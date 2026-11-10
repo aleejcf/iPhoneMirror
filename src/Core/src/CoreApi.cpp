@@ -698,7 +698,7 @@ std::int32_t IM_CALL im_refresh_devices_ex(iPhoneMirror::DeviceInfo* devices,
 
 std::int32_t IM_CALL im_wireless_receiver_start(const wchar_t* receiver_name,
     const wchar_t* host_path) {
-    return im_wireless_receiver_start_ex(receiver_name, host_path, 5120, 2880, 60);
+    return im_wireless_receiver_start_ex(receiver_name, host_path, 2880, 2880, 60);
 }
 
 std::int32_t IM_CALL im_wireless_receiver_start_ex(const wchar_t* receiver_name,
@@ -718,11 +718,17 @@ std::int32_t IM_CALL im_wireless_receiver_start_ex(const wchar_t* receiver_name,
         receiver = wireless_receiver;
     }
     try {
+        const auto matches = [width, height](std::uint32_t long_edge,
+            std::uint32_t short_edge) {
+            return (width == long_edge && height == short_edge) ||
+                (width == short_edge && height == long_edge);
+        };
         const auto supported =
-            (width == 5120 && height == 2880 && frame_rate == 60) ||
-            (width == 1920 && height == 1080 && frame_rate == 60) ||
-            (width == 1280 && height == 720 && frame_rate == 30) ||
-            (width == 960 && height == 540 && frame_rate == 30);
+            (matches(2880, 2880) && frame_rate == 60) ||
+            (matches(5120, 2880) && frame_rate == 60) ||
+            (matches(1920, 1080) && frame_rate == 60) ||
+            (matches(1280, 720) && frame_rate == 30) ||
+            (matches(960, 540) && frame_rate == 30);
         if (!supported)
             return fail(iPhoneMirror::Result::InvalidArgument,
                 L"Unsupported AirPlay display capability profile");
@@ -986,7 +992,7 @@ std::int32_t IM_CALL im_start_capture_with_options(const wchar_t* udid,
         !valid_video_preferences(options->requested_width, options->requested_height,
             options->target_fps) ||
         !std::isfinite(options->audio_volume) || options->audio_volume < 0.0F ||
-        options->audio_volume > 1.0F || !valid_capture_option_extensions(*options)) {
+        options->audio_volume > 2.0F || !valid_capture_option_extensions(*options)) {
         return fail(iPhoneMirror::Result::InvalidArgument,
             L"CaptureOptions 参数无效");
     }
@@ -1148,8 +1154,8 @@ std::int32_t IM_CALL im_copy_latest_video_frame_scaled(iPhoneMirror::VideoFrameI
     if (!nv12_to_bgra_scaled(*frame, buffer, output_width, output_height)) {
         return fail(iPhoneMirror::Result::ProtocolError, L"NV12/P010 缩放视频帧布局无效");
     }
-    static std::uint64_t conversion_count{};
-    const auto conversion_number = ++conversion_count;
+    static std::atomic<std::uint64_t> conversion_count{};
+    const auto conversion_number = conversion_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (conversion_number <= 3 || conversion_number % 60 == 0) {
         const auto elapsed = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - conversion_started).count();
@@ -1358,7 +1364,7 @@ std::int32_t IM_CALL im_set_audio_enabled(std::int32_t enabled) {
 }
 
 std::int32_t IM_CALL im_set_audio_volume(float volume) {
-    if (!std::isfinite(volume) || volume < 0.0F || volume > 1.0F) {
+    if (!std::isfinite(volume) || volume < 0.0F || volume > 2.0F) {
         return fail(iPhoneMirror::Result::InvalidArgument,
             L"音量必须位于 0.0 到 1.0 之间");
     }
@@ -1378,7 +1384,7 @@ std::int32_t IM_CALL im_session_create(const wchar_t* udid,
         options->struct_size != sizeof(iPhoneMirror::CaptureOptions) ||
         !valid_video_preferences(options->requested_width, options->requested_height,
             options->target_fps) || !std::isfinite(options->audio_volume) ||
-        options->audio_volume < 0.0F || options->audio_volume > 1.0F ||
+        options->audio_volume < 0.0F || options->audio_volume > 2.0F ||
         !valid_capture_option_extensions(*options)) {
         return fail(iPhoneMirror::Result::InvalidArgument, L"Invalid multi-device session options");
     }
@@ -1456,7 +1462,7 @@ std::int32_t IM_CALL im_wireless_session_create(const wchar_t* device_id,
         options->struct_size != sizeof(iPhoneMirror::CaptureOptions) ||
         !valid_video_preferences(options->requested_width, options->requested_height,
             options->target_fps) || !std::isfinite(options->audio_volume) ||
-        options->audio_volume < 0.0F || options->audio_volume > 1.0F ||
+        options->audio_volume < 0.0F || options->audio_volume > 2.0F ||
         !valid_capture_option_extensions(*options)) {
         return fail(iPhoneMirror::Result::InvalidArgument, L"Invalid wireless session options");
     }
@@ -1484,11 +1490,14 @@ std::int32_t IM_CALL im_wireless_session_create(const wchar_t* device_id,
                 L"Core closed while creating wireless session");
         }
         const auto id = next_session_handle++;
+        const auto device_fingerprint =
+            iPhoneMirror::logging::fingerprint(narrow(device_id));
+        const auto log_message = std::format(
+            "wireless_session create handle={} device_fp={}", id,
+            device_fingerprint);
         multi_sessions.emplace(id, std::move(context));
         *handle = id;
-        iPhoneMirror::logging::write(std::format(
-            "wireless_session create handle={} device_fp={}", id,
-            iPhoneMirror::logging::fingerprint(narrow(device_id))));
+        iPhoneMirror::logging::write(log_message);
         last_error.clear();
         return static_cast<std::int32_t>(iPhoneMirror::Result::Ok);
     } catch (const std::exception& error) {
@@ -1851,7 +1860,7 @@ std::int32_t IM_CALL im_session_set_audio_enabled(iPhoneMirror::SessionHandle ha
 }
 
 std::int32_t IM_CALL im_session_set_audio_volume(iPhoneMirror::SessionHandle handle, float volume) {
-    if (!std::isfinite(volume) || volume < 0.0F || volume > 1.0F)
+    if (!std::isfinite(volume) || volume < 0.0F || volume > 2.0F)
         return fail(iPhoneMirror::Result::InvalidArgument, L"Invalid audio volume");
     auto context = find_multi_session(handle);
     if (!context) return fail(iPhoneMirror::Result::InvalidArgument, L"Unknown session handle");
@@ -1980,7 +1989,7 @@ std::int32_t IM_CALL im_session_copy_latest_video_frame_nv12(
     *buffer_size = *required;
     if (!buffer || capacity < *required)
         return static_cast<std::int32_t>(iPhoneMirror::Result::BufferTooSmall);
-    return iPhoneMirror::media::detail::copy_nv12_frame_letterboxed(
+    return iPhoneMirror::media::detail::copy_nv12_frame_letterboxed_sdr(
         *frame, std::span<std::uint8_t>(buffer, *required), output_width,
         output_height)
         ? static_cast<std::int32_t>(iPhoneMirror::Result::Ok)
@@ -2071,7 +2080,24 @@ std::int32_t IM_CALL im_session_set_window_rotation(iPhoneMirror::SessionHandle 
     // A rotation is a local preview preference. Reconfiguring the QuickTime
     // display stream here sends HPD0/HPD1 over USB and can make iOS terminate
     // an otherwise healthy mirroring session during a game orientation change.
-    found->second->set_rotation(normalized == 2 ? 2 : 0);
+    found->second->set_rotation(normalized);
+    return static_cast<std::int32_t>(iPhoneMirror::Result::Ok);
+}
+
+std::int32_t IM_CALL im_session_set_window_opacity(iPhoneMirror::SessionHandle handle,
+    void* hwnd, float opacity) {
+    if (!std::isfinite(opacity) || opacity < 0.1F || opacity > 1.0F)
+        return fail(iPhoneMirror::Result::InvalidArgument, L"Invalid window opacity");
+    auto context = find_multi_session(handle);
+    if (!context) return fail(iPhoneMirror::Result::InvalidArgument, L"Unknown session handle");
+    std::scoped_lock lock(context->renderers_mutex);
+    const auto window = static_cast<HWND>(hwnd);
+    const auto found = context->renderers.find(window);
+    if (found == context->renderers.end() ||
+        (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP) == 0)
+        return fail(iPhoneMirror::Result::InvalidArgument, L"Unknown composition preview window");
+    found->second->set_opacity(opacity);
+    last_error.clear();
     return static_cast<std::int32_t>(iPhoneMirror::Result::Ok);
 }
 

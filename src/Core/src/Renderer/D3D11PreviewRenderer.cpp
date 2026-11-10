@@ -372,6 +372,8 @@ float4 maskMain(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGE
 } // namespace
 
 struct D3D11PreviewRenderer::Impl {
+    enum class RenderResult { Presented, Retry, Occluded };
+
     struct alignas(16) ShapeConstantData {
         float output_width{};
         float output_height{};
@@ -409,6 +411,9 @@ struct D3D11PreviewRenderer::Impl {
 
     HWND window{};
     FrameProvider provider;
+#ifdef IPHONEMIRROR_PREVIEW_TEST_HOOKS
+    PreviewTestHooks test_hooks;
+#endif
     std::jthread worker;
     bool composition_mode{};
 
@@ -419,6 +424,9 @@ struct D3D11PreviewRenderer::Impl {
     ComPtr<IDCompositionDevice> composition_device;
     ComPtr<IDCompositionTarget> composition_target;
     ComPtr<IDCompositionVisual> composition_visual;
+    ComPtr<IDCompositionEffectGroup> composition_effect;
+    std::atomic<float> opacity{1.0F};
+    float applied_opacity{1.0F};
     ComPtr<ID3D11RenderTargetView> target;
     ComPtr<ID3D11VertexShader> vertex_shader;
     ComPtr<ID3D11PixelShader> pixel_shader;
@@ -488,8 +496,14 @@ struct D3D11PreviewRenderer::Impl {
     std::uint32_t scheduled_fps{};
     std::chrono::steady_clock::time_point next_present_due{};
 
-    Impl(HWND value, FrameProvider frame_provider)
-        : window(value), provider(std::move(frame_provider)) {
+    Impl(HWND value, FrameProvider frame_provider
+#ifdef IPHONEMIRROR_PREVIEW_TEST_HOOKS
+        , PreviewTestHooks hooks
+#endif
+    ) : window(value), provider(std::move(frame_provider)) {
+#ifdef IPHONEMIRROR_PREVIEW_TEST_HOOKS
+        test_hooks = std::move(hooks);
+#endif
         initialize();
         worker = std::jthread([this](std::stop_token token) { run(token); });
     }
@@ -602,6 +616,13 @@ struct D3D11PreviewRenderer::Impl {
                 "IDCompositionDevice CreateVisual");
             check(composition_visual->SetContent(swap_chain.Get()),
                 "IDCompositionVisual SetContent");
+            check(composition_device->CreateEffectGroup(&composition_effect),
+                "IDCompositionDevice CreateEffectGroup");
+            applied_opacity = opacity.load(std::memory_order_relaxed);
+            check(composition_effect->SetOpacity(applied_opacity),
+                "IDCompositionEffectGroup SetOpacity");
+            check(composition_visual->SetEffect(composition_effect.Get()),
+                "IDCompositionVisual SetEffect");
             check(composition_target->SetRoot(composition_visual.Get()),
                 "IDCompositionTarget SetRoot");
             check(composition_device->Commit(), "IDCompositionDevice Commit");
@@ -687,6 +708,7 @@ struct D3D11PreviewRenderer::Impl {
         pixel_shader.Reset();
         vertex_shader.Reset();
         composition_visual.Reset();
+        composition_effect.Reset();
         composition_target.Reset();
         composition_device.Reset();
         swap_chain.Reset();
@@ -978,11 +1000,15 @@ struct D3D11PreviewRenderer::Impl {
     }
 
     bool rounded_window_enabled() const noexcept {
-        // The native preview enters full screen by removing WS_THICKFRAME
-        // instead of maximizing the HWND, so IsZoomed alone is insufficient.
-        // Normal composition windows retain the frame solely for hit-tested
-        // resizing; full-screen and maximized surfaces must remain rectangular.
-        return composition_mode && !IsZoomed(window) &&
+        // The main compact preview is a child HWND and therefore cannot use a
+        // transparent DComp swap chain. It still needs the shader's
+        // anti-aliased device curve; the matching HWND region removes only
+        // the fully transparent outer pixels. Full-screen and maximized
+        // surfaces intentionally remain rectangular.
+        const auto packed_profile = corner_profile.load(std::memory_order_relaxed);
+        const auto normalized_radius = std::bit_cast<float>(
+            static_cast<std::uint32_t>(packed_profile >> 32U));
+        return normalized_radius > 0.0F && !IsZoomed(window) &&
             GetPropW(window, L"iPhoneMirrorFullScreen") == nullptr;
     }
 
@@ -1272,6 +1298,9 @@ struct D3D11PreviewRenderer::Impl {
     }
 
     bool upload(const media::DecodedFrame& frame) {
+#ifdef IPHONEMIRROR_PREVIEW_TEST_HOOKS
+        if (test_hooks.before_upload && !test_hooks.before_upload()) return false;
+#endif
         if (frame.gpu_frame) {
             try {
                 if (prepare_shared_gpu_frame(frame)) {
@@ -1295,9 +1324,9 @@ struct D3D11PreviewRenderer::Impl {
         return upload_cpu(frame);
     }
 
-    void render(const media::DecodedFrame& frame) {
-        if (target_width == 0 || target_height == 0) return;
-        if (!upload(frame)) return;
+    RenderResult render(const media::DecodedFrame& frame) {
+        if (target_width == 0 || target_height == 0) return RenderResult::Retry;
+        if (!upload(frame)) return RenderResult::Retry;
 
         const auto signature =
             (static_cast<std::uint64_t>(frame.pixel_format) << 32U) |
@@ -1366,8 +1395,8 @@ struct D3D11PreviewRenderer::Impl {
 
         const auto packed_limit = render_size_limit.load(std::memory_order_relaxed);
         auto [limited_width, limited_height] = limited_render_size(frame);
-        if (swaps_axes) std::swap(limited_width, limited_height);
         const bool cap_reduces_source = limited_width < frame.width || limited_height < frame.height;
+        if (swaps_axes) std::swap(limited_width, limited_height);
         const bool use_limited_pass = packed_limit != 0 && cap_reduces_source &&
             (viewport.Width > static_cast<float>(limited_width) + 0.5F ||
              viewport.Height > static_cast<float>(limited_height) + 0.5F);
@@ -1448,10 +1477,26 @@ struct D3D11PreviewRenderer::Impl {
         // flip presentation must not hold up the newest landscape frame when
         // DWM is late with a vblank; skip that presentation and keep capture
         // and decode independent of desktop composition.
-        const auto present_result = swap_chain->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
-        if (present_result != DXGI_ERROR_WAS_STILL_DRAWING)
+        HRESULT present_result = S_OK;
+#ifdef IPHONEMIRROR_PREVIEW_TEST_HOOKS
+        if (test_hooks.before_present) present_result = test_hooks.before_present();
+#endif
+        if (present_result == S_OK)
+            present_result = swap_chain->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+#ifdef IPHONEMIRROR_PREVIEW_TEST_HOOKS
+        if (test_hooks.after_present) test_hooks.after_present(present_result);
+#endif
+        if (FAILED(present_result) && present_result != DXGI_ERROR_WAS_STILL_DRAWING)
             check(present_result, "Present");
         release_shared_gpu_frame();
+        if (present_result != S_OK) {
+            // A nonblocking present can be rejected while DWM is still
+            // composing (or while the child HWND is temporarily occluded).
+            // The caller keeps the frame dirty without advancing the media
+            // cursor, and backs off longer for an occluded window.
+            return present_result == DXGI_STATUS_OCCLUDED
+                ? RenderResult::Occluded : RenderResult::Retry;
+        }
         ++rendered_frames;
         if (rendered_frames == 1) first_presented_at = std::chrono::steady_clock::now();
         DXGI_FRAME_STATISTICS frame_statistics{};
@@ -1492,6 +1537,7 @@ struct D3D11PreviewRenderer::Impl {
                 local_render_width, local_render_height,
                 static_cast<unsigned>(statistics_result)));
         }
+        return RenderResult::Presented;
     }
 
     void run(std::stop_token token) noexcept {
@@ -1505,6 +1551,16 @@ struct D3D11PreviewRenderer::Impl {
                 // Coalesce interactive WM_SIZE bursts independently of media
                 // FPS. A resize iteration bypasses the media deadline below
                 // and immediately presents the newest retained frame.
+                // Commit independently of frame arrival/FPS: paused and empty
+                // previews must respond to the opacity slider too. Rebuilds
+                // restore the atomic preference in initialize().
+                const auto requested_opacity = opacity.load(std::memory_order_relaxed);
+                if (composition_effect && requested_opacity != applied_opacity) {
+                    check(composition_effect->SetOpacity(requested_opacity),
+                        "IDCompositionEffectGroup SetOpacity");
+                    check(composition_device->Commit(), "Commit preview opacity");
+                    applied_opacity = requested_opacity;
+                }
                 const bool target_resized = resize_if_needed(
                     std::chrono::steady_clock::now());
                 if (clear_requested.exchange(false, std::memory_order_acq_rel)) {
@@ -1550,6 +1606,10 @@ struct D3D11PreviewRenderer::Impl {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     continue;
                 }
+                // Retain a complete candidate before attempting any GPU work.
+                // Even the first presentation can fail after the provider has
+                // handed off its last frame from a now-static AirPlay screen.
+                last_frame = frame;
                 const bool output_mode_changed = update_output_mode(*frame);
                 if (!output_state.target_valid || !target) {
                     refresh_requested.store(true, std::memory_order_release);
@@ -1562,11 +1622,19 @@ struct D3D11PreviewRenderer::Impl {
                     continue;
                 }
                 const auto render_started = std::chrono::steady_clock::now();
-                render(*frame);
+                const auto render_result = render(*frame);
+                if (render_result != RenderResult::Presented) {
+                    release_shared_gpu_frame();
+                    // Rearm every failed redraw, including upload failures of
+                    // a frame whose timestamp was presented before a resize.
+                    refresh_requested.store(true, std::memory_order_release);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(
+                        render_result == RenderResult::Occluded ? 100 : 1));
+                    continue;
+                }
                 const auto render_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - render_started).count();
                 last_timestamp = frame->timestamp_100ns;
-                last_frame = frame;
                 if (requested_fps != 0) {
                     const auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                         std::chrono::duration<double>(1.0 / static_cast<double>(effective_fps)));
@@ -1578,6 +1646,8 @@ struct D3D11PreviewRenderer::Impl {
                         rendered_frames, render_ms));
                 }
             } catch (const std::exception& error) {
+                release_shared_gpu_frame();
+                refresh_requested.store(true, std::memory_order_release);
                 const auto removed_reason = device
                     ? device->GetDeviceRemovedReason() : E_POINTER;
                 if (FAILED(removed_reason)) {
@@ -1599,8 +1669,15 @@ struct D3D11PreviewRenderer::Impl {
     }
 };
 
-D3D11PreviewRenderer::D3D11PreviewRenderer(HWND window, FrameProvider provider)
-    : impl_(std::make_unique<Impl>(window, std::move(provider))) {}
+D3D11PreviewRenderer::D3D11PreviewRenderer(HWND window, FrameProvider provider
+#ifdef IPHONEMIRROR_PREVIEW_TEST_HOOKS
+    , PreviewTestHooks test_hooks
+#endif
+) : impl_(std::make_unique<Impl>(window, std::move(provider)
+#ifdef IPHONEMIRROR_PREVIEW_TEST_HOOKS
+    , std::move(test_hooks)
+#endif
+)) {}
 
 D3D11PreviewRenderer::~D3D11PreviewRenderer() = default;
 
@@ -1634,6 +1711,11 @@ void D3D11PreviewRenderer::set_corner_profile(float normalized_radius,
     impl_->corner_profile.store(pack_corner_profile(normalized_radius, curve_exponent),
         std::memory_order_relaxed);
     impl_->refresh_requested.store(true, std::memory_order_release);
+}
+
+void D3D11PreviewRenderer::set_opacity(float opacity) noexcept {
+    if (!impl_ || !std::isfinite(opacity)) return;
+    impl_->opacity.store(std::clamp(opacity, 0.1F, 1.0F), std::memory_order_relaxed);
 }
 
 void D3D11PreviewRenderer::set_rotation(std::int32_t quarter_turns) noexcept {

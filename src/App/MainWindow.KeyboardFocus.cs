@@ -1,0 +1,198 @@
+using System.Runtime.InteropServices;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
+using IPhoneMirror.App.Controls;
+using IPhoneMirror.App.Models;
+
+namespace IPhoneMirror.App;
+
+public partial class MainWindow
+{
+    // Invalidated on the dispatcher; read by transport workers as well. Reset
+    // before waiting for the route lock so queued input cannot survive refocus.
+    private long _keyboardInputGeneration;
+    private readonly Func<nint> _keyboardForegroundWindow = GetForegroundWindow;
+    private readonly Func<nint> _keyboardFocusedWindow = GetFocus;
+    private string? _keyboardStateUdid;
+    private bool _keyboardFocusSuspended;
+    private string? ActiveInputDeviceUdid => _activeControlWindow != 0
+        ? _activeControlUdid : _viewModel.SelectedDevice?.Udid;
+
+    private void FocusControlDevice(string? udid, nint window)
+    {
+        _keyboardFocusSuspended = false;
+        var previous = _activeControlUdid ?? _keyboardStateUdid;
+        if (_activeControlWindow != window || !DeviceViewModel.UdidEquals(previous, udid))
+        {
+            if (previous is not null)
+            {
+                HandleControlKeyboardInput(new PreviewKeyboardEventArgs(PreviewKeyboardKind.Reset, 0), previous);
+                _ = HandleUsbPointerInputAsync(new PreviewPointerEventArgs(PreviewPointerKind.Reset, 0, 0, 0, 0), previous);
+                if (_viewModel.IsBluetoothControlTarget(previous))
+                    _ = _viewModel.SendBluetoothMouseAsync(0, 0, expectedTargetDeviceUdid: previous);
+            }
+            ResetControlRouteState();
+            _keyboardStateUdid = udid;
+        }
+        _activeControlUdid = udid;
+        _activeControlWindow = window;
+        if (previous is not null && !DeviceViewModel.UdidEquals(previous, udid) &&
+            _keyboardRouter.RequestedMode == Services.KeyboardInputMode.Direct)
+        {
+            // Different devices have independent writers. Old-device cleanup
+            // remains captured in _keyboardHandoff (mapping takeover waits for
+            // it), while fresh keys can reach the new device. Retired physical
+            // keys remain quarantined and never migrate to this device.
+            _keyboardRouter.CompleteHandoff(_keyboardRouter.Generation);
+        }
+        _viewModel.SetControlInputDevice(udid);
+        ApplyBluetoothControlInputState(activateIndependentWindow: false);
+    }
+
+    private Func<bool> CaptureKeyboardSendGuard(nint sourceWindow) =>
+        CaptureKeyboardOwnerSendGuard(sourceWindow, Services.KeyboardInputMode.Direct);
+
+    private Func<bool> CaptureKeyboardOwnerSendGuard(nint sourceWindow, Services.KeyboardInputMode owner)
+    {
+        var generation = Volatile.Read(ref _keyboardInputGeneration);
+        var modeGeneration = KeyboardInputModeGeneration;
+        var foregroundWindow = _keyboardForegroundWindow;
+        // No WPF properties or device dictionaries may be read on the BLE
+        // worker. Route/focus resets invalidate this immutable snapshot.
+        return () => generation == Volatile.Read(ref _keyboardInputGeneration) &&
+            modeGeneration == KeyboardInputModeGeneration &&
+            _keyboardRouter.Mode == owner &&
+            sourceWindow != 0 && sourceWindow == foregroundWindow();
+    }
+
+    private Func<bool> CapturePointerSendGuard(nint sourceWindow)
+    {
+        var generation = Volatile.Read(ref _keyboardInputGeneration);
+        var foregroundWindow = _keyboardForegroundWindow;
+        return () => generation == Volatile.Read(ref _keyboardInputGeneration) &&
+            sourceWindow != 0 && sourceWindow == foregroundWindow();
+    }
+
+    private nint GetControlKeyboardWindow(string? udid)
+    {
+        if (string.IsNullOrWhiteSpace(udid)) return 0;
+        var independentWindow = _secondaryMirrors.GetWindowHandle(udid);
+        if (independentWindow != 0) return independentWindow;
+        if (_activeControlWindow != 0)
+            return DeviceViewModel.UdidEquals(_activeControlUdid, udid)
+                ? _activeControlWindow : 0;
+        return DeviceViewModel.UdidEquals(_viewModel.SelectedDevice?.Udid, udid)
+            ? _windowSource?.Handle ?? 0 : 0;
+    }
+
+    private bool CanForwardControlKeyboard(string? udid, nint sourceWindow)
+        => _mappingWindow?.IsEditing != true && CanForwardControlPointer(udid, sourceWindow) &&
+            (sourceWindow != _windowSource?.Handle || !IsMainKeyboardEditorFocused());
+
+    private bool CanForwardControlPointer(string? udid, nint sourceWindow)
+    {
+        // Compare the actual top-level HWND, not process ownership or WPF
+        // IsActive: native previews have their own HWNDs, and settings dialogs
+        // in this same process must not feed the phone's keyboard.
+        return _viewModel.AutomationHumanAllowed(udid) && !_bossKeyHidden && !_keyboardFocusSuspended &&
+            sourceWindow != 0 &&
+            sourceWindow == GetControlKeyboardWindow(udid) &&
+            sourceWindow == _keyboardForegroundWindow();
+    }
+
+    private bool IsMainKeyboardEditorFocused() =>
+        (MainPreviewHost.WindowHandle == 0 || _keyboardFocusedWindow() != MainPreviewHost.WindowHandle) &&
+        (_isSettingsPanelVisible || Keyboard.FocusedElement is TextBoxBase or PasswordBox or ComboBox or ButtonBase or Slider);
+
+    private void OnMainKeyboardFocusChanged(object sender, KeyboardFocusChangedEventArgs e)
+    {
+        if (_activeControlWindow == 0 && IsMainKeyboardEditorFocused()) ResetKeyboardOwnership();
+    }
+
+    private void DisposeKeyboardInputSubscriptions()
+    {
+        MainPreviewHost.KeyboardInput -= OnControlKeyboardInput;
+        _secondaryMirrors.KeyboardInput -= OnIndependentKeyboardInput;
+        _secondaryMirrors.KeyboardFocusChanged -= OnIndependentKeyboardFocusChanged;
+        Deactivated -= OnMainKeyboardDeactivated;
+        Activated -= OnMainKeyboardActivated;
+        PreviewGotKeyboardFocus -= OnMainKeyboardFocusChanged;
+        PreviewTextInput -= OnRemoteTextInput;
+        ClearControlText();
+    }
+
+    private bool IsControlKeyboardForeground
+    {
+        get
+        {
+            var udid = _activeControlWindow != 0 ? _activeControlUdid :
+                _viewModel.SelectedDevice?.Udid;
+            return CanForwardControlKeyboard(udid, GetControlKeyboardWindow(udid));
+        }
+    }
+
+    private void OnMainKeyboardDeactivated(object? sender, EventArgs e)
+    {
+        _mouseShortcutButtons.Clear();
+        _viewModel.SetControlInputDevice(null);
+        UnregisterDeviceHotkeys();
+        if (_activeControlWindow == 0)
+        {
+            _keyboardFocusSuspended = true;
+            HandleControlKeyboardInput(new PreviewKeyboardEventArgs(
+                PreviewKeyboardKind.Reset, 0), _viewModel.SelectedDevice?.Udid);
+            _ = HandleUsbPointerInputAsync(new PreviewPointerEventArgs(
+                PreviewPointerKind.Reset, 0, 0, 0, 0), _viewModel.SelectedDevice?.Udid);
+        }
+    }
+
+    private void OnMainKeyboardActivated(object? sender, EventArgs e) =>
+        FocusControlDevice(_viewModel.SelectedDevice?.Udid, 0);
+
+    private void OnIndependentKeyboardFocusChanged(string udid, nint hwnd, bool active)
+    {
+        if (!active)
+        {
+            if (_activeControlWindow != hwnd ||
+                !DeviceViewModel.UdidEquals(_activeControlUdid, udid)) return;
+            _keyboardFocusSuspended = true;
+            _mouseShortcutButtons.Clear();
+            _viewModel.SetControlInputDevice(null);
+            UnregisterDeviceHotkeys();
+            HandleControlKeyboardInput(new PreviewKeyboardEventArgs(
+                PreviewKeyboardKind.Reset, 0), udid);
+            _ = HandleUsbPointerInputAsync(new PreviewPointerEventArgs(
+                PreviewPointerKind.Reset, 0, 0, 0, 0), udid);
+        }
+        else FocusControlDevice(udid, hwnd);
+    }
+
+    private static bool IsGlobalControlShortcut(Services.BluetoothShortcutAction action) =>
+        action is Services.BluetoothShortcutAction.BossKey or
+            Services.BluetoothShortcutAction.BluetoothControl or
+            Services.BluetoothShortcutAction.WirelessControl or
+            Services.BluetoothShortcutAction.WiredControl;
+
+    private void UnregisterDeviceHotkeys()
+    {
+        if (_windowSource is null) return;
+        foreach (var action in Enum.GetValues<Services.BluetoothShortcutAction>())
+        {
+            if (IsGlobalControlShortcut(action)) continue;
+            var id = HotKeyId(action);
+            if (_registeredHotKeyIds.Remove(id))
+                UnregisterHotKey(_windowSource.Handle, id);
+        }
+    }
+
+    private void RefreshDeviceHotkeys()
+    {
+        // Keyboard execution belongs exclusively to the shared hook/router.
+        UnregisterDeviceHotkeys();
+    }
+
+    [DllImport("user32.dll")]
+    private static extern nint GetForegroundWindow();
+}

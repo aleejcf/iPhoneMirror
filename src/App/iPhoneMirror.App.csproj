@@ -1,4 +1,11 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="IPhoneMirror.App.Runtime.Tests" />
+    <InternalsVisibleTo Include="BluetoothHidStress" />
+  </ItemGroup>
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
@@ -9,11 +16,11 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <AssemblyName>iPhoneMirror</AssemblyName>
     <RootNamespace>IPhoneMirror.App</RootNamespace>
-    <Version>1.8.1</Version>
-    <AssemblyVersion>1.8.1.0</AssemblyVersion>
-    <FileVersion>1.8.1.0</FileVersion>
+    <Version>1.8.5-pre3.alejandro.1</Version>
+    <AssemblyVersion>1.8.5.0</AssemblyVersion>
+    <FileVersion>1.8.5.0</FileVersion>
     <Authors>RayrenSX</Authors>
-    <Product>iPhoneMirror</Product>
+    <Product>iPhoneMirror Alejandro</Product>
     <Description>Low-latency iPhone screen mirroring for Windows over USB and AirPlay.</Description>
     <Copyright>Copyright (c) 2026 RayrenSX</Copyright>
     <RepositoryUrl>https://github.com/RayrenSX/iPhoneMirror</RepositoryUrl>
@@ -28,31 +35,86 @@
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <PublishTrimmed>false</PublishTrimmed>
+    <UsbBridgeRoot Condition="'$(UsbBridgeRoot)' == ''">$(MSBuildProjectDirectory)\..\..\dist</UsbBridgeRoot>
     <!-- Keep the framework resource satellites used by the supported UI
          cultures in addition to the neutral English fallback. -->
-    <SatelliteResourceLanguages>en;zh-Hans;zh-Hant</SatelliteResourceLanguages>
+    <SatelliteResourceLanguages>en;es;zh-Hans;zh-Hant</SatelliteResourceLanguages>
   </PropertyGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="..\..\config\uxplay-component.json"
+                      LogicalName="IPhoneMirror.App.Components.UxPlay.json" />
+    <EmbeddedResource Include="native\components\ffmpeg.sha256"
+                      LogicalName="IPhoneMirror.App.Components.Ffmpeg.sha256"
+                      Condition="Exists('native\components\ffmpeg.sha256')" />
+    <Content Include="$(UsbBridgeRoot)\iUsbBridge.exe">
+      <Link>tools\iUsbBridge.exe</Link>
+      <TargetPath>tools\iUsbBridge.exe</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+    </Content>
+    <Content Include="$(UsbBridgeRoot)\_internal\**\*">
+      <Link>tools\_internal\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <TargetPath>tools\_internal\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+    </Content>
+    <Content Include="$(UsbBridgeRoot)\iUsbBridge.runtime.json">
+      <Link>tools\iUsbBridge.runtime.json</Link>
+      <TargetPath>tools\iUsbBridge.runtime.json</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+    </Content>
+    <Content Include="..\..\tools\ddi\**\*">
+      <Link>tools\ddi\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <TargetPath>tools\ddi\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+    </Content>
     <PackageReference Include="Markdig" Version="1.3.2" />
     <PackageReference Include="WPF-UI" Version="4.3.0" />
   </ItemGroup>
+
+  <Target Name="ValidateUsbTouchBridgePayload" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(UsbBridgeRoot)\iUsbBridge.exe')"
+           Text="iUsbBridge.exe is missing. Run build.ps1 so the self-developed USB bridge is built first." />
+    <Error Condition="!Exists('$(UsbBridgeRoot)\_internal')"
+           Text="UsbTouchBridge runtime directory is missing. Run build.ps1 so the self-developed USB bridge is built first." />
+    <Error Condition="!Exists('$(UsbBridgeRoot)\iUsbBridge.runtime.json')"
+           Text="iUsbBridge runtime manifest is missing. Run build.ps1 so the self-developed USB bridge is built first." />
+  </Target>
 
   <ItemGroup>
     <Compile Include="..\Shared\Networking\SegmentedHttpDownloader.cs"
              Link="Networking\SegmentedHttpDownloader.cs" />
     <Compile Include="..\Shared\Security\ElevationPathLock.cs"
              Link="Security\ElevationPathLock.cs" />
+    <Compile Include="..\SharedUI\Services\AccessibilityAppearance.cs" Link="Services\AccessibilityAppearance.cs" />
     <Compile Include="..\SharedUI\Services\WindowWorkAreaController.cs"
              Link="Services\WindowWorkAreaController.cs" />
+    <Compile Include="..\SharedUI\Animations\SurfaceMotion.cs" Link="Animations\SurfaceMotion.cs" />
     <Compile Include="..\SharedUI\Animations\PageTransition.cs"
              Link="Animations\PageTransition.cs" />
+    <Compile Include="..\SharedUI\Animations\RevealTransition.cs"
+             Link="Animations\RevealTransition.cs" />
     <Compile Include="..\SharedUI\Controls\ModernButton.cs"
              Link="Controls\ModernButton.cs" />
     <Compile Include="..\SharedUI\Controls\ModernCard.cs"
              Link="Controls\ModernCard.cs" />
     <Compile Include="..\SharedUI\Controls\ModernDialog.cs"
              Link="Controls\ModernDialog.cs" />
+    <Page Include="..\SharedUI\Themes\DesignTokens.xaml" Link="Themes\DesignTokens.xaml" />
+    <Page Include="..\SharedUI\Controls\Inputs.xaml" Link="Controls\Inputs.xaml" />
+    <Page Include="..\SharedUI\Controls\Buttons.xaml" Link="Controls\Buttons.xaml" />
+    <Compile Include="..\SharedUI\Controls\StatusAppearance.cs" Link="Controls\StatusAppearance.cs" />
+    <Compile Include="..\SharedUI\Controls\DialogKeyboard.cs" Link="Controls\DialogKeyboard.cs" />
+    <Compile Include="..\SharedUI\Controls\ComboBoxTextLayout.cs" Link="Controls\ComboBoxTextLayout.cs" />
+    <Compile Include="..\SharedUI\Controls\DialogViewport.cs" Link="Controls\DialogViewport.cs" />
+    <Compile Include="..\SharedUI\Controls\RoundedWindow.cs" Link="Controls\RoundedWindow.cs" />
     <Page Include="..\SharedUI\Themes\LightTheme.xaml"
           Link="Themes\LightTheme.xaml" />
     <Page Include="..\SharedUI\Themes\DarkTheme.xaml"
@@ -143,6 +205,14 @@
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
     </Content>
+    <Content Include="native\Wireless\UxPlay\**\*"
+             Condition="'$(IncludeBundledUxPlay)' == 'true' and Exists('native\Wireless\UxPlay')">
+      <Link>Wireless\UxPlay\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <TargetPath>Wireless\UxPlay\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+    </Content>
     <Content Include="native\Wireless\dnssd.dll" Condition="Exists('native\Wireless\dnssd.dll')">
       <Link>Wireless\dnssd.dll</Link>
       <TargetPath>Wireless\dnssd.dll</TargetPath>
@@ -165,7 +235,7 @@
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
     </Content>
-    <Content Include="..\..\third_party\airplay-server\LICENSE-*;..\..\third_party\airplay-server\NOTICE-*;..\..\third_party\airplay-server\SOURCE.md;..\..\third_party\airplay-server\SHA256SUMS.txt">
+    <Content Include="..\..\third_party\airplay-server\LICENSE-*;..\..\third_party\airplay-server\NOTICE-*;..\..\third_party\airplay-server\SOURCE.md;..\..\third_party\airplay-server\SHA256SUMS.txt;..\..\third_party\airplay-server\BUILD.json">
       <Link>Wireless\licenses\%(Filename)%(Extension)</Link>
       <TargetPath>Wireless\licenses\%(Filename)%(Extension)</TargetPath>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
@@ -204,6 +274,14 @@
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
     </Content>
+    <EmbeddedResource Include="..\..\CHANGELOG.zh-TW.md" WithCulture="false"
+                      LogicalName="Localization.CHANGELOG.zh-TW.md" />
+    <Content Include="..\..\CHANGELOG.zh-TW.md">
+      <Link>CHANGELOG.zh-TW.md</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+    </Content>
     <Content Include="..\..\docs\DRIVER_DEPENDENCIES.md">
       <Link>DRIVER_DEPENDENCIES.md</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
@@ -232,4 +310,5 @@
                       LogicalName="IPhoneMirror.App.Payload.iPhoneMirror.VirtualCamera.Admin.exe"
                       Condition="Exists('native\iPhoneMirror.VirtualCamera.Admin.exe')" />
   </ItemGroup>
+
 </Project>

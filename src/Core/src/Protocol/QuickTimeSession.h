@@ -60,12 +60,28 @@ public:
     [[nodiscard]] std::vector<std::vector<std::uint8_t>> begin_display_reconfigure(
         std::uint32_t width, std::uint32_t height);
     [[nodiscard]] std::vector<std::vector<std::uint8_t>> complete_display_reconfigure();
+    // The device only sends the next video frame after it receives a NEED, and
+    // a NEED is normally sent per video sample. When iOS drops one (for example
+    // while the game opens the microphone and the audio route changes) the
+    // video stops for good while audio keeps flowing; re-sending it resumes.
+    [[nodiscard]] std::optional<std::vector<std::uint8_t>> resend_need();
+    // Soft audio restart (HPA0 then HPA1) without touching the video stream.
+    [[nodiscard]] std::optional<std::vector<std::uint8_t>> stop_audio_stream();
+    [[nodiscard]] std::optional<std::vector<std::uint8_t>> start_audio_stream();
+    void set_request_audio(bool enabled) noexcept { options_.request_audio = enabled; }
+    [[nodiscard]] bool audio_requested() const noexcept { return options_.request_audio; }
     void set_demo_mode(bool enabled) noexcept { options_.demo_mode = enabled; }
     void reset();
 
     [[nodiscard]] SessionState state() const noexcept { return state_; }
     [[nodiscard]] std::uint64_t video_frames() const noexcept { return video_frames_; }
     [[nodiscard]] std::uint64_t audio_packets() const noexcept { return audio_packets_; }
+    [[nodiscard]] std::uint64_t need_sent() const noexcept { return need_sent_; }
+    [[nodiscard]] std::uint64_t reply_received() const noexcept { return reply_received_; }
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point>
+    last_video_sample_at() const noexcept { return last_video_sample_at_; }
+    [[nodiscard]] std::optional<std::chrono::steady_clock::time_point>
+    last_audio_sample_at() const noexcept { return last_audio_sample_at_; }
     [[nodiscard]] const std::optional<coremedia::FormatDescription>& video_format() const noexcept { return video_format_; }
     [[nodiscard]] const std::optional<coremedia::FormatDescription>& audio_format() const noexcept { return audio_format_; }
     [[nodiscard]] const std::optional<coremedia::AudioStreamBasicDescription>& negotiated_audio() const noexcept { return negotiated_audio_; }
@@ -81,6 +97,16 @@ private:
     std::uint64_t local_host_clock_{};
     std::uint64_t video_frames_{};
     std::uint64_t audio_packets_{};
+    // Stream-flow diagnostics: the mirror currently emits NEED only per video
+    // sample and ignores RPLY entirely. These counters let a single idle-screen
+    // capture confirm how the device stall correlates with NEED/RPLY traffic.
+    std::uint64_t need_sent_{};
+    std::uint64_t reply_received_{};
+    // Bounded log of every packet seen before the first video sample, so a
+    // stalled negotiation shows which SYNC step the device never sent.
+    std::uint32_t negotiation_packets_logged_{};
+    std::optional<std::chrono::steady_clock::time_point> last_video_sample_at_{};
+    std::optional<std::chrono::steady_clock::time_point> last_audio_sample_at_{};
     std::optional<coremedia::FormatDescription> video_format_;
     std::optional<coremedia::FormatDescription> audio_format_;
     std::optional<coremedia::AudioStreamBasicDescription> negotiated_audio_;

@@ -81,7 +81,15 @@ HRESULT create_media_type(GUID subtype, UINT32 width, UINT32 height,
     const UINT32 stride = nv12 ? width : width * 4U;
     if (FAILED(hr = type->SetUINT32(MF_MT_SAMPLE_SIZE, sample_size)) ||
         FAILED(hr = type->SetUINT32(MF_MT_AVG_BITRATE, bitrate)) ||
-        FAILED(hr = type->SetUINT32(MF_MT_DEFAULT_STRIDE, stride)))
+        FAILED(hr = type->SetUINT32(MF_MT_DEFAULT_STRIDE, stride)) ||
+        FAILED(hr = type->SetUINT32(MF_MT_VIDEO_PRIMARIES,
+                                    MFVideoPrimaries_BT709)) ||
+        FAILED(hr = type->SetUINT32(MF_MT_TRANSFER_FUNCTION,
+                                    MFVideoTransFunc_709)) ||
+        FAILED(hr = type->SetUINT32(MF_MT_YUV_MATRIX,
+                                    MFVideoTransferMatrix_BT709)) ||
+        FAILED(hr = type->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE,
+                                    MFNominalRange_0_255)))
         return hr;
     return type.CopyTo(result);
 }
@@ -209,7 +217,7 @@ void render_nv12(const FrameSnapshot* frame, BYTE* output, LONG pitch,
     BYTE* y_plane = output;
     BYTE* uv_plane = output + static_cast<std::ptrdiff_t>(pitch) * height;
     for (UINT32 y = 0; y < height; ++y)
-        std::memset(y_plane + static_cast<std::ptrdiff_t>(y) * pitch, 16,
+        std::memset(y_plane + static_cast<std::ptrdiff_t>(y) * pitch, 0,
                     width);
     for (UINT32 y = 0; y < height / 2U; ++y)
         std::memset(uv_plane + static_cast<std::ptrdiff_t>(y) * pitch, 128, width);
@@ -232,7 +240,7 @@ void render_nv12(const FrameSnapshot* frame, BYTE* output, LONG pitch,
             const int green = pixel[1];
             const int red = pixel[2];
             destination[x] = static_cast<BYTE>(clamp_byte(
-                ((66 * red + 129 * green + 25 * blue + 128) >> 8) + 16));
+                (54 * red + 183 * green + 19 * blue + 128) >> 8));
         }
     }
 
@@ -250,9 +258,9 @@ void render_nv12(const FrameSnapshot* frame, BYTE* output, LONG pitch,
             const int green = pixel[1];
             const int red = pixel[2];
             destination[x] = static_cast<BYTE>(clamp_byte(
-                ((-38 * red - 74 * green + 112 * blue + 128) >> 8) + 128));
+                ((-29 * red - 99 * green + 128 * blue + 128) >> 8) + 128));
             destination[x + 1U] = static_cast<BYTE>(clamp_byte(
-                ((112 * red - 94 * green - 18 * blue + 128) >> 8) + 128));
+                ((128 * red - 116 * green - 12 * blue + 128) >> 8) + 128));
         }
     }
 }
@@ -684,7 +692,12 @@ HRESULT MediaStream::render_frame(IMFMediaBuffer* buffer,
             (subtype == MFVideoFormat_NV12 ? 1U : 4U);
         const auto absolute_pitch = static_cast<std::uint64_t>(
             pitch < 0 ? -static_cast<std::int64_t>(pitch) : pitch);
-        const auto required_bytes = absolute_pitch * height;
+        // NV12 is semi-planar: Y plane (height) followed by interleaved UV
+        // plane (height / 2). RGB32 is fully packed at 4 bytes per pixel.
+        const auto plane_rows = subtype == MFVideoFormat_NV12
+            ? static_cast<std::uint64_t>(height) + (height / 2U)
+            : static_cast<std::uint64_t>(height);
+        const auto required_bytes = absolute_pitch * plane_rows;
         if (scanline == nullptr || pitch <= 0 || absolute_pitch < row_bytes ||
             required_bytes > buffer_length) {
             buffer_2d->Unlock2D();
@@ -729,14 +742,24 @@ HRESULT MediaSource::RuntimeClassInitialize(IMFAttributes* activation_attributes
         return hr;
     if (FAILED(hr = MFCreateEventQueue(&event_queue_))) return hr;
 
-    wchar_t channel_path[512]{};
-    UINT32 channel_path_length{};
-    if (activation_attributes == nullptr ||
-        FAILED(activation_attributes->GetString(
-            FrameChannelPathAttribute, channel_path,
-            static_cast<UINT32>(std::size(channel_path)),
-            &channel_path_length)))
-        channel_path[0] = L'\0';
+    std::wstring channel_path;
+    if (activation_attributes != nullptr) {
+        LPWSTR allocated_path = nullptr;
+        UINT32 allocated_length = 0;
+        const HRESULT string_hr = activation_attributes->GetAllocatedString(
+            FrameChannelPathAttribute, &allocated_path, &allocated_length);
+        if (SUCCEEDED(string_hr) && allocated_path != nullptr) {
+            channel_path.assign(allocated_path, allocated_length);
+            CoTaskMemFree(allocated_path);
+        } else {
+            // A fixed-size stack buffer would silently truncate or fail on a
+            // long/tampered path and fall back to pipe discovery, which could
+            // connect to an unintended publisher. Surface the failure so it is
+            // diagnosable instead of silent.
+            OutputDebugStringW(L"MediaSource: FrameChannelPathAttribute could "
+                               L"not be read; falling back to pipe discovery\n");
+        }
+    }
 
     UINT32 output_width{};
     UINT32 output_height{};
@@ -748,7 +771,7 @@ HRESULT MediaSource::RuntimeClassInitialize(IMFAttributes* activation_attributes
     }
 
     if (FAILED(hr = Microsoft::WRL::MakeAndInitialize<MediaStream>(
-            &stream_, this, channel_path, output_width, output_height,
+            &stream_, this, channel_path.c_str(), output_width, output_height,
             frame_rate)))
         return hr;
     ComPtr<IMFStreamDescriptor> stream_descriptor;
@@ -809,8 +832,12 @@ HRESULT MediaSource::CreatePresentationDescriptor(
 HRESULT MediaSource::Start(IMFPresentationDescriptor* presentation_descriptor,
                            const GUID* time_format,
                            const PROPVARIANT* start_position) {
-    if (presentation_descriptor == nullptr || start_position == nullptr)
+    if (presentation_descriptor == nullptr)
         return E_INVALIDARG;
+    // MF permits a null start_position to mean "start from the current
+    // position / beginning"; treat it as VT_EMPTY rather than rejecting
+    // compliant callers.
+    (void)start_position;
     if (time_format != nullptr && *time_format != GUID_NULL)
         return MF_E_UNSUPPORTED_TIME_FORMAT;
 

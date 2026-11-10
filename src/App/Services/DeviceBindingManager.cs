@@ -1,0 +1,328 @@
+using System.Text.Json;
+using System.IO;
+using IPhoneMirror.App.Localization;
+
+namespace IPhoneMirror.App.Services;
+
+internal enum ReverseControlMode { None, Bluetooth, Wireless, Usb }
+internal enum DeviceIdentityType { Wired, AirPlay, Bluetooth }
+internal enum DeviceBindingCompatibility { Confirmed, Compatible, Incompatible, Unknown }
+
+internal sealed record DeviceFingerprint(string? ProductType = null, string? ProductName = null,
+    string? ModelIdentifier = null, string? DeviceClass = null, string? SystemVersion = null);
+internal sealed record WiredDeviceIdentity(string Udid, string? DeviceName,
+    DeviceFingerprint? Fingerprint, DateTime BoundAt);
+internal sealed record AirPlayDeviceIdentity(string StableId, string? DeviceName,
+    DeviceFingerprint? Fingerprint, DateTime BoundAt);
+internal sealed record BluetoothDeviceIdentity(string StableId, string? DeviceName, DateTime BoundAt);
+internal sealed record DeviceBindingProfile(Guid Id, string DisplayName,
+    DeviceFingerprint? DeviceFingerprint, WiredDeviceIdentity? WiredIdentity,
+    AirPlayDeviceIdentity? AirPlayIdentity, BluetoothDeviceIdentity? BluetoothIdentity,
+    DateTime CreatedAt, DateTime UpdatedAt);
+internal sealed record BindIdentityResult(bool Success, DeviceBindingCompatibility Compatibility,
+    string? Error = null, bool RequiresConfirmation = false);
+internal sealed record CreateProfileResult(bool Success, DeviceBindingProfile? Profile,
+    string? Error = null);
+
+internal sealed class DeviceBindingManager
+{
+    internal static DeviceBindingManager Shared { get; } = new();
+    private readonly object _gate = new();
+    private readonly string _path;
+    private readonly Dictionary<Guid, DeviceBindingProfile> _profiles = [];
+    internal Exception? LoadError { get; private set; }
+    private readonly bool _readOnly;
+
+    internal DeviceBindingManager(string? path = null, bool readOnly = false)
+    {
+        _readOnly = readOnly;
+        _path = path ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "iPhoneMirror", "device-binding-profiles.json");
+        Load();
+    }
+
+    internal IReadOnlyList<DeviceBindingProfile> Profiles
+    { get { lock (_gate) return _profiles.Values.OrderBy(profile => profile.DisplayName).ToArray(); } }
+
+    internal void RefreshFromDisk()
+    {
+        var snapshot = new DeviceBindingManager(_path, readOnly: true);
+        if (snapshot.LoadError is not null) throw new IOException("Device profiles could not be read.", snapshot.LoadError);
+        lock (_gate)
+        {
+            _profiles.Clear();
+            foreach (var profile in snapshot.Profiles) _profiles[profile.Id] = profile;
+        }
+    }
+
+    /// <summary>Creates a usable profile from its first observed identity.
+    /// Empty profiles are invalid because they cannot represent a real device.</summary>
+    internal CreateProfileResult CreateProfileFromIdentity(string displayName,
+        DeviceIdentityType type, string stableId, DeviceFingerprint? fingerprint)
+    {
+        if (string.IsNullOrWhiteSpace(stableId))
+            return new(false, null, LocalizationService.GetOrDefault(
+                "DeviceBindingIdentityRequired", "A device identity is required."));
+        lock (_gate)
+        {
+            if (_profiles.Values.Any(profile => Matches(profile, type, stableId)))
+                return new(false, null, LocalizationService.GetOrDefault(
+                    "DeviceBindingIdentityAlreadyBound",
+                    "This device identity is already bound to a device profile."));
+            var now = DateTime.UtcNow;
+            var profile = type switch
+            {
+                DeviceIdentityType.Wired => new DeviceBindingProfile(Guid.NewGuid(),
+                    NormalizeDisplayName(displayName), fingerprint,
+                    new WiredDeviceIdentity(stableId, displayName, fingerprint, now),
+                    null, null, now, now),
+                DeviceIdentityType.AirPlay => new DeviceBindingProfile(Guid.NewGuid(),
+                    NormalizeDisplayName(displayName), fingerprint, null,
+                    new AirPlayDeviceIdentity(stableId, displayName, fingerprint, now),
+                    null, now, now),
+                _ => new DeviceBindingProfile(Guid.NewGuid(), NormalizeDisplayName(displayName),
+                    null, null, null,
+                    new BluetoothDeviceIdentity(stableId, displayName, now), now, now),
+            };
+            return TryCommitProfile(profile) ? new(true, profile) : new(false, null, SaveFailedMessage);
+        }
+    }
+
+    internal DeviceBindingProfile? FindById(Guid id)
+    { lock (_gate) return _profiles.GetValueOrDefault(id); }
+
+    internal bool RenameProfile(Guid id, string displayName)
+    {
+        lock (_gate)
+        {
+            if (!_profiles.TryGetValue(id, out var profile) || string.IsNullOrWhiteSpace(displayName)) return false;
+            return TryCommitProfile(profile with { DisplayName = displayName.Trim(), UpdatedAt = DateTime.UtcNow });
+        }
+    }
+
+    internal bool DeleteProfile(Guid id)
+    {
+        lock (_gate)
+        {
+            var updated = new Dictionary<Guid, DeviceBindingProfile>(_profiles);
+            return updated.Remove(id) && TryCommit(updated);
+        }
+    }
+
+    internal DeviceBindingProfile? FindByIdentity(DeviceIdentityType type, string stableId)
+    {
+        if (string.IsNullOrWhiteSpace(stableId)) return null;
+        lock (_gate) return _profiles.Values.FirstOrDefault(profile => Matches(profile, type, stableId));
+    }
+
+    internal DeviceBindingCompatibility ValidateCompatibility(Guid profileId, DeviceFingerprint? candidate)
+    {
+        lock (_gate) return _profiles.TryGetValue(profileId, out var profile)
+            ? ValidateCompatibilityUnsafe(profile, candidate) : DeviceBindingCompatibility.Unknown;
+    }
+
+    internal BindIdentityResult Bind(Guid profileId, DeviceIdentityType type, string stableId,
+        string? deviceName, DeviceFingerprint? fingerprint, bool userConfirmed = false)
+    {
+        if (string.IsNullOrWhiteSpace(stableId)) return new(false,
+            DeviceBindingCompatibility.Unknown, LocalizationService.GetOrDefault(
+                "DeviceBindingIdentityRequired", "A device identity is required."));
+        lock (_gate)
+        {
+            if (!_profiles.TryGetValue(profileId, out var profile)) return new(false,
+                DeviceBindingCompatibility.Unknown, LocalizationService.GetOrDefault(
+                    "DeviceBindingProfileNotFound", "The device profile was not found."));
+            var owner = _profiles.Values.FirstOrDefault(candidate => candidate.Id != profileId && Matches(candidate, type, stableId));
+            if (owner is not null) return new(false, DeviceBindingCompatibility.Unknown,
+                LocalizationService.GetOrDefault("DeviceBindingIdentityBoundElsewhere",
+                    "This device identity is already bound to another device profile."));
+            if (Matches(profile, type, stableId))
+                return new(true, DeviceBindingCompatibility.Confirmed);
+            var compatibility = ValidateCompatibilityUnsafe(profile, fingerprint);
+            if (compatibility == DeviceBindingCompatibility.Incompatible) return new(false,
+                compatibility, LocalizationService.GetOrDefault("DeviceBindingIncompatibleModel",
+                    "The detected device model does not match; it cannot be bound."));
+            if (compatibility is DeviceBindingCompatibility.Compatible or DeviceBindingCompatibility.Unknown && !userConfirmed)
+                return new(false, compatibility, compatibility == DeviceBindingCompatibility.Compatible
+                    ? LocalizationService.GetOrDefault("DeviceBindingCompatibleNeedsConfirmation",
+                        "The device model matches, but user confirmation is required.")
+                    : LocalizationService.GetOrDefault("DeviceBindingUnknownNeedsConfirmation",
+                        "The device model could not be verified automatically; user confirmation is required."),
+                    RequiresConfirmation: true);
+            var now = DateTime.UtcNow;
+            var updated = type switch
+            {
+                DeviceIdentityType.Wired => profile with { WiredIdentity = new(stableId, deviceName, fingerprint, now), DeviceFingerprint = profile.DeviceFingerprint ?? fingerprint, UpdatedAt = now },
+                DeviceIdentityType.AirPlay => profile with { AirPlayIdentity = new(stableId, deviceName, fingerprint, now), DeviceFingerprint = profile.DeviceFingerprint ?? fingerprint, UpdatedAt = now },
+                _ => profile with { BluetoothIdentity = new(stableId, deviceName, now), UpdatedAt = now }
+            };
+            return TryCommitProfile(updated) ? new(true, compatibility) : new(false, compatibility, SaveFailedMessage);
+        }
+    }
+
+    internal bool Unbind(Guid profileId, DeviceIdentityType type)
+    {
+        lock (_gate)
+        {
+            if (!_profiles.TryGetValue(profileId, out var profile)) return false;
+            var updated = type switch
+            {
+                DeviceIdentityType.Wired => profile with { WiredIdentity = null, UpdatedAt = DateTime.UtcNow },
+                DeviceIdentityType.AirPlay => profile with { AirPlayIdentity = null, UpdatedAt = DateTime.UtcNow },
+                _ => profile with { BluetoothIdentity = null, UpdatedAt = DateTime.UtcNow }
+            };
+            return TryCommitProfile(updated);
+        }
+    }
+
+    internal bool UnbindBluetoothByStableId(string stableId)
+    {
+        var profile = FindByIdentity(DeviceIdentityType.Bluetooth, stableId);
+        return profile is not null && Unbind(profile.Id, DeviceIdentityType.Bluetooth);
+    }
+
+    internal int ClearBluetoothBindings()
+    {
+        lock (_gate)
+        {
+            var updated = new Dictionary<Guid, DeviceBindingProfile>(_profiles);
+            var count = 0;
+            foreach (var profile in _profiles.Values.Where(profile => profile.BluetoothIdentity is not null))
+            {
+                updated[profile.Id] = profile with { BluetoothIdentity = null, UpdatedAt = DateTime.UtcNow };
+                count++;
+            }
+            return count != 0 && TryCommit(updated) ? count : 0;
+        }
+    }
+
+    private static bool Matches(DeviceBindingProfile profile, DeviceIdentityType type, string id) => type switch
+    {
+        DeviceIdentityType.Wired => string.Equals(profile.WiredIdentity?.Udid, id, StringComparison.OrdinalIgnoreCase),
+        DeviceIdentityType.AirPlay => string.Equals(profile.AirPlayIdentity?.StableId, id, StringComparison.OrdinalIgnoreCase),
+        _ => string.Equals(profile.BluetoothIdentity?.StableId, id, StringComparison.OrdinalIgnoreCase)
+    };
+
+    private static DeviceBindingCompatibility ValidateCompatibilityUnsafe(DeviceBindingProfile profile, DeviceFingerprint? candidate)
+    {
+        if (profile.DeviceFingerprint is null || candidate is null) return DeviceBindingCompatibility.Unknown;
+        var left = KnownModel(profile.DeviceFingerprint.ProductType) ??
+            KnownModel(profile.DeviceFingerprint.ModelIdentifier);
+        var right = KnownModel(candidate.ProductType) ?? KnownModel(candidate.ModelIdentifier);
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right)) return DeviceBindingCompatibility.Unknown;
+        return string.Equals(left, right, StringComparison.OrdinalIgnoreCase)
+            ? DeviceBindingCompatibility.Compatible : DeviceBindingCompatibility.Incompatible;
+    }
+
+    // Native AirPlay discovery uses a display label when model metadata is
+    // absent. Normalize both sides, including fingerprints already on disk.
+    private static string? KnownModel(string? value) =>
+        string.IsNullOrWhiteSpace(value) ||
+        string.Equals(value.Trim(), "AirPlay", StringComparison.OrdinalIgnoreCase)
+            ? null : value.Trim();
+
+    private void Load()
+    {
+        try
+        {
+            if (!File.Exists(_path)) return;
+            var profiles = JsonSerializer.Deserialize<List<DeviceBindingProfile>>(
+                File.ReadAllText(_path)) ?? [];
+            if (_readOnly)
+            {
+                var identities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var profileIds = new HashSet<Guid>();
+                foreach (var profile in profiles)
+                {
+                    if (profile is null || profile.Id == Guid.Empty || !profileIds.Add(profile.Id))
+                        throw new InvalidDataException("Invalid or duplicate device profile.");
+                    foreach (var (type, value) in new[] {
+                        (DeviceIdentityType.Wired, profile.WiredIdentity?.Udid),
+                        (DeviceIdentityType.AirPlay, profile.AirPlayIdentity?.StableId),
+                        (DeviceIdentityType.Bluetooth, profile.BluetoothIdentity?.StableId) })
+                    {
+                        if (value is null) continue;
+                        if (string.IsNullOrWhiteSpace(value) || !identities.Add(type + ":" + value))
+                            throw new InvalidDataException("Invalid or ambiguous device identity.");
+                    }
+                }
+            }
+            var removedEmptyProfiles = false;
+            foreach (var profile in profiles)
+            {
+                if (profile.WiredIdentity is null && profile.AirPlayIdentity is null &&
+                    profile.BluetoothIdentity is null)
+                {
+                    removedEmptyProfiles = true;
+                    continue;
+                }
+                _profiles[profile.Id] = profile;
+            }
+            if (removedEmptyProfiles && !_readOnly && !TryPersist(_profiles.Values))
+                LoadError = new IOException(SaveFailedMessage);
+        }
+        catch (Exception error) { LoadError = error; DiagnosticLogger.Exception("binding", "profile_load_failed", error); }
+    }
+
+    private static string SaveFailedMessage => LocalizationService.GetOrDefault(
+        "DeviceBindingSaveFailed", "Device bindings could not be saved. Please try again.");
+
+    // Callers hold _gate. Publish the new snapshot only after storage commits.
+    private bool TryCommitProfile(DeviceBindingProfile profile)
+    {
+        var updated = new Dictionary<Guid, DeviceBindingProfile>(_profiles) { [profile.Id] = profile };
+        return TryCommit(updated);
+    }
+
+    private bool TryCommit(Dictionary<Guid, DeviceBindingProfile> updated)
+    {
+        if (_readOnly || !TryPersist(updated.Values)) return false;
+        _profiles.Clear();
+        foreach (var profile in updated.Values) _profiles.Add(profile.Id, profile);
+        return true;
+    }
+
+    private bool TryPersist(IEnumerable<DeviceBindingProfile> profiles)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
+            var temporaryPath = $"{_path}.{Guid.NewGuid():N}.tmp";
+            try
+            {
+                File.WriteAllText(temporaryPath, JsonSerializer.Serialize(profiles,
+                    new JsonSerializerOptions { WriteIndented = true }));
+                File.Move(temporaryPath, _path, true);
+            }
+            finally
+            {
+                if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+            }
+            return true;
+        }
+        catch (Exception error)
+        {
+            DiagnosticLogger.Exception("binding", "profile_save_failed", error);
+            return false;
+        }
+    }
+
+    private static string NormalizeDisplayName(string displayName) =>
+        string.IsNullOrWhiteSpace(displayName) ? string.Empty : displayName.Trim();
+}
+
+internal sealed class ReverseControlManager
+{
+    internal DeviceBindingManager Bindings { get; }
+    internal ReverseControlMode ActiveMode { get; private set; }
+    internal string? ActiveMirrorDeviceId { get; private set; }
+    internal ReverseControlManager(DeviceBindingManager bindings) => Bindings = bindings;
+    internal bool Activate(string mirrorDeviceId, ReverseControlMode mode)
+    {
+        if (Bindings.FindByIdentity(DeviceIdentityType.Wired, mirrorDeviceId) is null &&
+            Bindings.FindByIdentity(DeviceIdentityType.AirPlay, mirrorDeviceId) is null) return false;
+        ActiveMirrorDeviceId = mirrorDeviceId; ActiveMode = mode; return true;
+    }
+    internal void Deactivate() { ActiveMode = ReverseControlMode.None; ActiveMirrorDeviceId = null; }
+    internal bool IsTarget(string mirrorDeviceId) => string.Equals(ActiveMirrorDeviceId, mirrorDeviceId, StringComparison.OrdinalIgnoreCase);
+}

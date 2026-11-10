@@ -1,4 +1,4 @@
-#ifndef MyAppVersion
+﻿#ifndef MyAppVersion
   #error MyAppVersion must be provided by scripts/build_installer.ps1
 #endif
 #ifndef MyNumericVersion
@@ -72,6 +72,11 @@ WizardStyle=modern
 WizardSizePercent=110
 Compression={#MyCompression}
 SolidCompression={#MySolidCompression}
+; Keep the driver self-contained, but let the solid stream reuse its .NET
+; assemblies across the main application's runtime (roughly 170 MB apart).
+LZMAUseSeparateProcess=yes
+LZMADictionarySize=262144
+LZMANumFastBytes=273
 CloseApplications=yes
 CloseApplicationsFilter=iPhoneMirror.exe,iPhoneMirror.Driver.exe
 RestartApplications=no
@@ -83,6 +88,7 @@ ChangesEnvironment=no
 [Languages]
 Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Name: "chinesetrad"; MessagesFile: "compiler:Languages\ChineseTraditional.isl"
+Name: "chinesetaiwan"; MessagesFile: "Languages\ChineseTraditionalTaiwan.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [LangOptions]
@@ -154,20 +160,59 @@ chinesetrad.ErrorRestartReplace=重新啟動電腦後取代檔案失敗：
 chinesetrad.ErrorRenamingTemp=在目的資料夾重新命名檔案時發生錯誤：
 chinesetrad.ErrorOpeningReadme=開啟說明檔案時發生錯誤。
 
+chinesetrad.ConfirmDeleteSharedFile2=系統顯示以下共用檔案已不再被任何程式使用。要移除此共用檔案嗎？%n%n若仍有程式使用此檔案，移除後可能導致程式無法正常運作。如不確定，請選擇「否」。保留此檔案不會損害系統。
+
+chinesesimp.ConfirmDeleteSharedFile2=系统显示以下共享文件已不再被任何程序使用。要删除此共享文件吗？%n%n如果仍有程序使用此文件，删除后可能导致程序无法正常运行。如不确定，请选择“否”。保留此文件不会损害系统。
+
+chinesetrad.FinishedHeadingLabel=[name] 安裝完成
+
+chinesetrad.FileExistsOverwriteExisting=覆寫現有檔案 (&O)
+
+chinesetrad.FileExistsKeepExisting=保留現有檔案 (&K)
+
+chinesetrad.FileExistsOverwriteOrKeepAll=對所有衝突檔案執行相同操作 (&D)
+
+chinesetrad.ExistingFileNewerOverwriteOrKeepAll=對所有衝突檔案執行相同操作 (&D)
+
+chinesetrad.ErrorCloseApplications=安裝程式無法自動關閉所有應用程式。繼續前，請關閉正在使用待更新檔案的應用程式。
+
+chinesetrad.CloseApplications=自動關閉應用程式 (&A)
+
+chinesesimp.InvalidPath=请输入包含驱动器盘符的完整路径。%n%n例如 C:\App，或 UNC 路径 \\server\share。
+
+chinesetrad.ConfirmUninstall=確定要完全移除 %1 及其所有元件嗎？
+
+chinesetrad.ReadyMemoUserInfo=使用者資料：
+
+chinesetrad.WizardUserInfo=使用者資料
+
 [CustomMessages]
 chinesesimp.DeleteUserDataPrompt=是否同时删除 iPhoneMirror 的用户配置和已下载更新？选择“否”将保留这些数据，以便以后重新安装。
 chinesetrad.DeleteUserDataPrompt=是否同時刪除 iPhoneMirror 的使用者設定和已下載的更新？選擇「否」會保留這些資料，以便日後重新安裝。
+chinesetaiwan.DeleteUserDataPrompt=是否同時刪除 iPhoneMirror 的使用者設定和已下載的更新？選擇「否」會保留這些資料，以便日後重新安裝。
 english.DeleteUserDataPrompt=Also delete iPhoneMirror settings and downloaded updates? Choose No to keep this data for a later reinstall.
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "{#MySourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Install the bridge's libusb0 copy explicitly. Inno Setup can collapse the
+; identical root and _internal payload entries from a recursive wildcard,
+; which left upgraded installations without the copy Python can load.
+Source: "{#MySourceDir}\*"; DestDir: "{app}"; Excludes: "tools\_internal\libusb0.dll"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#MySourceDir}\libusb0.dll"; DestDir: "{app}\tools\_internal"; DestName: "libusb0.dll"; Flags: ignoreversion
 
 ; Remove media-output files from older releases before copying the current
 ; payload. If the current build includes FFmpeg, [Files] restores these files.
 [InstallDelete]
+; The bridge is a PyInstaller onedir runtime. Delete its previous contents
+; before install so an upgrade never combines new code with stale Python DLLs.
+Type: filesandordirs; Name: "{app}\tools\_internal"
+; Driver elevation now uses a self-contained bundle. Remove old sidecars so
+; an upgrade cannot accidentally retain its former runtime configuration.
+Type: files; Name: "{app}\iPhoneMirror.Driver.dll"
+Type: files; Name: "{app}\iPhoneMirror.Driver.deps.json"
+Type: files; Name: "{app}\iPhoneMirror.Driver.runtimeconfig.json"
 Type: files; Name: "{app}\tools\ffmpeg\ffmpeg.exe"
 Type: files; Name: "{app}\tools\ffmpeg\LICENSE.txt"
 Type: files; Name: "{app}\tools\ffmpeg\README.txt"
@@ -181,6 +226,8 @@ Name: "{group}\Changelog"; Filename: "{app}\CHANGELOG.md"; WorkingDir: "{app}"; 
 Name: "{group}\卸载"; Filename: "{uninstallexe}"; IconFilename: "{uninstallexe}"; Languages: chinesesimp
 Name: "{group}\解除安裝"; Filename: "{uninstallexe}"; IconFilename: "{uninstallexe}"; Languages: chinesetrad
 Name: "{group}\Uninstall"; Filename: "{uninstallexe}"; IconFilename: "{uninstallexe}"; Languages: english
+Name: "{group}\更新記錄"; Filename: "{app}\CHANGELOG.zh-TW.md"; WorkingDir: "{app}"; IconFilename: "{app}\iPhoneMirror.exe"; AppUserModelID: "{#MyAppUserModelId}"; Languages: chinesetaiwan
+Name: "{group}\解除安裝"; Filename: "{uninstallexe}"; IconFilename: "{uninstallexe}"; Languages: chinesetaiwan
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\iPhoneMirror.exe"; WorkingDir: "{app}"; IconFilename: "{app}\iPhoneMirror.exe"; AppUserModelID: "{#MyAppUserModelId}"; Tasks: desktopicon
 
 [Registry]
@@ -199,6 +246,8 @@ const
 var
   DeleteUserData: Boolean;
 
+#include "DesktopShell.iss"
+
 procedure ConfigureWirelessFirewall();
 var
   ResultCode: Integer;
@@ -213,14 +262,17 @@ begin
   HostPath := ExpandConstant('{app}\Wireless\iPhoneMirror.WirelessHost.exe');
   DeleteArguments := 'advfirewall firewall delete rule name="' +
     WirelessFirewallRuleName + '"';
+  { AirPlay SETUP negotiates per-session mirror and RAOP media ports. Keep
+    the rule constrained to the installed host process and local subnet, but do
+    not restrict it to the fixed discovery/control ports. }
   AddTcpArguments := 'advfirewall firewall add rule name="' +
     WirelessFirewallRuleName + '" dir=in action=allow program="' + HostPath +
     '" enable=yes profile=private,public remoteip=localsubnet protocol=TCP ' +
-    'localport=5001,7001,7100,8090';
+    'localport=any';
   AddUdpArguments := 'advfirewall firewall add rule name="' +
     WirelessFirewallRuleName + '" dir=in action=allow program="' + HostPath +
     '" enable=yes profile=private,public remoteip=localsubnet protocol=UDP ' +
-    'localport=1900';
+    'localport=any';
   Exec(ExpandConstant('{sys}\netsh.exe'), DeleteArguments, '', SW_HIDE,
     ewWaitUntilTerminated, ResultCode);
   if not Exec(ExpandConstant('{sys}\netsh.exe'), AddTcpArguments, '', SW_HIDE,
@@ -233,6 +285,47 @@ begin
     Log('Could not start netsh to add the wireless SSDP firewall rule.')
   else if ResultCode <> 0 then
     Log(Format('Could not add the wireless SSDP firewall rule: %d.', [ResultCode]));
+
+  { UxPlay is launched by the adapter in a child process. Use a second
+    program rule so the optional fallback receives the same local-subnet
+    access as the bundled receiver. }
+  HostPath := ExpandConstant('{app}\Wireless\UxPlay\uxplay.exe');
+  if FileExists(HostPath) then begin
+    AddTcpArguments := 'advfirewall firewall add rule name="' +
+      WirelessFirewallRuleName + ' UxPlay" dir=in action=allow program="' + HostPath +
+      '" enable=yes profile=private,public remoteip=localsubnet protocol=TCP ' +
+      'localport=any';
+    AddUdpArguments := 'advfirewall firewall add rule name="' +
+      WirelessFirewallRuleName + ' UxPlay" dir=in action=allow program="' + HostPath +
+      '" enable=yes profile=private,public remoteip=localsubnet protocol=UDP ' +
+      'localport=any';
+    Exec(ExpandConstant('{sys}\netsh.exe'), AddTcpArguments, '', SW_HIDE,
+      ewWaitUntilTerminated, ResultCode);
+    Exec(ExpandConstant('{sys}\netsh.exe'), AddUdpArguments, '', SW_HIDE,
+      ewWaitUntilTerminated, ResultCode);
+    { mDNS discovery uses the link-local multicast address 224.0.0.251,
+      which is not covered by remoteip=localsubnet. }
+    AddUdpArguments := 'advfirewall firewall add rule name="' +
+      WirelessFirewallRuleName + ' UxPlay mDNS" dir=in action=allow program="' + HostPath +
+      '" enable=yes profile=private,public protocol=UDP localport=5353';
+    Exec(ExpandConstant('{sys}\netsh.exe'), AddUdpArguments, '', SW_HIDE,
+      ewWaitUntilTerminated, ResultCode);
+  end;
+end;
+
+procedure EnsureBonjourService();
+var
+  ResultCode: Integer;
+begin
+  if not IsAdminInstallMode then
+    Exit;
+
+  Exec(ExpandConstant('{sys}\sc.exe'),
+    'config "Bonjour Service" start= auto', '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\sc.exe'),
+    'start "Bonjour Service"', '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode);
 end;
 
 procedure RemoveWirelessFirewall();
@@ -248,6 +341,12 @@ begin
     Log('Could not start netsh to remove the wireless AirPlay firewall rule.')
   else if ResultCode <> 0 then
     Log(Format('Could not remove the wireless AirPlay firewall rule: %d.', [ResultCode]));
+  Exec(ExpandConstant('{sys}\netsh.exe'),
+      'advfirewall firewall delete rule name="' + WirelessFirewallRuleName + ' UxPlay"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\netsh.exe'),
+      'advfirewall firewall delete rule name="' + WirelessFirewallRuleName + ' UxPlay mDNS"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
 function UserDataDirectory(Param: String): String;
@@ -283,7 +382,7 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  ResultCode: Integer;
+  DesktopShell: Variant;
 begin
   { A previous per-user installation shadows the all-users shortcut because
     both use the same AppUserModelID. Remove its shortcuts only when the user
@@ -295,7 +394,10 @@ begin
   end;
 
   if CurStep = ssPostInstall then
+  begin
     ConfigureWirelessFirewall();
+    EnsureBonjourService();
+  end;
 
   if (CurStep = ssDone) and
      (ExpandConstant('{param:STARTAPP|0}') = '1') then
@@ -303,7 +405,16 @@ begin
     { Give Restart Manager time to release handles from both application EXEs
       before the updated shared runtime is loaded by a new process. }
     Sleep(1000);
-    Exec(ExpandConstant('{app}\iPhoneMirror.exe'), '', ExpandConstant('{app}'),
-      SW_SHOWNORMAL, ewNoWait, ResultCode);
+    { This installer may already have been started by an elevated updater,
+      so ExecAsOriginalUser would still inherit its administrator token.
+      Ask the interactive desktop shell to launch at the user's normal level. }
+    try
+      DesktopShell := GetInteractiveDesktopShell();
+      DesktopShell.ShellExecute(ExpandConstant('{app}\iPhoneMirror.exe'), '',
+        ExpandConstant('{app}'), 'open', SW_SHOWNORMAL);
+    except
+      Log('Could not restart iPhoneMirror through the desktop shell: ' +
+        GetExceptionMessage);
+    end;
   end;
 end;

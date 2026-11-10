@@ -1,6 +1,7 @@
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { extname, join, normalize, resolve, sep } from 'node:path';
+import { pipeline } from 'node:stream/promises';
 
 const port = Number.parseInt(process.env.SRS_LAB_PORT ?? '8090', 10);
 const root = resolve(import.meta.dirname);
@@ -80,8 +81,18 @@ async function status() {
   }
 }
 
-createServer(async (request, response) => {
-  const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
+async function handleRequest(request, response) {
+  let url;
+  let pathname;
+  try {
+    url = new URL(request.url ?? '/', 'http://127.0.0.1');
+    pathname = decodeURIComponent(url.pathname);
+    if (pathname.includes('\0')) throw new URIError('Invalid path');
+  } catch {
+    response.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    response.end('Bad request');
+    return;
+  }
   if (url.pathname === '/api/status') {
     response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     response.end(JSON.stringify(await status()));
@@ -94,7 +105,7 @@ createServer(async (request, response) => {
     return;
   }
 
-  const relative = normalize(decodeURIComponent(url.pathname === '/' ? '/index.html' : url.pathname))
+  const relative = normalize(pathname === '/' ? '/index.html' : pathname)
     .replace(/^([/\\])+/, '');
   const file = join(root, relative);
   if (!file.startsWith(`${root}${sep}`) || !existsSync(file) || !statSync(file).isFile()) {
@@ -108,7 +119,17 @@ createServer(async (request, response) => {
     'Cache-Control': 'no-store',
   });
   if (request.method === 'HEAD') response.end();
-  else createReadStream(file).pipe(response);
+  else await pipeline(createReadStream(file), response);
+}
+
+createServer((request, response) => {
+  void handleRequest(request, response).catch(error => {
+    if (response.destroyed) return;
+    if (response.headersSent) { response.destroy(); return; }
+    const missing = error.code === 'ENOENT' || error.code === 'ENOTDIR';
+    response.writeHead(missing ? 404 : 500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    response.end(missing ? 'Not found' : 'Internal server error');
+  });
 }).listen(port, '127.0.0.1', () => {
   console.log(`Stream Lab dashboard: http://127.0.0.1:${port}`);
 });

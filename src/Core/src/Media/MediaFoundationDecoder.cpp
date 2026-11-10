@@ -109,6 +109,36 @@ std::vector<std::uint8_t> length_prefixed_to_annex_b(
     return result;
 }
 
+// Overload that reuses a caller-supplied buffer to avoid per-frame heap
+// allocation on the decode hot path. thread_local storage at the call site
+// keeps a per-thread capacity across frames.
+void length_prefixed_to_annex_b(std::span<const std::uint8_t> sample,
+    std::uint8_t length_size, std::vector<std::uint8_t>& result) {
+    if (length_size < 1 || length_size > 4) {
+        throw std::runtime_error("invalid video NAL length size");
+    }
+    result.clear();
+    result.reserve(sample.size() + 16);
+    std::size_t offset{};
+    while (offset < sample.size()) {
+        if (sample.size() - offset < length_size) {
+            throw std::runtime_error("truncated length-prefixed video NAL header");
+        }
+        std::uint32_t length{};
+        for (std::uint8_t index{}; index < length_size; ++index) {
+            length = (length << 8U) | sample[offset + index];
+        }
+        offset += length_size;
+        if (length == 0 || length > sample.size() - offset) {
+            throw std::runtime_error("invalid length-prefixed video NAL size");
+        }
+        result.insert(result.end(), {0, 0, 0, 1});
+        result.insert(result.end(), sample.begin() + static_cast<std::ptrdiff_t>(offset),
+            sample.begin() + static_cast<std::ptrdiff_t>(offset + length));
+        offset += length;
+    }
+}
+
 GUID input_subtype(coremedia::VideoCodec codec) {
     if (codec == coremedia::VideoCodec::H264) return MFVideoFormat_H264;
     if (codec == coremedia::VideoCodec::Hevc) return MFVideoFormat_HEVC;
@@ -394,12 +424,12 @@ std::optional<std::uint32_t> checked_nv12_buffer_size(
 
 bool copy_nv12_frame_letterboxed(const DecodedFrame& frame,
     std::span<std::uint8_t> output, std::uint32_t output_width,
-    std::uint32_t output_height) noexcept {
+    std::uint32_t output_height, bool canonicalize_sdr) noexcept {
     if (frame.nv12.empty() && frame.gpu_frame) {
         auto materialized = frame;
         if (!materialize_gpu_frame(materialized)) return false;
         return copy_nv12_frame_letterboxed(materialized, output,
-            output_width, output_height);
+            output_width, output_height, canonicalize_sdr);
     }
     if (frame.width == 0 || frame.height == 0 || output_width == 0 ||
         output_height == 0 || (output_width & 1U) != 0 ||
@@ -409,7 +439,9 @@ bool copy_nv12_frame_letterboxed(const DecodedFrame& frame,
     const auto required = checked_nv12_buffer_size(output_width, output_height);
     if (!required || output.size() < *required) return false;
 
-    const auto source_stride = static_cast<std::size_t>(std::abs(frame.stride));
+    // std::abs on INT32_MIN is undefined behavior; widen to 64-bit first.
+    const auto stride_ll = static_cast<std::int64_t>(frame.stride);
+    const auto source_stride = static_cast<std::size_t>(stride_ll < 0 ? -stride_ll : stride_ll);
     const auto component_bytes = frame.pixel_format == PixelFormat::P010 ? 2U : 1U;
     const auto source_y_row_bytes = static_cast<std::size_t>(frame.width) *
         component_bytes;
@@ -435,7 +467,8 @@ bool copy_nv12_frame_letterboxed(const DecodedFrame& frame,
 
     const auto output_y_bytes = static_cast<std::size_t>(output_width) *
         output_height;
-    const auto black_y = frame.color.range == coremedia::ColorRange::Full
+    const auto black_y = canonicalize_sdr ||
+        frame.color.range == coremedia::ColorRange::Full
         ? std::uint8_t{0} : std::uint8_t{16};
     std::fill_n(output.data(), output_y_bytes, black_y);
     std::fill(output.begin() + static_cast<std::ptrdiff_t>(output_y_bytes),
@@ -464,7 +497,16 @@ bool copy_nv12_frame_letterboxed(const DecodedFrame& frame,
     auto* destination_y = output.data();
     auto* destination_uv = output.data() + output_y_bytes;
 
+    const bool canonical_color = frame.pixel_format == PixelFormat::Nv12 &&
+        !frame.color.is_hdr() && frame.color.range == coremedia::ColorRange::Full &&
+        (frame.color.transfer == coremedia::TransferFunction::Bt709 ||
+            frame.color.transfer == coremedia::TransferFunction::Unspecified) &&
+        (frame.color.matrix == coremedia::MatrixCoefficients::Bt709 ||
+            frame.color.matrix == coremedia::MatrixCoefficients::Unspecified) &&
+        (frame.color.primaries == coremedia::ColorPrimaries::Bt709 ||
+            frame.color.primaries == coremedia::ColorPrimaries::Unspecified);
     if (frame.pixel_format == PixelFormat::Nv12 &&
+        (!canonicalize_sdr || canonical_color) &&
         content_width == frame.width && content_height == frame.height) {
         for (std::uint32_t y = 0; y < content_height; ++y) {
             std::memcpy(destination_y + static_cast<std::size_t>(top + y) *
@@ -528,6 +570,70 @@ bool copy_nv12_frame_letterboxed(const DecodedFrame& frame,
         return frame.pixel_format == PixelFormat::P010
             ? row[component * 2U + 1U] : row[component];
     };
+    if (canonicalize_sdr && !canonical_color) {
+        const auto conversion = yuv_conversion_parameters(
+            frame.pixel_format, frame.color.range, frame.color.matrix);
+        const auto sample_normalized = [&](const std::uint8_t* row,
+            std::size_t component) noexcept {
+            if (frame.pixel_format == PixelFormat::P010) {
+                const auto offset = component * 2U;
+                const auto value = static_cast<std::uint16_t>(row[offset]) |
+                    (static_cast<std::uint16_t>(row[offset + 1U]) << 8U);
+                return static_cast<double>(value) / 65535.0;
+            }
+            return static_cast<double>(row[component]) / 255.0;
+        };
+        const auto sample_rgb = [&](std::uint32_t x,
+            std::uint32_t y) noexcept {
+            const auto source_x = x_map[x];
+            const auto source_y_index = y_map[y];
+            const auto* y_row = source_y +
+                static_cast<std::size_t>(source_y_index) * source_stride;
+            const auto* uv_row = source_uv +
+                static_cast<std::size_t>(source_y_index / 2U) * source_stride;
+            const auto chroma_component = static_cast<std::size_t>(source_x / 2U) * 2U;
+            return convert_yuv_to_sdr(
+                sample_normalized(y_row, source_x),
+                sample_normalized(uv_row, chroma_component),
+                sample_normalized(uv_row, chroma_component + 1U),
+                frame.color, conversion);
+        };
+        const auto encode_luma = [](double value) noexcept {
+            return static_cast<std::uint8_t>(std::clamp(
+                static_cast<int>(std::lround(value * 255.0)), 0, 255));
+        };
+        const auto encode_chroma = [](double value) noexcept {
+            return static_cast<std::uint8_t>(std::clamp(
+                static_cast<int>(std::lround(value * 255.0 + 128.0)), 0, 255));
+        };
+        for (std::uint32_t y = 0; y < content_height; ++y) {
+            auto* destination_row = destination_y +
+                static_cast<std::size_t>(top + y) * output_width + left;
+            for (std::uint32_t x = 0; x < content_width; ++x) {
+                const auto rgb = sample_rgb(x, y);
+                destination_row[x] = encode_luma(
+                    0.2126 * rgb.red + 0.7152 * rgb.green + 0.0722 * rgb.blue);
+            }
+        }
+        for (std::uint32_t y = 0; y < content_height; y += 2U) {
+            auto* destination_row = destination_uv +
+                static_cast<std::size_t>((top + y) / 2U) * output_width + left;
+            for (std::uint32_t x = 0; x < content_width; x += 2U) {
+                const auto a = sample_rgb(x, y);
+                const auto b = sample_rgb(x + 1U, y);
+                const auto c = sample_rgb(x, y + 1U);
+                const auto d = sample_rgb(x + 1U, y + 1U);
+                const auto red = (a.red + b.red + c.red + d.red) * 0.25;
+                const auto green = (a.green + b.green + c.green + d.green) * 0.25;
+                const auto blue = (a.blue + b.blue + c.blue + d.blue) * 0.25;
+                destination_row[x] = encode_chroma(
+                    -0.114572 * red - 0.385428 * green + 0.5 * blue);
+                destination_row[x + 1U] = encode_chroma(
+                    0.5 * red - 0.454153 * green - 0.045847 * blue);
+            }
+        }
+        return true;
+    }
     for (std::uint32_t y = 0; y < content_height; ++y) {
         const auto* source_row = source_y + static_cast<std::size_t>(y_map[y]) *
             source_stride;
@@ -551,17 +657,24 @@ bool copy_nv12_frame_letterboxed(const DecodedFrame& frame,
     return true;
 }
 
+bool copy_nv12_frame_letterboxed_sdr(const DecodedFrame& frame,
+    std::span<std::uint8_t> output, std::uint32_t output_width,
+    std::uint32_t output_height) noexcept {
+    return copy_nv12_frame_letterboxed(frame, output, output_width,
+        output_height, true);
+}
+
 bool materialize_gpu_frame(DecodedFrame& frame) noexcept {
     if (!frame.nv12.empty()) return true;
     if (!frame.gpu_frame || !frame.gpu_frame->shared_handle) return false;
-    ComPtr<IDXGIKeyedMutex> keyed_mutex;
-    bool keyed_acquired = false;
+    static std::mutex materialize_mutex;
+    static ComPtr<ID3D11Device> device;
+    static ComPtr<ID3D11Device1> device1;
+    static ComPtr<ID3D11DeviceContext> context;
+    static ComPtr<ID3D11Texture2D> staging_texture;
+    static D3D11_TEXTURE2D_DESC staging_description{};
+    std::scoped_lock lock(materialize_mutex);
     try {
-        static std::mutex materialize_mutex;
-        static ComPtr<ID3D11Device> device;
-        static ComPtr<ID3D11Device1> device1;
-        static ComPtr<ID3D11DeviceContext> context;
-        std::scoped_lock lock(materialize_mutex);
         if (!device) {
             constexpr D3D_FEATURE_LEVEL levels[] = {
                 D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
@@ -575,47 +688,71 @@ bool materialize_gpu_frame(DecodedFrame& frame) noexcept {
         check(device1->OpenSharedResource1(
             static_cast<HANDLE>(frame.gpu_frame->shared_handle),
             IID_PPV_ARGS(&shared_texture)), "open CPU materialize shared texture");
+        ComPtr<IDXGIKeyedMutex> keyed_mutex;
         check(shared_texture.As(&keyed_mutex), "query CPU materialize keyed mutex");
         const auto acquire = keyed_mutex->AcquireSync(1, 1000);
         if (acquire != WAIT_OBJECT_0)
             throw std::runtime_error("CPU materialize shared texture acquire timed out");
-        keyed_acquired = true;
+        struct ReadbackLocks {
+            IDXGIKeyedMutex* mutex;
+            ID3D11DeviceContext* context;
+            ID3D11Texture2D* mapped_texture{};
+            ~ReadbackLocks() {
+                if (mapped_texture) context->Unmap(mapped_texture, 0);
+                (void)mutex->ReleaseSync(1);
+            }
+        } locks{keyed_mutex.Get(), context.Get()};
 
         D3D11_TEXTURE2D_DESC source_description{};
         shared_texture->GetDesc(&source_description);
+        if (source_description.Width != frame.width ||
+            source_description.Height != frame.height ||
+            source_description.MipLevels != 1 || source_description.ArraySize != 1 ||
+            source_description.SampleDesc.Count != 1 ||
+            source_description.Format != (frame.pixel_format == PixelFormat::P010
+                ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12)) return false;
         auto staging = source_description;
         staging.Usage = D3D11_USAGE_STAGING;
         staging.BindFlags = 0;
         staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         staging.MiscFlags = 0;
-        ComPtr<ID3D11Texture2D> staging_texture;
-        check(device->CreateTexture2D(&staging, nullptr, &staging_texture),
-            "create CPU materialize staging texture");
+        // CPU output runs at video cadence. Reuse the readback allocation
+        // until the source size/format changes; the mutex also protects Map.
+        if (!staging_texture || staging.Width != staging_description.Width ||
+            staging.Height != staging_description.Height ||
+            staging.Format != staging_description.Format ||
+            staging.SampleDesc.Quality != staging_description.SampleDesc.Quality) {
+            ComPtr<ID3D11Texture2D> replacement;
+            check(device->CreateTexture2D(&staging, nullptr, &replacement),
+                "create CPU materialize staging texture");
+            staging_texture = std::move(replacement);
+            staging_description = staging;
+        }
         context->CopyResource(staging_texture.Get(), shared_texture.Get());
         D3D11_MAPPED_SUBRESOURCE mapped{};
         check(context->Map(staging_texture.Get(), 0, D3D11_MAP_READ, 0, &mapped),
             "map CPU materialize staging texture");
+        locks.mapped_texture = staging_texture.Get();
         const auto stride = static_cast<std::size_t>(mapped.RowPitch);
         const auto y_bytes = stride * frame.height;
         const auto uv_bytes = stride * ((static_cast<std::size_t>(frame.height) + 1U) / 2U);
         if (!mapped.pData || stride == 0 || y_bytes + uv_bytes >
             detail::MaxDxgiReadbackBytes)
-        {
-            context->Unmap(staging_texture.Get(), 0);
-            (void)keyed_mutex->ReleaseSync(1);
-            keyed_acquired = false;
             return false;
-        }
         frame.nv12.resize(y_bytes + uv_bytes);
         const auto* source = static_cast<const std::uint8_t*>(mapped.pData);
         std::memcpy(frame.nv12.data(), source, frame.nv12.size());
         frame.stride = static_cast<std::int32_t>(stride);
-        context->Unmap(staging_texture.Get(), 0);
-        (void)keyed_mutex->ReleaseSync(1);
-        keyed_acquired = false;
         return true;
     } catch (...) {
-        if (keyed_acquired && keyed_mutex) (void)keyed_mutex->ReleaseSync(1);
+        // A removed device cannot serve the next readback. Rebuild all cached
+        // resources together after RAII has unmapped/released the old ones.
+        if (device && (!device1 || FAILED(device->GetDeviceRemovedReason()))) {
+            staging_texture.Reset();
+            context.Reset();
+            device1.Reset();
+            device.Reset();
+        }
         return false;
     }
 }
@@ -1337,7 +1474,16 @@ struct MediaFoundationVideoDecoder::Impl {
         const D3D11_BOX visible_box{0, 0, 0, format.width, format.height, 1};
         d3d_context->CopySubresourceRegion(selected_slot->texture.Get(), 0, 0, 0, 0,
             source, source_subresource, &visible_box);
-        if (FAILED(selected_slot->mutex->ReleaseSync(1))) return false;
+        const auto release_hr = selected_slot->mutex->ReleaseSync(1);
+        if (FAILED(release_hr)) {
+            // The keyed mutex is now in an inconsistent state; record the
+            // HRESULT so consumers are not left blocking silently on the next
+            // AcquireSync before giving up on this slot.
+            logging::write(std::format(
+                "mf_decoder keyed_mutex release failed hr=0x{:08X}",
+                static_cast<unsigned int>(release_hr)));
+            return false;
+        }
 
         if (!selected_slot->frame) {
             ComPtr<IDXGIResource1> resource;
@@ -1608,26 +1754,33 @@ struct MediaFoundationVideoDecoder::Impl {
 
     std::vector<DecodedFrame> decode_once(std::span<const std::uint8_t> source,
         std::int64_t timestamp, std::int64_t duration, bool random_access) {
-        auto encoded = length_prefixed_to_annex_b(source, format.nalu_length_size);
+        // Reuse a per-thread buffer across frames to avoid per-frame heap
+        // allocation on the decode hot path. Only the first frame (which
+        // prepends parameter sets) allocates a fresh vector.
+        thread_local static std::vector<std::uint8_t> annex_b_buffer;
+        length_prefixed_to_annex_b(source, format.nalu_length_size, annex_b_buffer);
+        const std::vector<std::uint8_t>* encoded = &annex_b_buffer;
+        std::vector<std::uint8_t> parameter_sets_storage;
         if (!sent_parameter_sets) {
-            auto parameter_sets = parameter_sets_annex_b(format);
-            parameter_sets.insert(parameter_sets.end(), encoded.begin(), encoded.end());
-            encoded = std::move(parameter_sets);
+            parameter_sets_storage = parameter_sets_annex_b(format);
+            parameter_sets_storage.insert(parameter_sets_storage.end(),
+                annex_b_buffer.begin(), annex_b_buffer.end());
+            encoded = &parameter_sets_storage;
             sent_parameter_sets = true;
         }
-        if (encoded.size() > std::numeric_limits<DWORD>::max())
+        if (encoded->size() > std::numeric_limits<DWORD>::max())
             throw std::runtime_error("compressed video sample is too large");
         ComPtr<IMFSample> sample;
         ComPtr<IMFMediaBuffer> buffer;
         check(MFCreateSample(&sample), "create decoder input sample");
-        check(MFCreateMemoryBuffer(static_cast<DWORD>(encoded.size()), &buffer),
+        check(MFCreateMemoryBuffer(static_cast<DWORD>(encoded->size()), &buffer),
             "create decoder input buffer");
         BYTE* destination{};
         DWORD capacity{};
         check(buffer->Lock(&destination, &capacity, nullptr), "lock decoder input buffer");
-        std::copy(encoded.begin(), encoded.end(), destination);
+        std::copy(encoded->begin(), encoded->end(), destination);
         buffer->Unlock();
-        check(buffer->SetCurrentLength(static_cast<DWORD>(encoded.size())),
+        check(buffer->SetCurrentLength(static_cast<DWORD>(encoded->size())),
             "set decoder input length");
         check(sample->AddBuffer(buffer.Get()), "attach decoder input buffer");
         check(sample->SetSampleTime(timestamp), "set decoder sample time");

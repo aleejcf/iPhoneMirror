@@ -1,7 +1,9 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <!-- This WPF tool uses Win32 APIs, not WinRT projections. Avoid implicitly
+         shipping the unused 25 MB Windows SDK projection assembly. -->
+    <TargetFramework>net10.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -9,9 +11,9 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <AssemblyName>iPhoneMirror.Driver</AssemblyName>
     <RootNamespace>IPhoneMirror.DriverInstaller</RootNamespace>
-    <Version>1.8.1</Version>
-    <AssemblyVersion>1.8.1.0</AssemblyVersion>
-    <FileVersion>1.8.1.0</FileVersion>
+    <Version>1.8.5-pre3</Version>
+    <AssemblyVersion>1.8.5.0</AssemblyVersion>
+    <FileVersion>1.8.5.0</FileVersion>
     <Authors>RayrenSX</Authors>
     <Product>iPhoneMirror Driver Manager</Product>
     <Description>Standalone Apple USB and per-device capture driver manager for iPhoneMirror.</Description>
@@ -35,8 +37,10 @@
              Link="Networking\SegmentedHttpDownloader.cs" />
     <Compile Include="..\Shared\Security\ElevationPathLock.cs"
              Link="Security\ElevationPathLock.cs" />
+    <Compile Include="..\SharedUI\Services\AccessibilityAppearance.cs" Link="Services\AccessibilityAppearance.cs" />
     <Compile Include="..\SharedUI\Services\WindowWorkAreaController.cs"
              Link="Services\WindowWorkAreaController.cs" />
+    <Compile Include="..\SharedUI\Animations\SurfaceMotion.cs" Link="Animations\SurfaceMotion.cs" />
     <Compile Include="..\SharedUI\Animations\PageTransition.cs"
              Link="Animations\PageTransition.cs" />
     <Compile Include="..\SharedUI\Controls\ModernButton.cs"
@@ -45,6 +49,14 @@
              Link="Controls\ModernCard.cs" />
     <Compile Include="..\SharedUI\Controls\ModernDialog.cs"
              Link="Controls\ModernDialog.cs" />
+    <Page Include="..\SharedUI\Themes\DesignTokens.xaml" Link="Themes\DesignTokens.xaml" />
+    <Page Include="..\SharedUI\Controls\Inputs.xaml" Link="Controls\Inputs.xaml" />
+    <Page Include="..\SharedUI\Controls\Buttons.xaml" Link="Controls\Buttons.xaml" />
+    <Compile Include="..\SharedUI\Controls\StatusAppearance.cs" Link="Controls\StatusAppearance.cs" />
+    <Compile Include="..\SharedUI\Controls\DialogKeyboard.cs" Link="Controls\DialogKeyboard.cs" />
+    <Compile Include="..\SharedUI\Controls\ComboBoxTextLayout.cs" Link="Controls\ComboBoxTextLayout.cs" />
+    <Compile Include="..\SharedUI\Controls\DialogViewport.cs" Link="Controls\DialogViewport.cs" />
+    <Compile Include="..\SharedUI\Controls\RoundedWindow.cs" Link="Controls\RoundedWindow.cs" />
     <Page Include="..\SharedUI\Themes\LightTheme.xaml"
           Link="Themes\LightTheme.xaml" />
     <Page Include="..\SharedUI\Themes\DarkTheme.xaml"
@@ -67,6 +79,8 @@
     </Content>
     <EmbeddedResource Include="..\..\scripts\remove_selected_iphone_drivers.ps1"
                       LogicalName="DriverCleanup.Script.ps1" />
+    <EmbeddedResource Include="Services\DriverElevation.Bootstrap.ps1"
+                      LogicalName="DriverElevation.Bootstrap.ps1" />
     <Content Include="$(NuGetPackageRoot)wpf-ui\4.3.0\LICENSE.md"
              Condition="Exists('$(NuGetPackageRoot)wpf-ui\4.3.0\LICENSE.md')">
       <Link>licenses\WPF-UI-LICENSE.md</Link>

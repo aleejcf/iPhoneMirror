@@ -1,0 +1,319 @@
+# iUsbBridge.exe 调用文档
+
+`iUsbBridge.exe` 是 iPhoneMirror 的输入桥接进程。它通过 Apple
+usbmuxd 建立 CoreDevice 隧道，再向 Universal HID 服务发送触控和键盘报告。
+程序本身不提供交互式命令行输入；启动后通过标准输入接收二进制长度前缀的
+JSON 消息，通过标准输出发送 JSON Lines 状态事件。
+
+## 1. 基本位置
+
+```text
+dist/iUsbBridge.exe
+```
+
+上述路径相对仓库根目录；发布包中的 EXE 位于应用目录。它必须与
+`iUsbBridge.runtime.json` 和 `_internal` 一起部署，不能只复制单个 EXE。
+构建来源和依赖版本见[开发指南](DEVELOPMENT.md#桥接器构建来源)。
+
+查看参数：
+
+```powershell
+.\dist\iUsbBridge.exe --help
+```
+
+## 2. 启动参数
+
+```text
+iUsbBridge.exe [--usb | --wireless] [--udid UDID] [--rate-hz HZ] [--ddi-dir DIRECTORY]
+iUsbBridge.exe --enable-wifi-sync --udid UDID
+```
+
+参数说明：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--usb` | 只选择 usbmuxd 的 `USB` 设备。默认值。 |
+| `--wireless` | 优先连接 usbmuxd 的 `Network` 设备；若记录不存在，使用已完成配对的 RemotePairing mDNS 隧道，不会回退到 USB。 |
+| `--udid` | 指定目标设备 UDID；不指定时使用该传输类型发现到的第一个设备。 |
+| `--rate-hz` | 输入速率提示值，默认 `120`。它不会改变键盘报告格式。 |
+| `--enable-wifi-sync` | 为指定 UDID 通过 USB 启用 Apple Wi-Fi 同步后退出；会改变设备设置，不启动通常的输入会话。必须同时提供 `--udid`。 |
+| `--ddi-dir` | 可选的本地 Personalized DDI 目录，仅在设备尚未挂载镜像时使用；目录必须包含 `Image.dmg`、`BuildManifest.plist`、`Image.trustcache`。未传入时桥接器直接从 GitHub 官方 API 动态解析 commit 和文件清单，校验 Git blob 身份、文件大小及本地 SHA-256，并要求 manifest build 与当前运行时匹配。 |
+
+`--usb` 与 `--wireless` 互斥，必须最多指定一个。
+
+### USB 模式
+
+```powershell
+.\dist\iUsbBridge.exe --usb
+.\dist\iUsbBridge.exe --usb --udid "替换为目标设备UDID"
+```
+
+USB 模式要求 iPhone 通过数据线连接、已解锁并信任此电脑。
+
+在有线控制提示中点击“继续”后，若开发者模式尚未开启，桥接器会通过
+`com.apple.amfi.lockdown` 的 `action=0` 请求显示设置中的“开发者模式”开关。
+设备确认后发送 `user_action_required` 事件（`code=developer_mode_revealed`），
+结束本次连接并释放 USB 资源，界面显示“等待在手机上开启开发者模式”，不记录为控制失败。
+请在手机的
+“设置 > 隐私与安全性 > 开发者模式”中手动开启、重启并确认，再回到窗口点击“重试”。
+这一步只显示开关，不会自动开启模式或重启手机。已开启时继续正常准备 DDI。
+请求被拒绝或超时分别返回 `developer_mode_reveal_failed` / `developer_mode_reveal_timeout`，
+不会提示已成功显示；无线控制和只读配置检查不会发送此请求。
+
+当前源码对 iOS 27 使用 Cryptex DDI 准备流程：通过目标手机的可信 USB 连接建立
+CoreDevice/RSD 隧道，从固定的上游提交下载 Cryptex 镜像，校验大小、SHA-256、
+manifest 构建号和 payload digest，再请求 Apple 个性化签名并安装。安装完成后关闭
+准备隧道，重新建立控制会话，使 HID 服务列表刷新。已经安装的 Cryptex DDI 会保留；
+缺少真实触控 surface 时仍会报错，不会仅凭安装成功报告反控可用。
+
+标准 ZIP 与 Setup 内置固定版本的 Personalized 和 Cryptex DDI。Cryptex 优先校验并读取
+`tools/ddi/Xcode_iOS_DDI_Cryptex`，无需先下载镜像；Apple 个性化签名仍需访问 Apple 服务。
+内置文件缺失或损坏时，回退缓存 `%LOCALAPPDATA%\iPhoneMirror\DDI\Cryptex1` 和下载。
+下载优先使用 `raw.githubusercontent.com`，连接或 HTTP
+错误时回退到 GitHub API 的同一固定提交，仍执行全部校验。`--ddi-dir` 的三文件 PersonalizedDMG
+目录适用于旧流程，不能代替 iOS 27 的 Cryptex 镜像。无线缺少 HID 时会通过同一台手机
+的 USB 连接准备 DDI，然后重建无线会话；未插线时仍需先连接 USB 完成准备。
+
+### 无线模式
+
+```powershell
+.\dist\iUsbBridge.exe --wireless
+.\dist\iUsbBridge.exe --wireless --udid "替换为目标设备UDID"
+```
+
+无线模式使用 Apple 的 usbmux `Network` 设备记录或 CoreDevice 的 RemotePairing
+mDNS 隧道，不是 AirPlay，也不是直接连接某个固定 TCP 端口。首次使用通常需要：
+
+1. 先通过 USB 连接并信任 iPhone，并成功启动一次 USB 反控。桥接器会在这个可信 USB 会话中准备 RemotePairing 记录。
+2. 在 Apple Devices 或 iTunes 中启用“通过 Wi-Fi 同步此 iPhone”。
+3. 让电脑和 iPhone 位于同一局域网，并保持 iPhone 解锁。
+4. 保持 Apple Mobile Device Service 和 usbmuxd 正常运行；Windows 防火墙需要允许 Bonjour/mDNS（UDP 5353）。
+5. 若设备以 `Network` 类型出现在 usbmuxd 中，桥接器可直接使用；否则会自动尝试已配对的 RemotePairing 服务。
+
+可用 Python 检查设备类型：
+
+```powershell
+python -c "import asyncio; from pymobiledevice3.usbmux import list_devices; print(asyncio.run(list_devices()))"
+```
+
+如果没有 `Network` 设备，桥接器会尝试 RemotePairing 发现；缺少 RemotePairing
+记录时会返回 `wireless_remote_pairing_required`，不会偷偷使用 USB 设备。
+
+## 3. 启动事件
+
+stdout 每行是一个 JSON 对象。常见事件如下：
+
+```jsonl
+{"event":"status","code":"connecting_device","message":"正在建立USB设备会话"}
+{"event":"status","code":"initializing_touch","message":"正在初始化触控通道"}
+{"event":"ready","protocol":2,"capabilities":["iphoneMirror.usb_touch.v2","iphoneMirror.usb_keyboard.v1"],"udid":"...","rateHz":120,"gateOpen":true,"authMode":"direct","transport":"usb"}
+```
+
+事件类型：
+
+| `event` | 含义 |
+| --- | --- |
+| `status` | 连接、初始化或结束状态。 |
+| `ready` | HID 会话已建立，可以发送输入帧。 |
+| `warning` | 认证 gate、媒体流等非致命问题。 |
+| `error` | 消息格式、连接或 HID 发送失败；进程通常随后退出。 |
+| `clipboard_text` | 显式读取或可用的剪贴板监测返回文本，字段为 `text`。 |
+
+桥接器只会在 `gateOpen=true` 且已验证 mainTouchscreen（Service ID `257`）时发布
+`ready`。`authMode` 为 `mediastream` 或 `direct`；后者表示媒体流认证被拒后，
+通过 direct Universal HID 验证的回退路径。已挂载 DDI 缺少该 surface 时，桥接器会
+在旧镜像流程中自动重挂一次而非报告一个无法触控的 ready；Cryptex 流程保留现有镜像，
+通过重新连接刷新服务列表，仍缺少 surface 时报告失败。
+
+## 4. stdin 消息封装
+
+每条消息必须按以下格式写入 stdin：
+
+```text
+4 字节 little-endian 无符号长度
+长度字节的 UTF-8 JSON
+```
+
+长度只表示 JSON 字节数，不包含前面的 4 字节。当前 `MAX_FRAME_SIZE` 为
+`4 * 1024 * 1024` 字节（4 MiB）；长度为 0 或超限会被拒绝。
+stdout 始终按行读取，不能使用相同长度前缀解码。`ready.protocol=2` 与运行时清单
+schema `1` 是两个独立版本，不能混用。
+
+## 5. 触控帧
+
+消息结构：
+
+```json
+{
+  "schema": "iphoneMirror.touch.v2",
+  "kind": "touch_batch",
+  "seq": 1,
+  "timestampNs": 1234567890,
+  "points": [
+    {"pointerId": 0, "action": "down", "normalizedX": 0.5, "normalizedY": 0.5}
+  ]
+}
+```
+
+约束：
+
+- `seq` 必须是非负整数，建议每帧递增。
+- `action` 为 `down`、`move` 或 `up`。
+- `normalizedX`、`normalizedY` 必须在 `0.0` 到 `1.0` 之间。
+- 每帧最多 5 个触点，`pointerId` 在同一帧内不能重复。
+- 同一个 `pointerId` 的 `down`、`move`、`up` 会被映射到稳定的 0 到 4 号 HID slot。
+
+## 6. 键盘帧
+
+消息结构：
+
+```json
+{
+  "schema": "iphoneMirror.touch.v2",
+  "kind": "keyboard_batch",
+  "seq": 2,
+  "timestampNs": 1234567891,
+  "usages": [4, 224]
+}
+```
+
+`usages` 是“当前仍按住的全部按键”，不是增量事件：
+
+- 按下 `A`：发送 `[4]`。
+- 按住 `A` 再按左 Shift：发送 `[4, 225]`。
+- 释放 `A`、仍按左 Shift：发送 `[225]`。
+- 释放全部按键：发送 `[]`。
+
+常用 USB HID usage：
+
+| 按键 | usage | 按键 | usage |
+| --- | ---: | --- | ---: |
+| `A` | `4` | `Z` | `29` |
+| `1` | `30` | `0` | `39` |
+| `Enter` | `40` | `Esc` | `41` |
+| `Backspace` | `42` | `Tab` | `43` |
+| `Space` | `44` | `Left Shift` | `225` |
+| `Left Ctrl` | `224` | `Left Alt` | `226` |
+| `Right Ctrl` | `228` | `Right Alt` | `230` |
+
+键盘帧最多 30 个 usage，每个 usage 必须在 `0` 到 `239` 之间。桥接器会注册
+一个虚拟 Universal HID 键盘，并在退出前发送空列表释放所有按键。
+
+## 7. 系统按键与剪贴板
+
+以下消息同样采用 `iphoneMirror.touch.v2` 封装，在收到并验证目标设备 `ready` 后发送。
+
+| kind | 字段与语义 |
+|---|---|
+| `button_event` | `seq` 非负；`usagePage` / `usageCode` 为 0–65535；`state` 为 `down`、`up` 或 `canceled`，按下与释放应配对 |
+| `paste_text` | `text` 为字符串；桥接器异步尝试向设备粘贴，实际可用性受设备服务限制 |
+| `read_clipboard` | 请求设备文本，结果通过 `clipboard_text` 事件返回；失败可报告 `clipboard_read_failed` |
+
+剪贴板是有超时的辅助功能，不能把未收到剪贴板结果当作 HID 已断开。
+USB 与无线反控均以约 0.8 秒间隔后台读取设备文本，在当前 RSD 会话上串行执行，
+每次 PULL/SET 使用独立剪贴板连接，避免同一连接重复请求被设备拒绝；读取失败时
+退避至最长 8 秒，恢复后回到正常间隔，并记录
+`clipboard_poll_failed` / `clipboard_poll_recovered`。反控恢复期间暂停轮询。
+支持 UTF-8、UTF-16 文本与 URL。优先读取主表示；若富文本的纯文本表示尚待解析，
+则在同一读取超时内用新连接补读一次。仍未解析的文本按读取失败处理，不误报为空剪贴板。
+主动粘贴排队后暂停新的轮询读取；等待连接锁最多 20 秒，覆盖一个正在执行的 8 秒轮询及其
+清理；获取锁后另有 8 秒服务操作超时，覆盖设备端 Pasteboard daemon 唤醒较慢的情况，避免
+读写必然超时。Windows→iOS 的
+超时写入会在同一粘贴顺序锁内有界重试一次；超时后的 SET 可能已经到达设备，因此重试保持
+幂等，并继续保留未确认写入的来源信息。自动重试仅限 SET，不重发可能已经生效的
+Command+V 按键；Command 按下发送失败时也尝试释放。Windows 左右 Ctrl+V 均触发文本粘贴。
+读取 Windows 文本时若剪贴板暂时被占用，在 UI 的 STA 线程上最多尝试 5 次；
+等待期间切换设备、窗口失焦或键盘所有权变化会取消这次读取。
+成功写入手机的 Windows 文本会更新轮询
+基准，不再回传覆盖电脑上的新复制内容；写入前已开始的旧读取也会失效。
+如果 SET 已发起但响应超时或取消，则保留未确认写入的来源信息：下次有效轮询若读到
+相同文本，将其作为基准而不回传；若读到不同内容则正常同步，并清除待确认记录。
+连接或排队失败、尚未发起 SET 时不抑制设备文本。无法区分未确认 SET 与期间在手机上
+独立复制的同文内容，因此首次匹配保守按主机回传处理；之后观察到内容变化仍正常同步。
+Windows 端跟随最后选中的控制设备，投屏窗口失焦后仍同步；其他设备的最新内容
+按设备缓存。Windows 剪贴板被占用时按每组最多 5 次尝试，并在仍被占用时延迟后继续重试，
+直到成功或该结果失效；首次连续失败只记录一次错误。重试期间如出现新的本地复制、
+设备内容更新或桥接替换，则旧结果失效。空文本或非文本内容取消旧重试，不清空 Windows 剪贴板。
+每次设备读取先发出带有 `readId` 的 `clipboard_read_started`，Windows 在此事件到达、
+尚未排入 UI 队列时捕获剪贴板序号；`clipboard_text` 携带相同编号。慢速 PULL 期间或
+UI 排队期间的新本地复制都会使旧结果失效。读取结束（包括内容未变、失败和取消）均发出
+`clipboard_read_finished`，释放该编号的快照。主动读取与轮询串行发布，反向写入或会话
+恢复期间的旧结果不发布；主动读取也遵循未确认 SET 的防回写规则。
+旧桥接器没有编号时仍兼容按文本事件到达时间捕获序号。应用自身成功写入造成的序号变化会传递给仍有效的设备缓存及排队
+事件，不会误使另一台设备的待同步内容失效；已被外部复制覆盖的旧结果不会因此恢复。
+恢复期间客户端应暂停发送旧会话输入，重新验证 `ready` 后恢复路由。
+
+## 8. Python 调用示例
+
+以下示例启动 USB 模式，等待 `ready`，发送一次 `A`，再释放键盘并退出。
+
+```python
+import json
+import struct
+import subprocess
+from pathlib import Path
+
+exe = str(Path("dist/iUsbBridge.exe").resolve())  # 从仓库根目录运行
+p = subprocess.Popen(
+    [exe, "--usb"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    text=False,
+)
+
+def send(message):
+    raw = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    p.stdin.write(struct.pack("<I", len(raw)))
+    p.stdin.write(raw)
+    p.stdin.flush()
+
+while True:
+    line = p.stdout.readline()
+    if not line:
+        raise RuntimeError("bridge exited before ready; inspect stderr")
+    event = json.loads(line)
+    print(event)
+    if (event.get("event") == "ready" and event.get("protocol") == 2
+            and event.get("gateOpen") is True):
+        break
+    if event.get("event") == "error":
+        raise RuntimeError(event)
+
+send({"schema":"iphoneMirror.touch.v2", "kind":"keyboard_batch",
+      "seq":1, "timestampNs":0, "usages":[4]})
+send({"schema":"iphoneMirror.touch.v2", "kind":"keyboard_batch",
+      "seq":2, "timestampNs":0, "usages":[]})
+
+p.stdin.close()
+p.wait(timeout=10)
+```
+
+将启动参数替换为 `"--wireless"` 即可使用无线模式；也可以同时加入
+`"--udid", "设备UDID"`。
+
+## 9. 常见错误
+
+| 错误/现象 | 处理方式 |
+| --- | --- |
+| `没有 USB 设备` | 检查数据线、信任状态、Apple Mobile Device Service 和 usbmuxd。 |
+| `wireless_remote_pairing_required` | 先通过可信 USB 启动一次 USB 反控，以创建 RemotePairing 记录。 |
+| `wireless_device_not_discoverable` | 确认同一局域网、iPhone 已解锁，并允许 Windows 防火墙的 Bonjour/mDNS（UDP 5353）。 |
+| `wireless_remote_pairing_failed` | RemotePairing 隧道握手失败；重新 USB 初始化后再检查局域网与防火墙。 |
+| `developer_mode_required` | 在设备的“设置 > 隐私与安全性 > 开发者模式”中开启开发者模式并重启设备。 |
+| `developer_image_download_failed` / `developer_image_download_timeout` | DDI 下载或 GitHub 元数据解析失败；检查 GitHub 网络、限流状态后重试。 |
+| `developer_image_download_integrity_failed` / `developer_image_download_rate_limited` | 下载内容未通过完整性校验或线路被限流；稍后重试，或用 `--ddi-dir` 提供官方本地镜像。 |
+| `developer_image_tss_failed` | DDI 已下载，但 Apple 个性化服务或设备挂载失败；保持设备解锁并检查 Apple 服务网络。 |
+| `touch_surface_unavailable` | 设备 DDI 未提供 mainTouchscreen（257）；桥会自动刷新一次，仍失败时重启设备后重试。 |
+| `remote_control_unsupported_ios` 或 `9021` | 媒体流被拒且 direct Universal HID 也不可用；检查 DDI 后重试或改用蓝牙反控。 |
+| `unsupported touch message schema` | 检查 `schema`、`kind`、字段名和长度前缀。 |
+| 按键卡住 | 发送 `keyboard_batch` 且 `usages: []`；关闭程序时桥接器也会尝试自动释放。 |
+
+## 10. 与 iPhoneMirror 主程序的关系
+
+iPhoneMirror 主程序通过同样的 stdin/stdout 协议启动 bridge。当前 USB 控制
+路径传入 `--usb`；无线设备传入 `--wireless`。无线桥接会先检查所选 UDID 的
+usbmux `Network` 记录，缺失时再通过相同 UDID 的 RemotePairing 记录发现设备。
+
+有线投屏激活 QuickTime 配置后，Apple usbmuxd 可能暂时看不到手机。桥接器会尝试
+接管该设备的 USBMux 接口，并在动态回环端口提供进程内兼容服务；视频仍走 C++ 核心。
+释放时只关闭自己持有的接口与监听器，USB 配置恢复由投屏核心负责。

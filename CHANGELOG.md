@@ -5,10 +5,273 @@ All notable changes to iPhoneMirror are documented here. The project follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Automatically reconnect only the affected iPhone's USB port if Apple's
+  management connection remains missing after wired mirroring cleanup. Request
+  administrator approval when needed and verify recovery before reporting success.
+- Bundle both pinned x64 USB backend DLLs inside the frozen bridge's `_internal`
+  directory, and require native backend loading during its build-time self-check.
+  Release manifest validation now rejects packages missing either USB backend.
+  Override PyInstaller's host USB discovery so DLL aliases on the build machine
+  cannot shadow the bundled libusb0 backend.
+- Reject capture-mux listener startup timeouts instead of advertising an unbound
+  address; cancellation closes listeners created during startup and retires the
+  server loop before returning.
+- Close capture-mux connections when clients disconnect during startup or cancel
+  forwarding, including USB connections returned after cancellation; retire both
+  forwarding tasks with their owner.
+- Release partially initialized capture USB control interfaces before retry or
+  fallback, preserving the original error if device removal also breaks cleanup.
+  Retain USB configuration restore-helper failures in native diagnostics.
+- Let USB configuration recovery observe a full window after its helper returns.
+  Wait for control bridges before capture teardown and allow normal window exit
+  enough time for each active device's bounded cleanup.
+- Require an exact USB device record when confirming recovery after wired
+  mirroring; a wireless record no longer counts as restored USB connectivity.
+  Log individual USB/PnP recovery transitions for timeout diagnosis.
+- Distinguish missing wireless advertisements from failed connections to
+  advertised routes, preserving handshake diagnostics and pairing guidance.
+- Keep Apple's standard USB control route available when the optional capture
+  backend cannot load or USB discovery fails, including during capture retries.
+- Bound all Lockdown handshake retries, including USB DDI preparation for
+  wireless control, and close partially initialized device sockets on cancellation.
+- Retry alternate HID services after startup stream resets and verify each
+  candidate's live connection before selection; preserve dead-tunnel recovery.
+- Retry brief Windows sharing conflicts when atomically selecting a DDI cache
+  snapshot, retaining cancellation, bounded waits and the previous cache.
+- Keep DDI mirrors eligible when Range probes fail, and prefer a source that
+  completed a verified download for the remaining files. Report cache creation,
+  disk-space and write-access failures without retrying unrelated mirrors.
+- Try wireless RemotePairing after initial Network usbmux connection resets or
+  transport failures, while preserving device trust and lock-screen errors.
+- Bound each DDI source attempt and inspect partial socket reads so a slow
+  download cannot consume the entire fallback budget. Apply the same streaming
+  deadline checks to metadata and mirror probes; log transfer bytes and timing.
+- Reconcile key recording as well as keyboard routing after hook recovery, so
+  lost releases do not stall recording or leave shortcuts blocked after cancellation.
+- Fall back to RemotePairing when a discovered Network CoreDevice tunnel fails
+  before readiness, and abort wireless sockets when cleanup is cancelled.
+- Publish verified DDI cache snapshots atomically, preserving files used by
+  existing mounts during refresh, cancellation and concurrent downloads. Add
+  actionable cache write failure guidance in all four languages.
+- Restore keyboard ownership after USB/wireless reconnection in independent previews.
+  Clear missed modifier releases when restoring a keyboard hook while keeping held
+  keys quarantined until release.
+- Renew the Windows keyboard hook automatically so a silently removed hook cannot
+  permanently disable typing and configured shortcuts while mouse control still works.
+- Retry discovered wireless addresses, bound discovery and optional pairing, and
+  allow RemotePairing when Network usbmux is unavailable. Verify the RSD device
+  identity before opening input services. A missing USB tunnel now offers explicit
+  wireless control instead of silently using Wi-Fi while reporting a wired session.
+- Serialize bridge startup and shutdown, cancel pending startup on stop, and ignore
+  output from retired processes. Preserve cancellation instead of reporting a timeout.
+- Keep host input lifetimes distinct across child-process restarts so queued input
+  and clipboard requests cannot enter a later session with a reused protocol counter.
+- Release touch and keyboard state before closing media-authenticated HID sessions;
+  clean up partially opened button services and release pending button presses.
+- Keep HID fallback available while reconnecting, and bound media-session startup
+  and cleanup even when authentication fails. Scope rejected DDI cache records to
+  the device and OS with a five-minute expiry. Normalize cached asset ordering and
+  share the download deadline across metadata, proxies and compatible-version fallback.
+- Fall back from Modern HID to Legacy when the touch surface is missing, preserve
+  direct authentication after optional media failures, and close failed candidates.
+- Pin compatible DDI downloads so GitHub metadata outages do not block mirrors.
+  Reuse mirror rankings, isolate direct requests from proxy settings, validate the
+  manifest before downloading the image, retain local fallback candidates, and
+  refresh rejected cached images once without retrying identical content. Accept
+  the official `Image.dmg.trustcache` filename in local bundles.
+- Bound RemotePairing startup and teardown, detect idle wireless HID failures, and
+  keep wireless recovery on the selected transport. Fix queued-input cancellation,
+  blocked stdin shutdown, bridge reuse and stale process-exit callbacks.
+- Make Apple DDI personalization cancellable and bound image-service startup, upload,
+  mounting and verification. Report the failing stage, retain specific timeout errors,
+  and stop cancelled downloads from publishing their cache.
+- Preserve bridge runtime validation details instead of replacing them with an unknown error.
+- Retry temporary Apple signing failures within the existing timeout, verify mounted images,
+  and handle damaged DDI cache manifests. Observe host cancellation during startup and
+  retain the original failure through cleanup, with actionable guidance in all four languages.
+
+## [1.8.5-pre3] - 2026-10-15
+
+这是用于功能和兼容性测试的预览版。
+
+### 新增与改进
+
+- 支持同时录制和直播，可分别停止输出；直播期间可保存或丢弃已完成录制。
+- 安装包与便携版内置固定版本的 Personalized DDI 和 iOS 27 Cryptex DDI，使用前校验载荷；Apple 个性化签名仍需联网。
+- 设置助手增加工具入口，改进设备绑定、开发者模式引导和错误提示。
+- 改进 Automation API 的远程文本输入、会话管理、并行输出和启动取消处理。
+
+### 修复
+
+- 改进新设备 USB 描述符与活动配置等待，修正部分设备的显示尺寸映射。
+- 改进 Apple USBMux 就绪检测，支持探测商店版 Apple Devices，并提供端口占用诊断。
+- 修复 Cryptex/DDI 准备阶段的连接释放、取消和超时处理，打包并校验所需运行时能力。
+- 修复预览重绘、键盘焦点、设备切换和媒体输出状态处理问题。
+- 修复 SRS 测试服务的 HTTP 错误处理及多语言资源格式问题。
+- 应用与驱动管理器版本统一为 1.8.5-pre3。
+
+### 验证范围
+
+自动构建执行原生、Python、应用逻辑、驱动及本地化检查。GitHub 托管环境不运行需要交互桌面的 WPF 运行时测试。
+目标设备上的 Apple 签名、DDI 安装与控制兼容性，以及最终 ZIP/Setup 的完整安装、升级、卸载和实机验收仍需验证；构建通过不代表这些场景已通过。
+
+### Added
+
+- Record and stream simultaneously, stop each output independently, and save or discard a completed recording while streaming continues.
+- Bundle pinned Personalized and iOS 27 Cryptex DDI assets in both Setup and portable ZIP builds; Apple personalization still requires network access.
+- Add setup tool entry points and improve device binding, developer mode guidance, and error messages.
+- Improve Automation API remote text input, session management, parallel output, and startup cancellation.
+
+### Fixed
+
+- Improve USB descriptor and active configuration readiness checks and correct display size mappings for selected devices.
+- Detect Apple USBMux readiness, including Microsoft Store Apple Devices support, and report port conflicts.
+- Bound Cryptex/DDI connection cleanup, cancellation, and timeouts, and verify the packaged runtime capabilities.
+- Fix preview redraw, keyboard focus, device switching, media output state handling, SRS HTTP errors, and localization formatting.
+- Align the application and driver manager versions at 1.8.5-pre3.
+
+### Notes
+
+Automated builds check native code, Python, application logic, drivers, and localization. WPF runtime tests requiring an interactive desktop are skipped on GitHub-hosted runners.
+Apple signing, DDI installation and control on target devices, and full installation, upgrade, removal, and device acceptance of the final ZIP/Setup remain to be verified.
+
+## [1.8.5-pre] - 2026-10-06
+
+Prerelease for feature and compatibility testing.
+
+### Added
+
+- Unify keyboard routing and add a key-mapping wizard and five-point touch support.
+- Provide UxPlay as an optional downloadable wireless component.
+
+- Add independent Traditional Chinese (Taiwan) localization across the app,
+  driver tools, installer, stream test pages and complete release history.
+
+### Fixed
+
+- Isolate multi-device keyboard writes so a stalled device cannot block another
+  device's input. Drop queued touch gestures after focus changes, preserve
+  foreground input during inactive-device cleanup, and target Bluetooth startup
+  shortcuts at the focused preview device.
+- Compact preview toolbar labels from right to left according to the available
+  layout width, and restore them when space returns. Preserve icons, tooltips,
+  accessible names, theme styling and scrolling when even the icons cannot fit.
+- Keep navigation and button icon colors in sync with their controls when the
+  app starts in the system tray and first opens the complete or lightweight
+  workspace, including later theme and enabled-state changes.
+- Restore main-preview wired and wireless touch control after starting in the
+  system tray and opening the workspace. Initialize the input source from the
+  native window handle even while the WPF visual tree is still unattached.
+- Keep the last wireless mirroring frame visible when a static phone screen
+  stops sending video. Frame inactivity no longer restarts the session, and
+  resized or additional previews can reuse the retained frame.
+- Retry static preview redraws after a busy compositor or a transient GPU
+  upload failure, including when opening settings resizes the preview. Only
+  mark a frame as presented after success, and throttle retries while occluded.
+
+## [1.8.4-test4] - 2026-09-07
+
+### Changed
+
+- Improve wired and wireless reverse-control routing so touch and keyboard
+  events stay bound to the selected device and stale bridge callbacks cannot
+  affect a newer control session.
+- Keep wired, wireless, and Bluetooth control modes mutually exclusive while
+  transitions are in progress.
+
+### Fixed
+
+- Add a RemotePairing fallback for older iOS versions.
+- Release USB touch input at the last valid position when the pointer leaves
+  the mirrored preview.
+- Make Escape reliably exit full-screen previews before reverse-control
+  keyboard routing handles the key.
+- Restore the complete shortcut-settings snapshot when saving fails.
+
+### Verification
+
+- Extend application-logic and USB bridge tests for device-targeted routing,
+  callback lifetime, input release, full-screen Escape handling, and settings
+  rollback.
+
+## [1.8.3] - 2026-09-06
+
+### Fixed
+
+⚠⚠⚠紧急修复⚠⚠⚠
+1.8.1 直接升级到 1.8.2 后反控找不到 `libusb0.dll` 的问题。
+
+- Emergency fix for reverse control failing to find `libusb0.dll` after a
+  direct upgrade from 1.8.1 to 1.8.2. The USB bridge now receives all packaged
+  runtime directories in its process-specific DLL search path.
+
+## [1.8.2] - 2026-09-06
+
+### Added
+
+- Add wired and wireless reverse-control routes using the maintained USB
+  bridge, including keyboard text input and iOS hardware-button commands.
+- Add configurable global shortcuts for individual control actions and mouse
+  button shortcut capture.
+
+### Changed
+
+- Use the maintained iUsbBridge release payload directly in application,
+  installer, integrity validation, and release packaging.
+- Persist wireless-mirroring settings and improve orientation-aware control
+  coordinate handling for portrait and landscape sessions.
+
+### Fixed
+
+- Improve recovery from wireless landscape frame stalls without changing the
+  selected mirroring session.
+- Ensure drag state is released when the pointer leaves a mirrored preview.
+- Improve reverse-control prerequisite and failure guidance, device-profile
+  onboarding, and release build reproducibility.
+
 ### Added
 
 - Add a mirroring-settings shortcut window for configuring the reverse-control
   hotkey, with conflict detection and live updates to control guidance.
+
+### Fixed
+
+- Retry the active wired-mirroring usbmux interface when its device-side
+  VERSION handshake times out, then fall back to Apple usbmuxd without
+  interrupting the wired mirror.
+- Give volume up, volume down, and lock-screen reverse-control shortcuts
+  independent global-hotkey registrations, route hardware button reports to
+  the selected wired/wireless bridge, and hold the lock-side-button report
+  long enough for iOS to accept it.
+- Pass the selected wireless resolution and frame rate to the UxPlay AirPlay
+  negotiation, and reset partial Y4M state whenever its raw video pipe
+  reconnects so a truncated session cannot corrupt the first frame of the next
+  connection. Reinsert H.264 parameter sets at IDR frames and make the bundled
+  software decoder discard corrupted output until the next sync point instead
+  of leaving a persistent green preview. Runtime preflight now also requires
+  and loads the Y4M bridge plugin plus its transitive DLL dependencies before
+  the UxPlay backend is reported available. Runtime preparation now builds into
+  a validated staging directory and restores the previous bundle if packaging
+  is interrupted or fails.
+- Allow the AirPlay wireless host's per-session TCP and UDP media ports through
+  the process-scoped local-subnet firewall rule; previously only fixed control
+  ports were opened, leaving some devices connected with a black screen before
+  the sender timed out.
+- Port upstream AirPlayServer connection-compatibility and mirror-stream
+  recovery fixes while keeping the reproducible v1.1.2 source pin; this
+  preserves HTTP/RTSP request handling, case-insensitive headers, two-stage
+  pair verification, bounded mirror reads, and TCP keepalive.
+- Preserve full-range BT.709 metadata for SDR USB/AirPlay frames across D3D11
+  preview, NV12 output, recordings, live streams and the virtual camera, so
+  light interface grays are not expanded a second time and clipped to white.
+- Keep HDR frame range metadata intact while normalizing non-HDR wired frames;
+  add regression coverage for gray-level conversion and full-range wireless I420.
+- Bound queued Bluetooth motion reports and discard stale movement after a
+  notification stall while preserving button, wheel and keyboard transitions.
+- Treat the GATT notification status as the delivery result, avoiding false
+  disconnects when an adapter reports an optional byte count of zero.
 
 ## [1.8.1] - 2026-08-30
 
@@ -1438,7 +1701,18 @@ First public preview.
 - The first-time driver path still needs broader clean-machine validation.
 - Apple uses a private protocol and may change it in future iOS releases.
 
-[Unreleased]: https://github.com/RayrenSX/iPhoneMirror/compare/v1.7.1...HEAD
+[Unreleased]: https://github.com/RayrenSX/iPhoneMirror/compare/v1.8.4-test4...HEAD
+[1.8.4-test4]: https://github.com/RayrenSX/iPhoneMirror/compare/v1.8.3...v1.8.4-test4
+[1.8.3]: https://github.com/RayrenSX/iPhoneMirror/compare/v1.8.2...v1.8.3
+[1.8.2]: https://github.com/RayrenSX/iPhoneMirror/compare/v1.8.1...v1.8.2
+[1.8.1]: https://github.com/RayrenSX/iPhoneMirror/compare/v1.8.0...v1.8.1
+[1.8.0]: https://github.com/RayrenSX/iPhoneMirror/compare/v1.7.1...v1.8.0
+[1.8.0-insider30]: https://github.com/RayrenSX/iPhoneMirror/releases/tag/v1.8.0-insider30
+[1.8.0-insider29]: https://github.com/RayrenSX/iPhoneMirror/releases/tag/v1.8.0-insider29
+[1.8.0-insider28]: https://github.com/RayrenSX/iPhoneMirror/releases/tag/v1.8.0-insider28
+[1.8.0-insider27]: https://github.com/RayrenSX/iPhoneMirror/releases/tag/v1.8.0-insider27
+[1.8.0-insider26]: https://github.com/RayrenSX/iPhoneMirror/releases/tag/v1.8.0-insider26
+[1.6.9]: https://github.com/RayrenSX/iPhoneMirror/compare/v1.6.8...v1.6.9
 [1.7.1]: https://github.com/RayrenSX/iPhoneMirror/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/RayrenSX/iPhoneMirror/compare/v1.6.9...v1.7.0
 [1.6.8]: https://github.com/RayrenSX/iPhoneMirror/compare/v1.6.7...v1.6.8

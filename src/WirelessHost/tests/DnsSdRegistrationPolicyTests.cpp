@@ -26,10 +26,16 @@ bool has_property(const iPhoneMirror::wireless::DnsSdProperties& properties,
 
 int main() {
     constexpr std::array cases{
-        std::array{std::uint32_t{0}, std::uint32_t{7}, std::uint32_t{7}},
+        std::array{std::uint32_t{0}, std::uint32_t{7},
+            iPhoneMirror::wireless::DnsSdAllInterfaces},
         std::array{std::uint32_t{0}, std::uint32_t{0}, std::uint32_t{0}},
         std::array{std::uint32_t{3}, std::uint32_t{0}, std::uint32_t{3}},
-        std::array{std::uint32_t{21}, std::uint32_t{42}, std::uint32_t{42}},
+        std::array{std::uint32_t{21}, std::uint32_t{42},
+            iPhoneMirror::wireless::DnsSdAllInterfaces},
+        std::array{std::uint32_t{24}, std::uint32_t{24},
+            iPhoneMirror::wireless::DnsSdAllInterfaces},
+        std::array{std::uint32_t{4}, std::uint32_t{24},
+            iPhoneMirror::wireless::DnsSdAllInterfaces},
         std::array{std::numeric_limits<std::uint32_t>::max(),
             std::uint32_t{0}, std::numeric_limits<std::uint32_t>::max()},
     };
@@ -37,9 +43,16 @@ int main() {
     for (const auto& [requested, preferred, expected] : cases) {
         if (iPhoneMirror::wireless::dns_sd_registration_interface(
                 requested, preferred) != expected) {
-            std::cerr << "DNS-SD interface selection ignored the preferred adapter\n";
+            std::cerr << "aggregate DNS-SD registration lost an eligible interface\n";
             return 1;
         }
+    }
+
+    if (iPhoneMirror::wireless::dns_sd_native_interface(
+            iPhoneMirror::wireless::DnsSdAllInterfaces) != 0 ||
+        iPhoneMirror::wireless::dns_sd_native_interface(17) != 17) {
+        std::cerr << "all-interface DNS-SD sentinel was not mapped correctly\n";
+        return 1;
     }
 
     iPhoneMirror::wireless::DnsSdRegistrationLeases leases;

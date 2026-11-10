@@ -1,3 +1,4 @@
+using IPhoneMirror.App.Localization;
 using System.Diagnostics;
 using System.Text;
 using IPhoneMirror.App.Interop;
@@ -57,7 +58,7 @@ internal sealed class MediaCastAudioDecoder : IDisposable
         {
             process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             if (!process.Start())
-                throw new InvalidOperationException("FFmpeg audio decoder could not start.");
+                throw new InvalidOperationException(LocalizationService.Get("FfmpegAudioStartFailed"));
             process.ErrorDataReceived += (_, args) =>
             {
                 if (!string.IsNullOrWhiteSpace(args.Data) &&
@@ -66,12 +67,14 @@ internal sealed class MediaCastAudioDecoder : IDisposable
             };
             process.BeginErrorReadLine();
             var cancellation = new CancellationTokenSource();
+            var activeProcess = process;
+            var token = cancellation.Token;
             lock (_gate)
             {
-                _process = process;
+                _process = activeProcess;
                 _cancellation = cancellation;
-                _readTask = Task.Run(() => ReadLoopAsync(process,
-                    cancellation.Token, diagnostic), CancellationToken.None);
+                _readTask = Task.Run(() => ReadLoopAsync(activeProcess,
+                    token, diagnostic), CancellationToken.None);
                 process = null;
             }
             diagnostic?.Invoke("media_audio_started");
@@ -149,10 +152,15 @@ internal sealed class MediaCastAudioDecoder : IDisposable
                 if (read == 0) break;
                 filled += read;
                 if (filled != packetBuffer.Length) continue;
-                var packet = new AudioPacket(++_sequence, SampleRate, Channels,
-                    16, packetBuffer.ToArray());
                 lock (_gate)
                 {
+                    // A read can finish after Stop cleared the queue, or after
+                    // Start replaced this process. Never enqueue stale audio
+                    // into the stopped/new session.
+                    if (cancellationToken.IsCancellationRequested ||
+                        !ReferenceEquals(_process, process)) break;
+                    var packet = new AudioPacket(++_sequence, SampleRate, Channels,
+                        16, packetBuffer.ToArray());
                     _packets.Enqueue(packet);
                     while (_packets.Count > MaximumQueuedPackets)
                         _packets.Dequeue();

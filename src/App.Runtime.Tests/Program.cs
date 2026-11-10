@@ -1,4 +1,4 @@
-using System.Collections;
+﻿using System.Collections;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
@@ -21,13 +21,240 @@ using WpfSymbolIcon = Wpf.Ui.Controls.SymbolIcon;
 
 namespace IPhoneMirror.App.Runtime.Tests;
 
-internal static class Program
+internal static partial class Program
 {
     [STAThread]
     private static int Main(string[] args)
     {
         try
         {
+            // Set this before any test creates WPF windows, including API and lifecycle tests.
+            // Native preview tests retain their own real HWND/D3D rendering paths.
+            RenderOptions.ProcessRenderMode = System.Windows.Interop.RenderMode.SoftwareOnly;
+            if (args is ["--automation-lifecycle"])
+                return RunAutomationLifecycleTests();
+            if (args is ["--automation-lifecycle-long-startup"])
+                return RunAutomationLifecycleTests(verifyLongStartup: true);
+            if (args is ["--device-control-live", var liveBridge, var liveUdid, var liveMode])
+                return RunDeviceControlLive(liveBridge, liveUdid, liveMode);
+            if (args is ["--device-control-hold-live", var holdBridge, var holdUdid, var holdMode, var holdSeconds])
+                return RunDeviceControlLive(holdBridge, holdUdid, holdMode, int.Parse(holdSeconds));
+            if (args is ["--wireless-recovery-live"])
+                return RunWirelessRecoveryLive();
+            if (args is ["--wireless-recovery-selected-live", var recoveryUdid])
+                return RunWirelessRecoveryLive(recoveryUdid);
+            if (args is ["--wireless-socket-recovery-selected-live", var socketUdid, var socketMode])
+                return RunWirelessRecoveryLive(socketUdid, socketMode);
+            if (args is ["--control-lifecycle", var lifecyclePython])
+                return RunBridgeProcessLifecycleTests(lifecyclePython);
+            if (args is ["--owned-runtime-check", var ownedBridge])
+                return RunOwnedRuntimeCheck(ownedBridge);
+            if (args is ["--ddi-startup"])
+                return RunDdiStartupTests();
+            if (args is ["--ddi-startup", var ddiBridge])
+                return RunDdiStartupTests(ddiBridge);
+            if (args is ["--control-error-presentation"])
+                return RunControlErrorPresentationTests();
+            if (args is ["--automation-api"])
+                return RunAutomationApiTests();
+            if (args is ["--automation-settings", var automationOutput])
+                return RunAutomationSettingsTests(automationOutput);
+            if (args is ["--setup-tools", var toolsOutput])
+                return RunSetupToolsTests(toolsOutput);
+            if (args is ["--driver-ui", var toolsDriverAssembly, var toolsDriverOutput])
+                return RenderDriverTools(toolsDriverAssembly, toolsDriverOutput);
+            if (args is ["--first-run-setup", var setupOutput])
+                return RunFirstRunSetupTests(setupOutput);
+            if (args is ["--setup-assessment", var assessmentOutput])
+                return RunSetupAssessmentTests(assessmentOutput);
+            if (args is ["--setup-assessment-preview", var assessmentPreviewOutput])
+                return RunSetupAssessmentTests(assessmentPreviewOutput, preview: true);
+            if (args is ["--setup-runtime-probe", var runtimeDriver])
+                return ProbeSetupRuntimeAsync(runtimeDriver).GetAwaiter().GetResult();
+            if (args is ["--first-run-driver-probe", var setupDriver])
+                return ProbeFirstRunDriver(setupDriver);
+            if (args is ["--first-run-driver-cancel", var cancellationDriver])
+                return TestFirstRunDriverCancellationAsync(cancellationDriver).GetAwaiter().GetResult();
+            if (args is ["--keyboard-mapping-wizard", var wizardOutput])
+                return RunMappingWizardTests(wizardOutput);
+            if (args is ["--keyboard-mapping-picking", var pickingOutput])
+                return RunMappingPickingTests(pickingOutput);
+            if (args is ["--five-point-live", var fiveOutput, var fiveTransport, var fiveUdid,
+                var fivePython, var fiveScript, var fiveObserver])
+                return RunFivePointLive(fiveOutput, fiveTransport, fiveUdid, fivePython, fiveScript, fiveObserver);
+            if (args is ["--wired-control-restart-live", var restartOutput])
+                return RunKeyboardMappingLiveProbe(restartOutput, wiredRestart: true);
+            if (args is ["--wired-window-exit-live", var exitOutput])
+                return RunKeyboardMappingLiveProbe(exitOutput, realWindowExit: true);
+            if (args is ["--wired-window-exit-selected-live", var selectedExitOutput, var selectedExitUdid])
+                return RunKeyboardMappingLiveProbe(selectedExitOutput, realWindowExit: true, selectedUdid: selectedExitUdid);
+            if (args is ["--wired-capture-only-exit-selected-live", var captureExitOutput, var captureExitUdid])
+                return RunKeyboardMappingLiveProbe(captureExitOutput, realWindowExit: true, selectedUdid: captureExitUdid, skipReverseControl: true);
+            if (args is ["--wired-capture-exit-evidence", var captureExitEvidence])
+            {
+                AssertWiredCaptureRestorationEvidence(captureExitEvidence);
+                Console.WriteLine("Native capture exit confirms Apple USB restoration without warnings.");
+                return 0;
+            }
+            if (args is ["--keyboard-router"])
+                return RunKeyboardRouterTests();
+            if (args is ["--keyboard-ownership"])
+                return RunKeyboardOwnershipTests();
+            if (args is ["--keyboard-ownership-live", var ownershipOutput])
+                return RunKeyboardMappingLiveProbe(ownershipOutput, ownership: true);
+            if (args is ["--keyboard-clipboard-live", var clipboardOutput])
+                return RunKeyboardMappingLiveProbe(clipboardOutput, ownership: true, clipboard: true);
+            if (args is ["--component-audio-formats", var referenceFfmpeg])
+                return RunComponentAudioFormatTests(referenceFfmpeg);
+            if (args is ["--component-runtime"])
+                return RunComponentRuntimeTests();
+            if (args is ["--component-uxplay-lifecycle", var lifecycleOutput])
+                return RunUxPlayLifecycleTests(lifecycleOutput);
+            if (args is ["--component-public-uxplay", var componentPublicOutput])
+            {
+                Environment.SetEnvironmentVariable("IPHONE_MIRROR_APP_LOG_DIRECTORY", Path.GetFullPath(Path.Combine(componentPublicOutput, "logs")));
+                ComponentDownloadNetworkTests.RunPublicComponentAsync(componentPublicOutput).GetAwaiter().GetResult();
+                return 0;
+            }
+            if (args is ["--keyboard-mapping", var mappingOutput])
+                return RunKeyboardMappingTests(mappingOutput);
+            if (args is ["--keyboard-mapping-regressions"])
+                return RunKeyboardMappingRegressions();
+            if (args is ["--keyboard-mapping-interaction", var mappingInteractionOutput])
+                return RunKeyboardMappingInteractionTests(mappingInteractionOutput);
+            if (args is ["--keyboard-mapping-lifecycle", var mappingLifecycleOutput])
+                return RunKeyboardMappingInteractionTests(mappingLifecycleOutput, lifecycleOnly: true);
+            if (args is ["--keyboard-mapping-live-probe", var mappingLiveOutput])
+                return RunKeyboardMappingLiveProbe(mappingLiveOutput);
+            if (args is ["--keyboard-mapping-live-interactive", var mappingInteractiveOutput])
+                return RunKeyboardMappingLiveProbe(mappingInteractiveOutput, interactive: true);
+            if (args is ["--keyboard-mapping-live-interactive-wireless", var mappingWirelessInteractiveOutput])
+                return RunKeyboardMappingLiveProbe(mappingWirelessInteractiveOutput, wireless: true, interactive: true);
+            if (args is ["--keyboard-mapping-capture-interactive", var mappingCaptureOutput])
+                return RunKeyboardMappingLiveProbe(mappingCaptureOutput, captureOnly: true);
+            if (args is ["--keyboard-mapping-live-actions", var mappingActionsOutput, var mappingTransport])
+                return RunKeyboardMappingLiveProbe(mappingActionsOutput, true, mappingTransport == "wireless");
+            if (args is ["--component-public-large", var publicLargeOutput])
+            {
+                Environment.SetEnvironmentVariable("IPHONE_MIRROR_APP_LOG_DIRECTORY", Path.GetFullPath(Path.Combine(publicLargeOutput, "logs")));
+                ComponentDownloadNetworkTests.RunPublicAsync(publicLargeOutput, "http://127.0.0.1:7897", mirrors: true, largeOnly: true).GetAwaiter().GetResult();
+                return 0;
+            }
+            if (args is ["--component-network", var archive, var metadata, var networkOutput])
+            {
+                Environment.SetEnvironmentVariable("IPHONE_MIRROR_APP_LOG_DIRECTORY", Path.GetFullPath(Path.Combine(networkOutput, "logs")));
+                ComponentDownloadNetworkTests.RunAsync(archive, metadata, networkOutput).GetAwaiter().GetResult();
+                return 0;
+            }
+            if (args is ["--clipboard-sync"])
+                return RunClipboardSyncRegressionTests();
+            if (args is ["--media-bridge-idle"])
+            {
+                Console.In.ReadToEnd();
+                return 0;
+            }
+            if (args is ["--media-review"])
+            {
+                var mediaApp = new App { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+                typeof(App).GetProperty("IsUiPreviewMode", KeyboardTestMembers)!.SetValue(mediaApp, true);
+                mediaApp.InitializeComponent();
+                try { TestMediaReviewRegressions(); }
+                finally { mediaApp.Shutdown(); }
+                return 0;
+            }
+            if (args is ["--virtual-camera-regression"])
+                return RunVirtualCameraRegressionTests();
+            if (args is ["--updater-elevation-regression"])
+                return RunUpdaterElevationRegressionTests();
+            if (args is ["--capture-review"])
+            {
+                var captureApp = new App { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+                typeof(App).GetProperty("IsUiPreviewMode", KeyboardTestMembers)!.SetValue(captureApp, true);
+                captureApp.InitializeComponent();
+                try { TestCaptureReviewRegressions(); }
+                finally { captureApp.Shutdown(); }
+                return 0;
+            }
+            if (args is ["--logic-review"])
+            {
+                var reviewApp = new App { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+                typeof(App).GetProperty("IsUiPreviewMode", KeyboardTestMembers)!.SetValue(reviewApp, true);
+                reviewApp.InitializeComponent();
+                try { TestLogicReviewRegressions(); }
+                finally { reviewApp.Shutdown(); }
+                return 0;
+            }
+            if (args is ["--ui-audit-fixes", var fixesOutput])
+                return RunUiAuditFixTests(fixesOutput);
+            if (args is ["--adaptive-toolbar", var toolbarOutput])
+                return RunAdaptiveToolbarTests(toolbarOutput);
+            if (args is ["--tray-startup-theme", var trayThemeOutput])
+                return RunTrayStartupThemeTests(trayThemeOutput);
+            if (args is ["--theme-content", var themeContentOutput])
+                return RunThemeContentAudit(themeContentOutput);
+            if (args is ["--tray-mode", var trayOutput])
+                return RunTrayModeTests(trayOutput);
+            if (args is ["--ui-performance", var performanceOutput])
+                return RunUiPerformanceAudit(performanceOutput);
+            if (args is ["--ui-regression"])
+            {
+                RenderOptions.ProcessRenderMode = System.Windows.Interop.RenderMode.SoftwareOnly;
+                TestUpdateWindowThemeSwitch();
+                Console.WriteLine("UI theme, window and control runtime regressions passed.");
+                return 0;
+            }
+            if (args is ["--component-download-ui", var componentOutput])
+                return RunComponentDownloadTests(componentOutput);
+            if (args is ["--interaction-regression"])
+                return RunInteractionRegressionTests();
+            if (args is ["--preview-context-menu"])
+                return RunPreviewContextMenuTests();
+            if (args is ["--control-states", var controlOutput])
+                return RunControlStateAudit(controlOutput);
+            if (args is ["--localization-audit"])
+                return LocalizationAuditTests.Run();
+            if (args is ["--taiwan-localization"])
+                return RunTaiwanLocalizationTests();
+            if (args is ["--language-display-audit", var displayOutput])
+                return RunLanguageDisplayAudit(displayOutput);
+            if (args is ["--language-display-audit", var focusedDisplayOutput, var displaySurface])
+                return RunLanguageDisplayAudit(focusedDisplayOutput, displaySurface);
+            if (args is ["--workspace-regression"])
+                return RunWorkspaceRegressionTests();
+            if (args is ["--workspace-performance", var workspacePerformanceOutput])
+                return RunWorkspacePerformanceAudit(workspacePerformanceOutput);
+            if (args is ["--keyboard-focus"])
+                return RunKeyboardFocusTests();
+            if (args is ["--shortcuts"])
+                return RunKeyboardFocusTests(shortcutReview: true);
+            if (args is ["--mouse-shortcuts"])
+                return RunKeyboardFocusTests(initializeHiddenHandle: true, shortcutReview: true, mouseShortcutReview: true);
+            if (args is ["--preview-pointer"])
+                return RunKeyboardFocusTests(initializeHiddenHandle: true);
+            if (args is ["--driver-localization-audit", var localizedDriverAssembly])
+                return LocalizationAuditTests.RunDriver(localizedDriverAssembly);
+            if (args is ["--driver-combobox", var comboDriverAssembly])
+                return RunDriverComboBoxTests(comboDriverAssembly);
+            if (args is ["--driver-ui-audit", var sourceRoot, var driverAssembly, var driverOutput])
+                return RunDriverConsistencyAudit(sourceRoot, driverAssembly, driverOutput);
+            if (args is ["--ui-audit", var auditOutput])
+                return RunConsistencyAudit(auditOutput);
+            if (args is ["--ui-audit", var cultureOutput, "--culture", var auditCulture] &&
+                auditCulture is "zh-CN" or "zh-HK" or "zh-TW" or "en-US")
+                return RunConsistencyAudit(cultureOutput, onlyCulture: auditCulture);
+            if (args is ["--ui-audit", var focusedOutput, var focusedSurface])
+                return RunConsistencyAudit(focusedOutput, focusedSurface);
+            if (args is ["--ui-audit", var localizedOutput, var localizedSurface, "--culture", var localizedCulture] &&
+                localizedCulture is "zh-CN" or "zh-HK" or "zh-TW" or "en-US")
+                return RunConsistencyAudit(localizedOutput, localizedSurface, localizedCulture);
+            if (args is ["--preview-shell-ui-audit", var previewOutput])
+                return RunPreviewShellAudit(previewOutput);
+            if (args is ["--reverse-control-countdown"])
+                return ReverseControlCountdownTests.Run();
+            if (args is ["--control-binding", var bindingOutput])
+                return RunControlBindingTests(bindingOutput);
+            if (args is ["--wired-control-live-countdown"])
+                return WiredControlLiveCountdownTest.Run();
             if (args is ["--live-record", .. var recordingArgs])
                 return RunLiveRecordingAsync(recordingArgs).GetAwaiter().GetResult();
             if (args is ["--protected-preview", .. var protectedPreviewArgs])
@@ -38,6 +265,14 @@ internal static class Program
                 return RunCaptureStatusPreview(statusArgs.FirstOrDefault());
             if (args is ["--ui-preview", var themeName, var surface])
                 return RunUiPreview(themeName, surface);
+            if (args.Length != 0)
+                throw new ArgumentException("Unknown runtime test arguments: " + string.Join(" ", args));
+            RunAutomationApiTests();
+            RunInteractionRegressionTests();
+            TestWheelCancellationState();
+            TestUsbPasteKeyboardState();
+            TestReverseControlWorkflowStages();
+            TestTerminalReverseControlStatusIgnoresLateStartupEvents();
             TestUpdateWindowThemeSwitch();
             Console.WriteLine("App runtime tests passed.");
             return 0;
@@ -47,6 +282,194 @@ internal static class Program
             Console.Error.WriteLine(error);
             return 1;
         }
+    }
+
+    private static void TestWheelCancellationState()
+    {
+        var pointerType = typeof(MainWindow).GetNestedType("UsbTouchPointerState", BindingFlags.NonPublic)!;
+        var state = Activator.CreateInstance(pointerType, nonPublic: true)!;
+        var cancel = typeof(MainWindow).GetMethod("CancelWheelScroll", BindingFlags.NonPublic | BindingFlags.Static)!;
+        var cancelled = pointerType.GetField("WheelCancelled")!;
+        var draining = pointerType.GetField("WheelDraining")!;
+        cancel.Invoke(null, [state]);
+        if ((bool)cancelled.GetValue(state)!)
+            throw new InvalidOperationException("A regular click must not cancel the next wheel gesture.");
+        draining.SetValue(state, true);
+        cancel.Invoke(null, [state]);
+        if (!(bool)cancelled.GetValue(state)!)
+            throw new InvalidOperationException("A click must cancel an in-flight wheel gesture.");
+    }
+
+    private static void TestUsbPasteKeyboardState()
+    {
+        var intercept = typeof(MainWindow).GetMethod("TryInterceptUsbPasteKey",
+            BindingFlags.NonPublic | BindingFlags.Static) ??
+            throw new MissingMethodException(typeof(MainWindow).FullName,
+                "TryInterceptUsbPasteKey");
+        var usages = new HashSet<byte>();
+        const byte vUsage = 0x19;
+
+        foreach (var controlMask in new byte[] { 0x01, 0x10, 0x11 })
+        {
+            usages.Add(vUsage);
+            var press = InvokeUsbPasteIntercept(intercept, isKeyDown: true,
+                vUsage, controlMask, usages, pastePending: false);
+            if (!press.Intercepted || !press.PasteRequested || !press.PastePending || usages.Contains(vUsage))
+                throw new InvalidOperationException("Both left and right Ctrl+V must request a clipboard paste.");
+            var release = InvokeUsbPasteIntercept(intercept, isKeyDown: false,
+                vUsage, modifiers: 0, usages, press.PastePending);
+            if (!release.Intercepted || release.PastePending || release.PasteRequested)
+                throw new InvalidOperationException("Either Ctrl+V chord must release its paste state.");
+        }
+
+        usages.Add(vUsage);
+        var firstDown = InvokeUsbPasteIntercept(intercept, isKeyDown: true,
+            vUsage, modifiers: 0x01, usages, pastePending: false);
+        if (!firstDown.Intercepted || !firstDown.PasteRequested ||
+            !firstDown.PastePending || usages.Contains(vUsage))
+            throw new InvalidOperationException(
+                "The first Ctrl+V down must request one paste and remove V from USB HID state.");
+
+        // Raw Input and the legacy key message can both report this same down.
+        usages.Add(vUsage);
+        var duplicateDown = InvokeUsbPasteIntercept(intercept, isKeyDown: true,
+            vUsage, modifiers: 0x01, usages, firstDown.PastePending);
+        if (!duplicateDown.Intercepted || duplicateDown.PasteRequested ||
+            !duplicateDown.PastePending || usages.Contains(vUsage))
+            throw new InvalidOperationException(
+                "A duplicate Ctrl+V down must stay suppressed without requesting another paste.");
+
+        // Releasing Ctrl before V causes another keyboard report. V must not
+        // reappear in that report while the intercepted press is pending.
+        if (usages.Contains(vUsage))
+            throw new InvalidOperationException(
+                "An intercepted V leaked into the Ctrl-release keyboard report.");
+
+        var up = InvokeUsbPasteIntercept(intercept, isKeyDown: false,
+            vUsage, modifiers: 0, usages, duplicateDown.PastePending);
+        if (!up.Intercepted || up.PasteRequested || up.PastePending ||
+            usages.Contains(vUsage))
+            throw new InvalidOperationException(
+                "The matching V up must be suppressed and clear paste state.");
+
+        var staleUp = InvokeUsbPasteIntercept(intercept, isKeyDown: false,
+            vUsage, modifiers: 0, usages, up.PastePending);
+        if (staleUp.Intercepted || staleUp.PasteRequested || staleUp.PastePending)
+            throw new InvalidOperationException(
+                "A duplicate V up after the intercepted press must remain idempotent.");
+
+        // A Ctrl release or unrelated key must not clear the pending V until
+        // the matching V-up arrives.
+        usages.Add(0x04);
+        var unrelatedDown = InvokeUsbPasteIntercept(intercept, isKeyDown: true,
+            usage: 0x04, modifiers: 0, usages, pastePending: true);
+        var unrelatedUp = InvokeUsbPasteIntercept(intercept, isKeyDown: false,
+            usage: 0x04, modifiers: 0, usages, unrelatedDown.PastePending);
+        if (unrelatedDown.Intercepted || unrelatedUp.Intercepted ||
+            !unrelatedDown.PastePending || !unrelatedUp.PastePending)
+            throw new InvalidOperationException(
+                "Unrelated keys must not alter an intercepted V lifecycle.");
+
+        usages.Add(vUsage);
+        var regularDown = InvokeUsbPasteIntercept(intercept, isKeyDown: true,
+            vUsage, modifiers: 0, usages, pastePending: false);
+        if (regularDown.Intercepted || regularDown.PasteRequested ||
+            regularDown.PastePending || !usages.Contains(vUsage))
+            throw new InvalidOperationException(
+                "A regular V down must remain available to normal USB and Bluetooth keyboard routing.");
+    }
+
+    private static (bool Intercepted, bool PastePending, bool PasteRequested)
+        InvokeUsbPasteIntercept(MethodInfo intercept, bool isKeyDown, byte usage,
+            byte modifiers, HashSet<byte> usages, bool pastePending)
+    {
+        object?[] arguments =
+            [isKeyDown, usage, modifiers, usages, pastePending, false];
+        var intercepted = (bool)intercept.Invoke(null, arguments)!;
+        return (intercepted, (bool)arguments[4]!, (bool)arguments[5]!);
+    }
+
+    private static void TestReverseControlWorkflowStages()
+    {
+        var assembly = typeof(App).Assembly;
+        var viewModelType = assembly.GetType(
+            "IPhoneMirror.App.Windows.ReverseControlStatusViewModel",
+            throwOnError: true)!;
+        var modeType = assembly.GetType(
+            "IPhoneMirror.App.Services.ControlStatusMode",
+            throwOnError: true)!;
+        var getStages = viewModelType.GetMethod("GetWorkflowStages",
+            BindingFlags.Static | BindingFlags.NonPublic) ??
+            throw new MissingMethodException(viewModelType.FullName,
+                "GetWorkflowStages");
+
+        foreach (var propertyName in new[] { "Stages", "Diagnostics", "PromptOptions" })
+        {
+            if (viewModelType.GetProperty(propertyName,
+                    BindingFlags.Instance | BindingFlags.Public) is null)
+                throw new InvalidOperationException(
+                    $"{propertyName} must be public so WPF can bind its items.");
+        }
+
+        AssertStages("Usb",
+            ["CheckingBinding", "CheckingPermissions", "PreparingDeviceSupport",
+                "Connecting", "InitializingServices", "StartingInputRouter"]);
+        AssertStages("Wireless",
+            ["CheckingBinding", "CheckingPermissions", "Connecting",
+                "InitializingServices", "StartingInputRouter"]);
+        AssertStages("Bluetooth",
+            ["CheckingBinding", "CheckingBluetooth", "SwitchingBluetoothPeripheral",
+                "WaitingForPhoneConnection", "VerifyingTouch"]);
+        return;
+
+        void AssertStages(string mode, string[] expected)
+        {
+            var value = Enum.Parse(modeType, mode);
+            var stages = (IEnumerable)(getStages.Invoke(null, [value]) ??
+                throw new InvalidOperationException(
+                    $"No reverse-control stages were returned for {mode}."));
+            var actual = stages.Cast<object>().Select(stage => stage.ToString()).ToArray();
+            if (!actual.SequenceEqual(expected))
+                throw new InvalidOperationException(
+                    $"Unexpected {mode} reverse-control workflow: " +
+                    string.Join(", ", actual));
+        }
+    }
+
+    private static void TestTerminalReverseControlStatusIgnoresLateStartupEvents()
+    {
+        var assembly = typeof(App).Assembly;
+        var serviceType = assembly.GetType(
+            "IPhoneMirror.App.Services.ControlStatusService", throwOnError: true)!;
+        var modeType = assembly.GetType(
+            "IPhoneMirror.App.Services.ControlStatusMode", throwOnError: true)!;
+        var stageType = assembly.GetType(
+            "IPhoneMirror.App.Services.ControlStage", throwOnError: true)!;
+        var service = Activator.CreateInstance(serviceType, nonPublic: true)!
+            ?? throw new InvalidOperationException("Could not create ControlStatusService.");
+        var usb = Enum.Parse(modeType, "Usb");
+        var connecting = Enum.Parse(stageType, "Connecting");
+        var initializing = Enum.Parse(stageType, "InitializingServices");
+        var report = serviceType.GetMethod("Report",
+            BindingFlags.Instance | BindingFlags.NonPublic) ??
+            throw new MissingMethodException(serviceType.FullName, "Report");
+        var ready = serviceType.GetMethod("Ready",
+            BindingFlags.Instance | BindingFlags.NonPublic) ??
+            throw new MissingMethodException(serviceType.FullName, "Ready");
+        var current = serviceType.GetProperty("Current",
+            BindingFlags.Instance | BindingFlags.NonPublic) ??
+            throw new MissingMemberException(serviceType.FullName, "Current");
+
+        report.Invoke(service, [usb, connecting, "iPhone", "connecting", true, null, 0, 0]);
+        ready.Invoke(service, [usb, "iPhone", "ready"]);
+        report.Invoke(service, [usb, initializing, "iPhone", "late startup event", true, null, 0, 0]);
+
+        var snapshot = current.GetValue(service) ??
+            throw new InvalidOperationException("ControlStatusService did not retain a snapshot.");
+        var stage = snapshot.GetType().GetProperty("Stage")?.GetValue(snapshot)?.ToString();
+        if (!string.Equals(stage, "Ready", StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"A late startup event regressed terminal reverse-control status to {stage}.");
     }
 
     private static void DrainDispatcher()
@@ -93,14 +516,26 @@ internal static class Program
             window = new IPhoneMirror.App.Windows.AdvancedSettingsWindow(
                 1920, 1080, previewOnly: true);
         }
+        else if (surface.Equals("setup", StringComparison.OrdinalIgnoreCase))
+        {
+            var checkpoint = Path.Combine(Path.GetTempPath(), "iPhoneMirror-setup-preview", Guid.NewGuid().ToString("N"), "checkpoint.json");
+            window = new IPhoneMirror.App.Windows.FirstRunSetupWindow(new IPhoneMirror.App.ViewModels.MainViewModel(),
+                new FirstRunSetupStore(checkpoint), previewOnly: true);
+        }
         else
         {
-            throw new ArgumentException("UI preview surface must be main or child.");
+            throw new ArgumentException("UI preview surface must be main, child or setup.");
         }
 
         window.Title = $"iPhoneMirror UI Audit — {theme} — {surface}";
         application.MainWindow = window;
-        window.Closed += (_, _) => application.Shutdown();
+        window.Closed += (_, _) =>
+        {
+            application.Shutdown();
+            // This preview uses Dispatcher.Run rather than Application.Run.
+            if (surface.Equals("setup", StringComparison.OrdinalIgnoreCase))
+                application.Dispatcher.BeginInvokeShutdown(DispatcherPriority.Background);
+        };
         window.Show();
         ApplyTheme(assembly, theme);
         Dispatcher.Run();
@@ -352,15 +787,8 @@ internal static class Program
                 throw new InvalidOperationException("FFmpeg probe returned no capabilities.");
             Console.WriteLine($"Encoder: {ReadProperty<string>(capabilities,
                 "PreferredH264Encoder")}");
-            var requestType = RequireType(assembly,
-                "IPhoneMirror.App.Services.MediaOutputRequest");
-            var kindType = RequireType(assembly,
-                "IPhoneMirror.App.Services.MediaOutputKind");
-            var request = Activator.CreateInstance(requestType,
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
-                null, new object[] { Enum.Parse(kindType, "Recording"), destination,
-                    width, height, frameRate, bitrateKbps, string.Empty }, null) ??
-                throw new InvalidOperationException("Recording request could not be created.");
+            var request = CreateLiveRecordingRequest(assembly, destination,
+                width, height, frameRate, bitrateKbps);
             await InvokeAsyncResult(RequireMethod(serviceType, "StartAsync",
                 BindingFlags.Instance | BindingFlags.NonPublic).Invoke(service,
                     [sessionHandle, request, capabilities, CancellationToken.None]) ??
@@ -487,6 +915,17 @@ internal static class Program
         }
     }
 
+    private static object CreateLiveRecordingRequest(Assembly assembly,
+        string destination, uint width, uint height, int frameRate, int bitrateKbps)
+    {
+        var requestType = RequireType(assembly, "IPhoneMirror.App.Services.MediaOutputRequest");
+        var kindType = RequireType(assembly, "IPhoneMirror.App.Services.MediaOutputKind");
+        return Activator.CreateInstance(requestType, KeyboardTestMembers, null,
+            [Enum.Parse(kindType, "Recording"), destination, width, height,
+                frameRate, bitrateKbps, string.Empty, null], null) ??
+            throw new InvalidOperationException("Recording request could not be created.");
+    }
+
     private static async Task<object?> InvokeAsyncResult(object awaitable)
     {
         if (awaitable is not Task task)
@@ -516,7 +955,9 @@ internal static class Program
 
     private static void TestUpdateWindowThemeSwitch()
     {
-        var application = new App();
+        var application = new App { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+        typeof(App).GetProperty("IsUiPreviewMode", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(application, true);
         application.InitializeComponent();
         var assembly = typeof(App).Assembly;
         TestHongKongLocalizationSwitch(application, assembly);
@@ -541,7 +982,7 @@ internal static class Program
               }]
             }]
             """;
-        var release = parseLatest.Invoke(null, [releaseJson, true, false]) ??
+        var release = parseLatest.Invoke(null, [releaseJson, true, false, Type.Missing]) ??
             throw new InvalidOperationException("Release fixture was not parsed.");
 
         var clientType = assembly.GetType(
@@ -562,6 +1003,7 @@ internal static class Program
         owner.Show();
         try
         {
+            TestLogicReviewRegressions();
             var windowType = assembly.GetType(
                 "IPhoneMirror.App.Windows.UpdateWindow", throwOnError: true)!;
             var window = Activator.CreateInstance(windowType,
@@ -569,7 +1011,6 @@ internal static class Program
                 binder: null, args: [release, client, false, true], culture: null) as Window ??
                 throw new InvalidOperationException("Update window was not constructed.");
             window.Owner = owner;
-            ((FluentWindow)window).WindowBackdropType = WindowBackdropType.Acrylic;
             window.Show();
             try
             {
@@ -598,8 +1039,11 @@ internal static class Program
                 window.Close();
             }
 
+            ReverseControlCountdownTests.Run(owner);
+            TestPreviewContextMenus();
             TestProtectedContentOverlay(owner, assembly);
             TestProtectedContentNoticeWindow(owner, assembly);
+            TestWorkspaceAnimations(application);
             TestDeveloperToolsWindow(application, assembly);
             TestMainWindowThemeAndCaptionControls(application, assembly);
         }
@@ -755,9 +1199,19 @@ internal static class Program
                 if (window.Owner is not null || window.Topmost)
                     throw new InvalidOperationException(
                         "Developer tools window must be independent and non-topmost.");
-                AssertWindowsOwnOuterCorners(window, "Developer tools");
-                AssertCatalogCount(windowType, window, "WorkspaceItems", 6);
-                AssertCatalogCount(windowType, window, "WindowItems", 15);
+                AssertSelfDrawnWindowCorners(window);
+                AssertCatalogCount(windowType, window, "WorkspaceItems", 7);
+                AssertCatalogKeys(windowType, window, "WindowItems",
+                [
+                    "advanced-settings", "text-input", "device-binding",
+                    "airplay-device-selection", "bluetooth-connection", "bluetooth-client-binding",
+                    "bluetooth-control-notice", "shortcut-settings", "reverse-control-status",
+                    "prompt", "reverse-control-wired-prerequisite", "reverse-control-wireless-prerequisite",
+                    "reverse-control-error", "capture-error", "session-closed", "usb-config-error",
+                    "capture-recovery", "image-settings", "projection-settings", "media-output",
+                    "usb-mode", "startup-error", "update", "instance-conflict", "protected-content",
+                    "native-preview",
+                ]);
                 foreach (var controlName in new[]
                 {
                     "ThemeComboBox", "LanguageComboBox", "OpacitySlider",
@@ -790,7 +1244,7 @@ internal static class Program
         }
         finally
         {
-            owner.Close();
+            CloseWorkspaceTestWindow(owner);
         }
     }
 
@@ -837,8 +1291,245 @@ internal static class Program
         }
         finally
         {
+            CloseWorkspaceTestWindow(window);
+        }
+    }
+
+    private static void TestWorkspaceAnimations(Application application)
+    {
+        TestWindowWorkAreaPosition(application);
+        var app = application as App ??
+            throw new InvalidOperationException("Runtime test application is not iPhoneMirror.App.");
+        var displayMode = GetApplicationDisplayMode(app);
+        try
+        {
+            SetApplicationDisplayMode(app, ApplicationDisplayMode.Complete);
+            var full = CreateWorkspaceTestWindow(application, includeNativePreview: false);
+            try
+            {
+                TestCompleteWorkspaceAnimation(full);
+            }
+            finally
+            {
+                CloseWorkspaceTestWindow(full);
+            }
+
+            SetApplicationDisplayMode(app, ApplicationDisplayMode.Lightweight);
+            var lightweight = CreateWorkspaceTestWindow(application, includeNativePreview: false);
+            try
+            {
+                TestLightweightWorkspaceAnimation(lightweight);
+            }
+            finally
+            {
+                CloseWorkspaceTestWindow(lightweight);
+            }
+            TestLightweightStartupWhileDispatcherBusy(application);
+        }
+        finally
+        {
+            SetApplicationDisplayMode(app, displayMode);
+        }
+    }
+
+    private static MainWindow CreateWorkspaceTestWindow(Application application,
+        bool includeNativePreview = true, bool initializeHiddenHandle = false)
+    {
+        var window = new MainWindow
+        {
+            Width = 1800,
+            Height = 820,
+            ShowInTaskbar = false,
+        };
+        // Keep device enumeration from changing the selected workspace while
+        // a deterministic animation sample is running.
+        var loaded = typeof(MainWindow).GetMethod("OnLoaded",
+            BindingFlags.Instance | BindingFlags.NonPublic, binder: null,
+            types: [typeof(object), typeof(RoutedEventArgs)], modifiers: null) ??
+            throw new MissingMethodException(typeof(MainWindow).FullName, "OnLoaded");
+        window.Loaded -= (RoutedEventHandler)Delegate.CreateDelegate(
+            typeof(RoutedEventHandler), window, loaded);
+        if (!includeNativePreview)
+        {
+            // The localization/layout matrix does not render video. Remove only the
+            // native child before Show so it cannot initialize a GPU swap chain.
+            // The default smoke tests retain it and exercise native preview separately.
+            var host = (FrameworkElement)window.FindName("MainPreviewHost");
+            if (host.Parent is not System.Windows.Controls.Panel parent)
+                throw new InvalidOperationException("Native preview parent was not found.");
+            parent.Children.Remove(host);
+        }
+        application.MainWindow = window;
+        if (initializeHiddenHandle)
+            new System.Windows.Interop.WindowInteropHelper(window).EnsureHandle();
+        window.Show();
+        var applyWorkspace = RequireMethod(typeof(MainWindow),
+            "ApplyWorkspacePanelState", BindingFlags.Instance | BindingFlags.NonPublic);
+        applyWorkspace.Invoke(window, [false]);
+        var applyMode = RequireMethod(typeof(MainWindow),
+            "ApplyApplicationDisplayMode", BindingFlags.Instance | BindingFlags.NonPublic);
+        applyMode.Invoke(window, null);
+        AdvanceDispatcher(TimeSpan.FromMilliseconds(450));
+        window.UpdateLayout();
+        return window;
+    }
+
+    private static void CloseWorkspaceTestWindow(MainWindow window)
+    {
+        var allowClose = typeof(MainWindow).GetField("_allowClose",
+            BindingFlags.Instance | BindingFlags.NonPublic) ??
+            throw new MissingFieldException(typeof(MainWindow).FullName, "_allowClose");
+        allowClose.SetValue(window, true);
+        // _allowClose deliberately bypasses the application-wide close path
+        // so the next test can create another window. Own that skipped cleanup:
+        // WPF may defer disposing HwndHost until dispatcher shutdown, leaving
+        // the global D3D renderer alive until DLL detach under the loader lock.
+        try
+        {
+            ((IDisposable)window.FindName("MainPreviewHost")).Dispose();
             window.Close();
         }
+        finally
+        {
+            var viewModel = (IPhoneMirror.App.ViewModels.MainViewModel)KeyboardField(window, "_viewModel");
+            var previousContext = SynchronizationContext.Current;
+            SynchronizationContext.SetSynchronizationContext(new DispatcherSynchronizationContext(window.Dispatcher));
+            try { WaitReviewTask(viewModel.ShutdownAsync()); }
+            finally { SynchronizationContext.SetSynchronizationContext(previousContext); }
+        }
+        InteractionAssert(!IPhoneMirror.App.Interop.NativeCore.ForcePreviewRefresh(),
+            "A closed test window retained its native preview renderer.");
+    }
+
+    private static void TestCompleteWorkspaceAnimation(MainWindow window)
+    {
+        var setLeft = RequireMethod(typeof(MainWindow), "SetLeftWorkspacePanel",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var setSettings = RequireMethod(typeof(MainWindow), "SetSettingsPanelVisible",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var panelType = typeof(MainWindow).GetNestedType("LeftWorkspacePanel",
+            BindingFlags.NonPublic) ??
+            throw new MissingMemberException(typeof(MainWindow).FullName,
+                "LeftWorkspacePanel");
+        var none = Enum.Parse(panelType, "None");
+        var devices = Enum.Parse(panelType, "Devices");
+        var leftPanel = window.FindName("LeftPanelHost") as FrameworkElement ??
+            throw new InvalidOperationException("Workspace left panel was not found.");
+        var leftGap = window.FindName("LeftGapColumn") as System.Windows.Controls.ColumnDefinition ??
+            throw new InvalidOperationException("Workspace left gap was not found.");
+
+        if (leftPanel.ActualWidth < 299 || leftGap.ActualWidth < 17)
+            throw new InvalidOperationException("Complete workspace did not start with the device panel open.");
+
+        setLeft.Invoke(window, [none]);
+        window.UpdateLayout();
+        AdvanceDispatcher(TimeSpan.FromMilliseconds(80));
+        window.UpdateLayout();
+
+        setSettings.Invoke(window, [true]);
+        setLeft.Invoke(window, [devices]);
+        AdvanceDispatcher(TimeSpan.FromMilliseconds(360));
+        window.UpdateLayout();
+        var controlPanel = window.FindName("ControlPanel") as FrameworkElement ??
+            throw new InvalidOperationException("Workspace control panel was not found.");
+        // Rendering may start late while the UI audit is exercising other WPF
+        // windows. Wait for the actual end state without relaxing its geometry.
+        var settle = Stopwatch.StartNew();
+        while ((leftPanel.ActualWidth < 299 || leftGap.ActualWidth < 17 ||
+                controlPanel.Width < 335 || controlPanel.Visibility != Visibility.Visible) &&
+               settle.Elapsed < TimeSpan.FromSeconds(2))
+        {
+            AdvanceDispatcher(TimeSpan.FromMilliseconds(50));
+            window.UpdateLayout();
+        }
+        if (leftPanel.ActualWidth < 299 || leftGap.ActualWidth < 17 ||
+            controlPanel.Width < 335 || controlPanel.Visibility != Visibility.Visible)
+            throw new InvalidOperationException(
+                $"Complete workspace did not settle both panels after the retargeted animation: " +
+                $"left={leftPanel.ActualWidth:F1}, gap={leftGap.ActualWidth:F1}, " +
+                $"control={controlPanel.ActualWidth:F1}, controlWidth={controlPanel.Width:F1}, " +
+                $"controlDesired={controlPanel.DesiredSize.Width:F1}, controlMin={controlPanel.MinWidth:F1}, " +
+                $"controlVisibility={controlPanel.Visibility}, " +
+                $"grid={((System.Windows.Controls.Grid)window.FindName("MainContentGrid")!).ActualWidth:F1}, " +
+                $"columns={string.Join(",", ((System.Windows.Controls.Grid)window.FindName("MainContentGrid")!).ColumnDefinitions.Select(column => $"{column.ActualWidth:F1}/{column.Width.GridUnitType}"))}, " +
+                $"column={((System.Windows.Controls.ColumnDefinition)window.FindName("ControlColumn")!).ActualWidth:F1}, " +
+                $"columnWidth={((System.Windows.Controls.ColumnDefinition)window.FindName("ControlColumn")!).Width.Value:F1}, " +
+                $"columnUnit={((System.Windows.Controls.ColumnDefinition)window.FindName("ControlColumn")!).Width.GridUnitType}.");
+    }
+
+    private static void TestLightweightWorkspaceAnimation(MainWindow window)
+    {
+        var setLeft = RequireMethod(typeof(MainWindow), "SetLeftWorkspacePanel",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        var panelType = typeof(MainWindow).GetNestedType("LeftWorkspacePanel",
+            BindingFlags.NonPublic) ??
+            throw new MissingMemberException(typeof(MainWindow).FullName,
+                "LeftWorkspacePanel");
+        var none = Enum.Parse(panelType, "None");
+        var devices = Enum.Parse(panelType, "Devices");
+        var startLeft = window.Left;
+        var expandedWidth = window.ActualWidth;
+
+        setLeft.Invoke(window, [none]);
+        AdvanceDispatcher(TimeSpan.FromMilliseconds(100));
+        var closingWidth = window.ActualWidth;
+        if (Math.Abs(window.Left - startLeft) > 1 ||
+            closingWidth >= expandedWidth - 1)
+            throw new InvalidOperationException(
+                $"Lightweight workspace did not contract from the right with its left rail fixed: " +
+                $"left={window.Left:F1}/{startLeft:F1}, width={closingWidth:F1}/{expandedWidth:F1}.");
+
+        AdvanceDispatcher(TimeSpan.FromMilliseconds(360));
+        var collapsedWidth = window.ActualWidth;
+        if (Math.Abs(window.Left - startLeft) > 1 ||
+            collapsedWidth >= expandedWidth - 8)
+            throw new InvalidOperationException(
+                "Lightweight workspace did not finish the right-side contraction.");
+
+        setLeft.Invoke(window, [devices]);
+        AdvanceDispatcher(TimeSpan.FromMilliseconds(360));
+        if (Math.Abs(window.Left - startLeft) > 1 ||
+            window.ActualWidth <= collapsedWidth + 8)
+            throw new InvalidOperationException(
+                "Lightweight workspace did not expand to the right with its left rail fixed.");
+    }
+
+    private static ApplicationDisplayMode GetApplicationDisplayMode(App app)
+    {
+        var settings = app.GetType().GetProperty("UpdateSettings",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(app) ??
+            throw new MissingMemberException(typeof(App).FullName, "UpdateSettings");
+        return (ApplicationDisplayMode)(settings.GetType().GetProperty(
+            "ApplicationDisplayMode")?.GetValue(settings) ??
+            throw new MissingMemberException(settings.GetType().FullName,
+                "ApplicationDisplayMode"));
+    }
+
+    private static void SetApplicationDisplayMode(App app, ApplicationDisplayMode value)
+    {
+        var settings = app.GetType().GetProperty("UpdateSettings",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(app) ??
+            throw new MissingMemberException(typeof(App).FullName, "UpdateSettings");
+        var property = settings.GetType().GetProperty("ApplicationDisplayMode") ??
+            throw new MissingMemberException(settings.GetType().FullName,
+                "ApplicationDisplayMode");
+        property.SetValue(settings, value);
+    }
+
+    private static void AdvanceDispatcher(TimeSpan duration)
+    {
+        var frame = new DispatcherFrame();
+        var timer = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = duration,
+        };
+        timer.Tick += (_, _) =>
+        {
+            timer.Stop();
+            frame.Continue = false;
+        };
+        timer.Start();
+        Dispatcher.PushFrame(frame);
     }
 
     private static void TestShortcutSettingsWindow(MainWindow owner, Assembly assembly)
@@ -1000,6 +1691,7 @@ internal static class Program
         if (!notice.IsVisible || !notice.Topmost || notice.Owner != owner)
             throw new InvalidOperationException(
                 "Bluetooth control waiting notice must be visible, topmost, and owned.");
+        AssertSelfDrawnWindowCorners(notice);
         var waitingDetail = noticeType.GetProperty("DetailText")?.GetValue(notice) as string;
         if (string.IsNullOrWhiteSpace(waitingDetail) ||
             !waitingDetail.Contains("TEST-PC", StringComparison.Ordinal))
@@ -1014,6 +1706,7 @@ internal static class Program
             throw new InvalidOperationException(
                 "Bluetooth control waiting notice did not expose the complete pairing steps.");
         var waitingHeight = notice.ActualHeight;
+        var waitingWidth = notice.Width;
 
         showConnected.Invoke(null, [owner]);
         if (!notice.IsVisible ||
@@ -1028,7 +1721,7 @@ internal static class Program
                 "Bluetooth control pairing steps remained visible after connection.");
         DrainDispatcher();
         notice.UpdateLayout();
-        if (Math.Abs(notice.Width - 500) > 0.5 ||
+        if (Math.Abs(notice.Width - waitingWidth) > 0.5 ||
             notice.ActualHeight >= waitingHeight)
             throw new InvalidOperationException(
                 $"Bluetooth control confirmation did not retain its original width " +
@@ -1037,8 +1730,11 @@ internal static class Program
         if (notice.Content is not FrameworkElement content)
             throw new InvalidOperationException(
                 "Bluetooth control notice does not expose a measurable content surface.");
-        content.Measure(new Size(notice.Width, double.PositiveInfinity));
-        if (notice.ActualHeight - content.DesiredSize.Height > 12)
+        var frame = (WpfBorder)notice.Template.FindName("RoundedWindowSurface", notice);
+        var frameWidth = frame.Margin.Left + frame.Margin.Right + frame.BorderThickness.Left + frame.BorderThickness.Right;
+        var frameHeight = frame.Margin.Top + frame.Margin.Bottom + frame.BorderThickness.Top + frame.BorderThickness.Bottom;
+        content.Measure(new Size(notice.Width - frameWidth, double.PositiveInfinity));
+        if (notice.ActualHeight - content.DesiredSize.Height - frameHeight > 12)
             throw new InvalidOperationException(
                 "Bluetooth control confirmation retained excess space below its content.");
         if (notice.IsVisible && close.Invoke(null, null) is not true)
@@ -1083,6 +1779,12 @@ internal static class Program
         TestDeveloperPreviewAction(application, owner, openSurface,
             "prompt", "AppPromptWindow", "OnCancelClick");
         TestDeveloperPreviewAction(application, owner, openSurface,
+            "reverse-control-wired-prerequisite", "BluetoothControlNoticeWindow", "OnCloseClick");
+        TestDeveloperPreviewAction(application, owner, openSurface,
+            "reverse-control-wireless-prerequisite", "BluetoothControlNoticeWindow", "OnCloseClick");
+        TestDeveloperPreviewAction(application, owner, openSurface,
+            "reverse-control-error", "CaptureStatusNoticeWindow", "OnCloseClick");
+        TestDeveloperPreviewAction(application, owner, openSurface,
             "capture-error", "CaptureStatusNoticeWindow", "OnCloseClick");
         TestDeveloperPreviewAction(application, owner, openSurface,
             "session-closed", "CaptureStatusNoticeWindow", "OnCloseClick");
@@ -1102,27 +1804,12 @@ internal static class Program
         try
         {
             conflictWindow.UpdateLayout();
-            AssertWindowsOwnOuterCorners(conflictWindow, "Instance conflict window");
+            AssertSelfDrawnWindowCorners(conflictWindow);
         }
         finally
         {
             conflictWindow.Close();
         }
-    }
-
-    private static void AssertWindowsOwnOuterCorners(Window window, string label)
-    {
-        var windowSurface = window.FindName("WindowSurface") as WpfBorder ??
-            throw new InvalidOperationException($"{label} surface was not found.");
-        if (windowSurface.CornerRadius != new CornerRadius(0) ||
-            windowSurface.BorderThickness != new Thickness(0))
-            throw new InvalidOperationException(
-                $"{label} must leave outer corners and borders to Windows.");
-        var cornerPreference = window.GetType().GetProperty(
-            "WindowCornerPreference")?.GetValue(window)?.ToString();
-        if (!string.Equals(cornerPreference, "Round", StringComparison.Ordinal))
-            throw new InvalidOperationException(
-                $"{label} must use Windows rounded corners.");
     }
 
     private static void TestDeveloperPreviewAction(Application application,
@@ -1162,6 +1849,18 @@ internal static class Program
                 $"Developer catalog {propertyName} expected {expected}, got {actual}.");
     }
 
+    private static void AssertCatalogKeys(Type windowType, object window,
+        string propertyName, string[] expected)
+    {
+        var items = windowType.GetProperty(propertyName)?.GetValue(window) as IEnumerable ??
+            throw new InvalidOperationException($"Developer catalog was not found: {propertyName}");
+        var actual = items.Cast<object>().Select(item =>
+            (string)item.GetType().GetProperty("Key")!.GetValue(item)!).ToArray();
+        if (!actual.Order(StringComparer.Ordinal).SequenceEqual(expected.Order(StringComparer.Ordinal)))
+            throw new InvalidOperationException(
+                $"Developer catalog {propertyName} has unexpected keys: {string.Join(", ", actual)}.");
+    }
+
     private static void ApplyTheme(Assembly assembly, AppTheme theme)
     {
         var themeService = assembly.GetType(
@@ -1184,8 +1883,14 @@ internal static class Program
     private static void AssertPrimaryButtonText(WpfButton button, Color expectedColor)
     {
         button.ApplyTemplate();
-        if (button.Template.FindName("PrimaryLabel", button) is not WpfTextBlock label ||
-            label.Foreground is not SolidColorBrush brush || brush.Color != expectedColor)
+        AdvanceDispatcher(TimeSpan.FromMilliseconds(60));
+        button.UpdateLayout();
+        var access = Visuals(button).OfType<System.Windows.Controls.AccessText>()
+            .FirstOrDefault(text => text.Text == button.Content?.ToString());
+        var label = access is not null
+            ? FindVisualDescendant<WpfTextBlock>(access, _ => true)
+            : FindVisualDescendant<WpfTextBlock>(button, text => text.Text == button.Content?.ToString());
+        if (label?.Foreground is not SolidColorBrush brush || brush.Color != expectedColor)
             throw new InvalidOperationException(
                 $"Primary button text did not use the expected theme color {expectedColor}.");
     }

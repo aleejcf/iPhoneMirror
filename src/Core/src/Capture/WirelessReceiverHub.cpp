@@ -1,5 +1,6 @@
 #include "Capture/WirelessReceiverHub.h"
 
+#include "HostCommon.h"
 #include "HttpUrl.h"
 #include "Audio/WasapiRenderer.h"
 #include "IpcProtocol.h"
@@ -57,17 +58,6 @@ std::wstring unique_ipc_suffix() {
     return std::format(L"{}-{}", GetCurrentProcessId(), text);
 }
 
-bool read_all(HANDLE pipe, void* destination, std::size_t size) noexcept {
-    auto* bytes = static_cast<std::uint8_t*>(destination);
-    while (size != 0) {
-        DWORD read{};
-        const auto request = static_cast<DWORD>(std::min<std::size_t>(size, 1024U * 1024U));
-        if (!ReadFile(pipe, bytes, request, &read, nullptr) || read == 0) return false;
-        bytes += read;
-        size -= read;
-    }
-    return true;
-}
 
 bool write_all(HANDLE pipe, const void* source, std::size_t size) noexcept {
     const auto* bytes = static_cast<const std::uint8_t*>(source);
@@ -158,6 +148,14 @@ std::wstring header_text(const char (&value)[Size]) {
 } // namespace
 
 namespace iPhoneMirror::capture {
+
+// read_all is shared via HostCommon.h; pull it into this namespace so the
+// existing unqualified call sites resolve to host_common::read_all.
+using iPhoneMirror::host_common::read_all;
+
+void HandleDeleter::operator()(void* handle) const noexcept {
+    if (handle) CloseHandle(handle);
+}
 
 namespace detail {
 
@@ -305,6 +303,32 @@ void WirelessClientStream::set_metadata(
     if (!os_version.empty()) os_version_ = std::move(os_version);
 }
 
+void WirelessClientStream::set_mirror_state(wireless::MirrorSenderState state) {
+    std::scoped_lock lock(mutex_);
+    if (!connected_) return;
+    mirror_state_ = state;
+    if (latest_frame_) snapshot_.state = State::Streaming;
+    snapshot_.message = state == wireless::MirrorSenderState::Paused
+        ? L"AirPlay video paused" : state == wireless::MirrorSenderState::Reconnecting
+        ? L"AirPlay video reconnecting" : L"Wireless mirroring";
+    fps_sample_time_ = std::chrono::steady_clock::now();
+    fps_sample_frames_ = snapshot_.video_frames;
+    snapshot_.fps = 0;
+}
+
+void WirelessClientStream::set_mirror_geometry(const wireless::MessageHeader& header) {
+    if (header.width == 0 || header.height == 0 || header.width > 16384 ||
+        header.height > 16384 || header.stride[0] == 0 || header.stride[1] == 0 ||
+        header.stride[0] > 16384 || header.stride[1] > 16384) return;
+    std::scoped_lock lock(mutex_);
+    if (!connected_) return;
+    source_width_ = header.stride[0]; source_height_ = header.stride[1];
+    output_width_ = header.width; output_height_ = header.height;
+    // Retain decoded dimensions and pixels until a new decoded frame arrives.
+    logging::write(std::format("wireless_geometry device_fp={} source={}x{} output={}x{}",
+        anonymous_label(id_), source_width_, source_height_, output_width_, output_height_));
+}
+
 WirelessDeviceSnapshot WirelessClientStream::device() const {
     std::scoped_lock lock(mutex_);
     return {
@@ -321,16 +345,40 @@ bool WirelessClientStream::connected() const {
 }
 
 void WirelessClientStream::attach(CapturePreferences preferences) {
+    bool reset_video{};
     {
         std::scoped_lock lock(mutex_);
+        reset_video = attachments_ == 0;
         ++attachments_;
-        snapshot_.state = connected_ ? State::Handshaking : State::WaitingForDevice;
-        snapshot_.message = connected_ ? L"AirPlay connected: " + name_
-                                       : L"Waiting for AirPlay device";
+        if (!connected_ || !latest_frame_) {
+            snapshot_.state = connected_ ? State::Handshaking : State::WaitingForDevice;
+            snapshot_.message = connected_ ? L"AirPlay connected: " + name_
+                                           : L"Waiting for AirPlay device";
+        }
     }
+    if (reset_video) reset_video_for_attach();
     set_target_fps(preferences.target_fps);
     set_audio_volume(preferences.audio_volume);
     set_audio_enabled(preferences.play_audio);
+}
+
+void WirelessClientStream::reset_video_for_attach() noexcept {
+    std::scoped_lock lock(mutex_);
+    // A local capture-session recovery must not blank an otherwise live
+    // AirPlay connection. Keep the last decoded frame visible while the
+    // subscriber is re-attached; the next frame will replace it and the
+    // format-change path below will clear it only when geometry really changes.
+    // This is deliberately different from a new device connection, where no
+    // frame exists yet and the counters should start from zero.
+    if (!latest_frame_) {
+        snapshot_.width = snapshot_.height = 0;
+        snapshot_.fps = snapshot_.latency_ms = 0;
+        snapshot_.video_frames = snapshot_.audio_packets = 0;
+        snapshot_.audio_sample_rate = snapshot_.audio_channels = 0;
+    }
+    started_at_ = std::chrono::steady_clock::now();
+    fps_sample_time_ = started_at_;
+    fps_sample_frames_ = snapshot_.video_frames;
 }
 
 void WirelessClientStream::detach() noexcept {
@@ -359,13 +407,11 @@ std::shared_ptr<const media::DecodedFrame> WirelessClientStream::latest_frame() 
 }
 
 std::shared_ptr<const media::DecodedFrame> WirelessClientStream::next_render_frame() {
+    // AirPlay may send nothing while the phone screen is static. Every preview
+    // must retain access to the latest immutable frame for resize/repaint and
+    // newly opened windows, without another renderer consuming it first.
     std::scoped_lock lock(mutex_);
-    if (render_queue_.empty()) return nullptr;
-    auto frame = render_queue_.size() > 2 ? std::move(render_queue_.back())
-                                          : std::move(render_queue_.front());
-    if (render_queue_.size() > 2) render_queue_.clear();
-    else render_queue_.pop_front();
-    return frame;
+    return latest_frame_;
 }
 
 std::shared_ptr<const AudioPacket> WirelessClientStream::next_audio_packet(
@@ -431,9 +477,9 @@ void WirelessClientStream::publish_video(const wireless::MessageHeader& header,
     frame->color.primaries = coremedia::ColorPrimaries::Bt709;
     frame->color.transfer = coremedia::TransferFunction::Bt709;
     frame->color.matrix = coremedia::MatrixCoefficients::Bt709;
-    frame->color.range = coremedia::ColorRange::Limited;
-    frame->timestamp_100ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        received_at - started_at_).count() / 100;
+    // AirPlay screen mirroring publishes full-range I420. Treating these
+    // samples as video-range expands light UI grays (for example 243) to 255.
+    frame->color.range = coremedia::ColorRange::Full;
     frame->received_at = received_at;
 
     std::scoped_lock lock(mutex_);
@@ -441,12 +487,24 @@ void WirelessClientStream::publish_video(const wireless::MessageHeader& header,
     // Re-check the connection while holding the stream lock so a late frame
     // cannot repopulate a device that was just cleared.
     if (!connected_) return;
+    frame->timestamp_100ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        received_at - started_at_).count() / 100;
+    const bool format_changed = snapshot_.width != 0 && snapshot_.height != 0 &&
+        (snapshot_.width != header.width || snapshot_.height != header.height);
+    if (format_changed) {
+        // Replace the retained frame atomically below, so all previews see
+        // the new orientation without draining frames with old geometry.
+        fps_sample_frames_ = snapshot_.video_frames;
+        fps_sample_time_ = received_at;
+        logging::write(std::format(
+            "wireless_video format_changed device_fp={} from={}x{} to={}x{}",
+            anonymous_label(id_), snapshot_.width, snapshot_.height,
+            header.width, header.height));
+    }
     latest_frame_ = frame;
-    render_queue_.push_back(frame);
-    const auto queue_limit = attachments_ == 0 ? 1U : 4U;
-    while (render_queue_.size() > queue_limit) render_queue_.pop_front();
     snapshot_.state = State::Streaming;
     snapshot_.message = L"Wireless mirroring";
+    mirror_state_ = wireless::MirrorSenderState::Active;
     snapshot_.width = header.width;
     snapshot_.height = header.height;
     ++snapshot_.video_frames;
@@ -477,8 +535,9 @@ void WirelessClientStream::publish_audio(const wireless::MessageHeader& header,
         if (!connected_) return;
         attached = attachments_ != 0;
         snapshot_.state = State::Streaming;
-        snapshot_.message = snapshot_.width == 0 || snapshot_.height == 0
-            ? L"AirPlay music streaming" : L"Wireless mirroring";
+        if (mirror_state_ == wireless::MirrorSenderState::Active)
+            snapshot_.message = snapshot_.width == 0 || snapshot_.height == 0
+                ? L"AirPlay music streaming" : L"Wireless mirroring";
         ++snapshot_.audio_packets;
         snapshot_.audio_sample_rate = header.sample_rate;
         snapshot_.audio_channels = header.channels;
@@ -538,8 +597,9 @@ void WirelessClientStream::clear_media() noexcept {
     {
         std::scoped_lock lock(mutex_);
         latest_frame_.reset();
-        render_queue_.clear();
         snapshot_.width = snapshot_.height = 0;
+        mirror_state_ = wireless::MirrorSenderState::Active;
+        source_width_ = source_height_ = output_width_ = output_height_ = 0;
         snapshot_.fps = snapshot_.latency_ms = 0;
         snapshot_.audio_sample_rate = snapshot_.audio_channels = 0;
     }
@@ -567,7 +627,7 @@ void WirelessReceiverHub::start(std::wstring receiver_name, std::wstring host_pa
     std::scoped_lock lifecycle_lock(lifecycle_mutex_);
     // A crashed host leaves a signaled process handle and a joinable reader
     // thread behind. Reap that stale state before starting its replacement.
-    if (process_ && (WaitForSingleObject(as_handle(process_), 0) != WAIT_TIMEOUT ||
+    if (process_ && (WaitForSingleObject(as_handle(process_.get()), 0) != WAIT_TIMEOUT ||
             pipe_disconnected_.load(std::memory_order_acquire)))
         stop_locked();
     if (worker_.joinable() || playback_worker_.joinable() || process_) return;
@@ -591,22 +651,20 @@ void WirelessReceiverHub::start(std::wstring receiver_name, std::wstring host_pa
         0, security.get());
     if (pipe == INVALID_HANDLE_VALUE)
         throw std::runtime_error(std::format("CreateNamedPipe failed: {}", GetLastError()));
-    pipe_ = pipe;
+    pipe_.reset(pipe);
     SetLastError(ERROR_SUCCESS);
     const auto stop_event = CreateEventW(security.get(), TRUE, FALSE, stop_event_name_.c_str());
     const auto stop_event_error = GetLastError();
     if (!stop_event) {
-        CloseHandle(pipe);
-        pipe_ = nullptr;
+        pipe_.reset();
         throw std::runtime_error(std::format("CreateEvent failed: {}", stop_event_error));
     }
     if (stop_event_error == ERROR_ALREADY_EXISTS) {
         CloseHandle(stop_event);
-        CloseHandle(pipe);
-        pipe_ = nullptr;
+        pipe_.reset();
         throw std::runtime_error("AirPlay stop event name was already claimed");
     }
-    stop_event_ = stop_event;
+    stop_event_.reset(stop_event);
 
     auto command = quote_argument(host_path_) + L" --pipe " + quote_argument(pipe_name_) +
         L" --stop-event " + quote_argument(stop_event_name_) + L" --name " +
@@ -619,14 +677,13 @@ void WirelessReceiverHub::start(std::wstring receiver_name, std::wstring host_pa
     const auto working_directory = std::filesystem::path(host_path_).parent_path().wstring();
     if (!CreateProcessW(host_path_.c_str(), command.data(), nullptr, nullptr, FALSE,
             CREATE_NO_WINDOW, nullptr, working_directory.c_str(), &startup, &process)) {
-        CloseHandle(stop_event);
-        CloseHandle(pipe);
-        stop_event_ = pipe_ = nullptr;
+        stop_event_.reset();
+        pipe_.reset();
         throw std::runtime_error(std::format("CreateProcess for wireless host failed: {}",
             GetLastError()));
     }
     CloseHandle(process.hThread);
-    process_ = process.hProcess;
+    process_.reset(process.hProcess);
     stopping_.store(false, std::memory_order_release);
     ready_.store(false, std::memory_order_release);
     pipe_disconnected_.store(false, std::memory_order_release);
@@ -634,14 +691,19 @@ void WirelessReceiverHub::start(std::wstring receiver_name, std::wstring host_pa
         std::scoped_lock lock(playback_mutex_);
         playback_update_ = {};
     }
-    logging::write(std::format(
-        "wireless_hub host_started pid={} receiver_fp={} capability={}x{}@{} "
-        "mode=combined host_file={}", process.dwProcessId,
-        anonymous_label(receiver_name_), width, height, frame_rate,
-        narrow(std::filesystem::path(host_path_).filename().wstring())));
-    worker_ = std::jthread([this](std::stop_token token) { run(token); });
-    playback_worker_ = std::jthread(
-        [this](std::stop_token token) { run_playback_writer(token); });
+    try {
+        logging::write(std::format(
+            "wireless_hub host_started pid={} receiver_fp={} capability={}x{}@{} "
+            "mode=combined host_file={}", process.dwProcessId,
+            anonymous_label(receiver_name_), width, height, frame_rate,
+            narrow(std::filesystem::path(host_path_).filename().wstring())));
+        worker_ = std::jthread([this](std::stop_token token) { run(token); });
+        playback_worker_ = std::jthread(
+            [this](std::stop_token token) { run_playback_writer(token); });
+    } catch (...) {
+        stop_locked();
+        throw;
+    }
 }
 
 void WirelessReceiverHub::stop() noexcept {
@@ -653,15 +715,15 @@ void WirelessReceiverHub::stop_locked() noexcept {
     if (!worker_.joinable() && !playback_worker_.joinable() && !process_) return;
     stopping_.store(true, std::memory_order_release);
     ready_.store(false, std::memory_order_release);
-    if (stop_event_) SetEvent(as_handle(stop_event_));
+    if (stop_event_) SetEvent(as_handle(stop_event_.get()));
     if (playback_worker_.joinable()) {
         playback_worker_.request_stop();
         CancelSynchronousIo(playback_worker_.native_handle());
     }
     playback_condition_.notify_all();
     if (pipe_) {
-        CancelIoEx(as_handle(pipe_), nullptr);
-        DisconnectNamedPipe(as_handle(pipe_));
+        CancelIoEx(as_handle(pipe_.get()), nullptr);
+        DisconnectNamedPipe(as_handle(pipe_.get()));
     }
     if (worker_.joinable()) {
         worker_.request_stop();
@@ -669,21 +731,14 @@ void WirelessReceiverHub::stop_locked() noexcept {
     }
     if (playback_worker_.joinable()) playback_worker_.join();
     if (process_) {
-        if (WaitForSingleObject(as_handle(process_), 3000) == WAIT_TIMEOUT) {
-            TerminateProcess(as_handle(process_), 1);
-            WaitForSingleObject(as_handle(process_), 1000);
+        if (WaitForSingleObject(as_handle(process_.get()), 3000) == WAIT_TIMEOUT) {
+            TerminateProcess(as_handle(process_.get()), 1);
+            WaitForSingleObject(as_handle(process_.get()), 1000);
         }
-        CloseHandle(as_handle(process_));
-        process_ = nullptr;
+        process_.reset();
     }
-    if (stop_event_) {
-        CloseHandle(as_handle(stop_event_));
-        stop_event_ = nullptr;
-    }
-    if (pipe_) {
-        CloseHandle(as_handle(pipe_));
-        pipe_ = nullptr;
-    }
+    stop_event_.reset();
+    pipe_.reset();
     mark_all_disconnected();
     logging::write("wireless_hub stopped");
 }
@@ -691,7 +746,7 @@ void WirelessReceiverHub::stop_locked() noexcept {
 bool WirelessReceiverHub::running() const noexcept {
     std::scoped_lock lifecycle_lock(lifecycle_mutex_);
     return process_ && !pipe_disconnected_.load(std::memory_order_acquire) &&
-        WaitForSingleObject(as_handle(process_), 0) == WAIT_TIMEOUT;
+        WaitForSingleObject(as_handle(process_.get()), 0) == WAIT_TIMEOUT;
 }
 
 bool WirelessReceiverHub::ready() const noexcept {
@@ -816,7 +871,7 @@ void WirelessReceiverHub::run_playback_writer(std::stop_token stop_token) noexce
             header.media_rate = update.rate;
         }
         std::scoped_lock write_lock(pipe_write_mutex_);
-        if (!pipe_ || !write_all(as_handle(pipe_), &header, sizeof(header))) {
+        if (!pipe_ || !write_all(as_handle(pipe_.get()), &header, sizeof(header))) {
             if (!stopping_.load(std::memory_order_acquire))
                 logging::write("wireless_hub playback writer disconnected");
             ready_.store(false, std::memory_order_release);
@@ -832,8 +887,8 @@ void WirelessReceiverHub::run_playback_writer(std::stop_token stop_token) noexce
 
 void WirelessReceiverHub::run(std::stop_token stop_token) noexcept {
     try {
-        const auto pipe = as_handle(pipe_);
-        const auto expected_process_id = process_ ? GetProcessId(as_handle(process_)) : 0;
+        const auto pipe = as_handle(pipe_.get());
+        const auto expected_process_id = process_ ? GetProcessId(as_handle(process_.get())) : 0;
         const auto connected = expected_process_id != 0 &&
             connect_expected_client(pipe, expected_process_id, stop_token);
         if (!connected) throw std::runtime_error("wireless host could not connect");
@@ -886,6 +941,17 @@ void WirelessReceiverHub::handle_message(const wireless::MessageHeader& header,
     }
     case wireless::MessageType::Video:
         if (const auto stream = find_connected(header)) stream->publish_video(header, payload);
+        break;
+    case wireless::MessageType::MirrorState:
+        if (!payload.empty() || header.reserved >
+            static_cast<std::uint32_t>(wireless::MirrorSenderState::Reconnecting))
+            throw std::runtime_error("invalid mirror state");
+        if (const auto stream = find_connected(header))
+            stream->set_mirror_state(static_cast<wireless::MirrorSenderState>(header.reserved));
+        break;
+    case wireless::MessageType::MirrorGeometry:
+        if (!payload.empty()) throw std::runtime_error("invalid mirror geometry payload");
+        if (const auto stream = find_connected(header)) stream->set_mirror_geometry(header);
         break;
     case wireless::MessageType::Audio:
         // Some RAOP-only senders begin publishing PCM without invoking the
@@ -1066,8 +1132,13 @@ std::shared_ptr<WirelessClientStream> WirelessReceiverHub::get_or_create(
     std::shared_ptr<WirelessClientStream> stream;
     {
         std::scoped_lock lock(mutex_);
-        auto [position, inserted] = clients_.try_emplace(id);
-        if (inserted) position->second = std::make_shared<WirelessClientStream>(id, name);
+        auto position = clients_.find(id);
+        if (position == clients_.end()) {
+            // Construct before inserting so a bad_alloc never leaves a null
+            // entry that find_connected would later dereference.
+            auto created = std::make_shared<WirelessClientStream>(id, name);
+            position = clients_.emplace(id, std::move(created)).first;
+        }
         stream = position->second;
     }
     if (mark_connected) stream->set_identity(std::move(name), true);

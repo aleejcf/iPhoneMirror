@@ -1,32 +1,37 @@
 namespace IPhoneMirror.App.Services;
 
-/// <summary>Combines unsent relative-motion reports without losing travel.</summary>
+/// <summary>Retains one bounded unsent relative-motion report.</summary>
 internal static class BluetoothMouseReportCoalescer
 {
     internal const int ReportLength = 6;
 
     internal static byte[] MergePendingMotion(byte[]? pending, byte[] incoming)
     {
-        if (pending is null || pending.Length != ReportLength ||
-            incoming.Length != ReportLength || pending[0] != incoming[0] ||
-            incoming[5] != 0)
-            return incoming;
-
-        var x = Math.Clamp(ReadInt16(pending, 1) + ReadInt16(incoming, 1),
-            short.MinValue + 1, short.MaxValue);
-        var y = Math.Clamp(ReadInt16(pending, 3) + ReadInt16(incoming, 3),
-            short.MinValue + 1, short.MaxValue);
-        WriteInt16(incoming, 1, (short)x);
-        WriteInt16(incoming, 3, (short)y);
-        return incoming;
+        // The HID pump uses this newest-wins helper for unsent relative
+        // motion. A pending report is disposable once it is older than the
+        // current BLE send window.
+        return incoming.Length == ReportLength ? incoming : pending ?? incoming;
     }
 
-    private static short ReadInt16(byte[] report, int offset) =>
-        (short)(report[offset] | report[offset + 1] << 8);
-
-    private static void WriteInt16(byte[] report, int offset, short value)
+    internal static byte[] MergeRecentMotion(byte[]? pending, byte[] incoming)
     {
-        report[offset] = (byte)(value & 0xFF);
-        report[offset + 1] = (byte)((value >> 8) & 0xFF);
+        if (pending is null || pending.Length != ReportLength ||
+            incoming.Length != ReportLength)
+            return incoming;
+
+        static short ReadAxis(byte[] report, int offset) =>
+            (short)(report[offset] | report[offset + 1] << 8);
+        static short AddAxis(short left, short right) => (short)Math.Clamp(
+            (int)left + right, short.MinValue + 1, short.MaxValue);
+
+        var x = AddAxis(ReadAxis(pending, 1), ReadAxis(incoming, 1));
+        var y = AddAxis(ReadAxis(pending, 3), ReadAxis(incoming, 3));
+        return
+        [
+            incoming[0],
+            (byte)(x & 0xFF), (byte)((x >> 8) & 0xFF),
+            (byte)(y & 0xFF), (byte)((y >> 8) & 0xFF),
+            incoming[5],
+        ];
     }
 }

@@ -49,8 +49,8 @@ struct LibUsb0QuickTimeOpenOptions {
     // claim-only path so a restart cannot reconfigure a live Apple filter.
     bool allow_configuration_initialization{};
     // After an exact libusb0 device-interface arrival, AppleUsbFilter can make
-    // the handle visible before its new descriptors are committed. Keep one
-    // verified handle and wait on read-only descriptor evidence; never reopen.
+    // the handle visible before its new descriptors/active configuration are
+    // committed. Keep one verified handle and wait for both; never reopen.
     bool wait_for_activated_descriptor{};
     std::stop_token stop_token{};
 };
@@ -68,6 +68,9 @@ public:
     [[nodiscard]] static bool enable_quicktime_configuration(const AppleUsbIdentity& identity);
     [[nodiscard]] static bool disable_quicktime_configuration(const std::string& serial);
     [[nodiscard]] static bool disable_quicktime_configuration(const AppleUsbIdentity& identity);
+    // Called only after all selected-phone handles have been released and its
+    // normal configuration returned, but Apple USBMux still cannot see it.
+    [[nodiscard]] static bool reconnect_normal_device(const AppleUsbIdentity& identity);
     [[nodiscard]] static LibUsb0Connection open_quicktime(const std::string& serial);
     [[nodiscard]] static LibUsb0Connection open_quicktime(
         const AppleUsbIdentity& identity,

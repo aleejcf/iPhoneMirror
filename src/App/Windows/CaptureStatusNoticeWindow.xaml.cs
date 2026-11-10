@@ -1,34 +1,47 @@
+using System.ComponentModel;
 using System.Windows;
 using IPhoneMirror.App.Localization;
 
 namespace IPhoneMirror.App.Windows;
 
-public partial class CaptureStatusNoticeWindow : Wpf.Ui.Controls.FluentWindow
+public partial class CaptureStatusNoticeWindow : IPhoneMirror.UI.Controls.RoundedWindow, INotifyPropertyChanged
 {
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    private static CaptureStatusNoticeWindow? _activeError;
     private enum NoticeKind { Error, UsbConfiguration, Stopped }
 
-    public string TitleText { get; }
-    public string BodyText { get; }
-    public string BadgeText { get; }
-    public string HintText { get; }
+    private readonly string _titleText;
+    public string TitleText => LocalizationService.RefreshText(_titleText);
+    private readonly string _bodyText;
+    public string BodyText => LocalizationService.RefreshText(_bodyText);
+    public string? TechnicalDetails { get; }
+    public bool HasTechnicalDetails => !string.IsNullOrWhiteSpace(TechnicalDetails);
+    private readonly string _badgeText;
+    public string BadgeText => LocalizationService.RefreshText(_badgeText);
+    private readonly string _hintText;
+    public string HintText => LocalizationService.RefreshText(_hintText);
     public bool IsStopped { get; }
     public bool IsUsbConfiguration { get; }
+    public bool IsReverseControl { get; }
     public bool IsWarning => IsStopped || IsUsbConfiguration;
 
     private CaptureStatusNoticeWindow(string title, string body, NoticeKind kind,
-        bool previewOnly = false)
+        bool reverseControl = false, bool previewOnly = false, string? technicalDetails = null)
     {
-        TitleText = title;
-        BodyText = body;
+        _titleText = title;
+        _bodyText = body;
+        TechnicalDetails = technicalDetails;
         IsStopped = kind == NoticeKind.Stopped;
         IsUsbConfiguration = kind == NoticeKind.UsbConfiguration;
-        BadgeText = LocalizationService.Get(kind switch
+        IsReverseControl = reverseControl;
+        _badgeText = LocalizationService.Get(kind switch
         {
             NoticeKind.Stopped => "CaptureNoticeStoppedBadge",
             NoticeKind.UsbConfiguration => "CaptureNoticeUsbBadge",
-            _ => "CaptureNoticeErrorBadge",
+            _ => reverseControl ? "ReverseControlNoticeErrorBadge" : "CaptureNoticeErrorBadge",
         });
-        HintText = LocalizationService.Get(kind switch
+        _hintText = LocalizationService.Get(kind switch
         {
             NoticeKind.Stopped => "CaptureNoticeStoppedHint",
             NoticeKind.UsbConfiguration => "CaptureNoticeUsbHint",
@@ -36,29 +49,53 @@ public partial class CaptureStatusNoticeWindow : Wpf.Ui.Controls.FluentWindow
         });
         DataContext = this;
         InitializeComponent();
+        LocalizationService.RefreshWhenLanguageChanges(this, () =>
+            PropertyChanged?.Invoke(this, new(null)));
     }
 
     internal static void ShowError(string title, string body) =>
         ShowError(title, body, usbConfiguration: false);
 
     internal static void ShowError(string title, string body,
-        bool usbConfiguration) =>
-        new CaptureStatusNoticeWindow(title, body,
-            usbConfiguration ? NoticeKind.UsbConfiguration : NoticeKind.Error)
+        bool usbConfiguration, bool reverseControl = false, string? technicalDetails = null) =>
+        ShowErrorCore(title, body, usbConfiguration, reverseControl, technicalDetails);
+
+    private static void ShowErrorCore(string title, string body,
+        bool usbConfiguration, bool reverseControl, string? technicalDetails)
+    {
+        if (_activeError is { IsVisible: true })
         {
-            Owner = Application.Current.MainWindow,
-        }.ShowDialog();
+            if (_activeError.TitleText == title && _activeError.BodyText == body)
+            {
+                _activeError.Activate();
+                return;
+            }
+            _activeError.Close();
+        }
+        // WPF assigns the first constructed Window as MainWindow. Capture the
+        // existing owner first, and ignore a hidden or already closed owner.
+        var owner = Application.Current?.MainWindow;
+        var notice = new CaptureStatusNoticeWindow(title, body,
+            usbConfiguration ? NoticeKind.UsbConfiguration : NoticeKind.Error,
+            reverseControl: reverseControl, technicalDetails: technicalDetails);
+        if (owner is { IsVisible: true }) notice.Owner = owner;
+        _activeError = notice;
+        notice.Closed += (_, _) =>
+        {
+            if (ReferenceEquals(_activeError, notice)) _activeError = null;
+        };
+        notice.ShowDialog();
+    }
 
     internal static void ShowStoppedThen(string title, string body,
         Func<Task> afterShown)
     {
         ArgumentNullException.ThrowIfNull(afterShown);
-        var notice = new CaptureStatusNoticeWindow(title, body, NoticeKind.Stopped)
-        {
-            Owner = Application.Current.MainWindow,
-        };
+        var owner = Application.Current?.MainWindow;
+        var notice = new CaptureStatusNoticeWindow(title, body, NoticeKind.Stopped);
+        if (owner is { IsVisible: true }) notice.Owner = owner;
         var started = false;
-        notice.ContentRendered += async (_, _) =>
+        async Task ReleaseAfterShownAsync()
         {
             if (started) return;
             started = true;
@@ -73,8 +110,15 @@ public partial class CaptureStatusNoticeWindow : Wpf.Ui.Controls.FluentWindow
                 Services.DiagnosticLogger.Exception("capture",
                     "capture_notice_after_shown_failed", error);
             }
-        };
-        notice.ShowDialog();
+        }
+        notice.ContentRendered += async (_, _) => await ReleaseAfterShownAsync();
+        try { notice.ShowDialog(); }
+        finally
+        {
+            // Closing before ContentRendered (or failing to show) must not
+            // retain the failed capture. The once guard also covers re-entry.
+            if (!started) _ = ReleaseAfterShownAsync();
+        }
     }
 
     internal static void ShowDeveloperErrorPreview(Window owner) =>
@@ -82,6 +126,14 @@ public partial class CaptureStatusNoticeWindow : Wpf.Ui.Controls.FluentWindow
             LocalizationService.Format("DeviceCaptureErrorTitleFormat",
                 LocalizationService.Get("DeveloperPreviewDeviceName")),
             LocalizationService.Get("CaptureActionVideoRetry"), NoticeKind.Error);
+
+    internal static void ShowDeveloperReverseControlErrorPreview(Window owner) =>
+        ShowDeveloperPreview(owner,
+            LocalizationService.Get("ReverseControlErrorTitle"),
+            LocalizationService.Format("ReverseControlErrorBodyFormat",
+                LocalizationService.Get("ReverseControlTransportWired"),
+                LocalizationService.Get("DeveloperPreviewReverseControlUnavailable")), NoticeKind.Error,
+            reverseControl: true);
 
     internal static void ShowDeveloperStoppedPreview(Window owner) =>
         ShowDeveloperPreview(owner,
@@ -96,9 +148,10 @@ public partial class CaptureStatusNoticeWindow : Wpf.Ui.Controls.FluentWindow
             NoticeKind.UsbConfiguration);
 
     private static void ShowDeveloperPreview(Window owner, string title,
-        string body, NoticeKind kind)
+        string body, NoticeKind kind, bool reverseControl = false)
     {
-        new CaptureStatusNoticeWindow(title, body, kind, previewOnly: true)
+        new CaptureStatusNoticeWindow(title, body, kind,
+            reverseControl: reverseControl, previewOnly: true)
         {
             Owner = owner,
         }.Show();

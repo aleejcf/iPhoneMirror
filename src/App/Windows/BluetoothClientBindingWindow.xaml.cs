@@ -7,17 +7,21 @@ using IPhoneMirror.App.Services;
 
 namespace IPhoneMirror.App.Windows;
 
-public partial class BluetoothClientBindingWindow : Wpf.Ui.Controls.FluentWindow,
+public partial class BluetoothClientBindingWindow : IPhoneMirror.UI.Controls.RoundedWindow,
     INotifyPropertyChanged
 {
     private BluetoothClientInfo? _selectedClient;
     private readonly Func<string, bool> _unbind;
     private readonly Func<Task<IReadOnlyList<BluetoothClientInfo>>> _refresh;
     private readonly string? _suggestedId;
+    private readonly TaskCompletionSource<string?> _result =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
     private bool _isRefreshing;
+    private bool _resultCompleted;
 
     public ObservableCollection<BluetoothClientInfo> Clients { get; } = [];
-    public string TargetText { get; }
+    private readonly string _targetName;
+    public string TargetText => LocalizationService.Format("BluetoothClientBindingTargetFormat", _targetName);
     public BluetoothClientInfo? SelectedClient
     {
         get => _selectedClient;
@@ -29,7 +33,7 @@ public partial class BluetoothClientBindingWindow : Wpf.Ui.Controls.FluentWindow
             OnPropertyChanged(nameof(CanConfirm));
         }
     }
-    public bool CanConfirm => SelectedClient?.CanBind == true;
+    public bool CanConfirm => !_isRefreshing && SelectedClient?.CanBind == true;
     public bool CanRefresh => !_isRefreshing;
 
     private BluetoothClientBindingWindow(Window owner, string targetName,
@@ -40,12 +44,18 @@ public partial class BluetoothClientBindingWindow : Wpf.Ui.Controls.FluentWindow
         _unbind = unbind;
         _refresh = refresh;
         _suggestedId = suggestedId;
-        TargetText = LocalizationService.Format("BluetoothClientBindingTargetFormat",
-            targetName);
+        _targetName = targetName;
         ReplaceClients(clients, suggestedId);
         Owner = owner;
         DataContext = this;
         InitializeComponent();
+        Closed += OnClosed;
+        LocalizationService.RefreshWhenLanguageChanges(this, () =>
+        {
+            OnPropertyChanged(nameof(TargetText));
+            FeedbackText.Text = LocalizationService.RefreshText(FeedbackText.Text);
+            foreach (var client in Clients) client.NotifyLanguageChanged();
+        });
     }
 
     internal static string? Show(Window owner, string targetName,
@@ -55,17 +65,51 @@ public partial class BluetoothClientBindingWindow : Wpf.Ui.Controls.FluentWindow
     {
         var window = new BluetoothClientBindingWindow(owner, targetName, clients, suggestedId,
             refresh, unbind);
-        return window.ShowDialog() == true ? window.SelectedClient?.Id : null;
+        window.ShowDialog();
+        return window._result.Task.GetAwaiter().GetResult();
+    }
+
+    internal static void ShowDeveloperPreview(Window owner) =>
+        new BluetoothClientBindingWindow(owner, "iPhone", [], null,
+            () => Task.FromResult<IReadOnlyList<BluetoothClientInfo>>([]), _ => false).Show();
+
+    // The Bluetooth control startup path must not enter a nested modal
+    // dispatcher loop. Keep the window modeless and let callers await the
+    // user's choice without blocking the main window.
+    internal static Task<string?> ShowAsync(Window owner, string targetName,
+        IReadOnlyList<BluetoothClientInfo> clients, string? suggestedId,
+        Func<Task<IReadOnlyList<BluetoothClientInfo>>> refresh,
+        Func<string, bool> unbind)
+    {
+        var window = new BluetoothClientBindingWindow(owner, targetName, clients,
+            suggestedId, refresh, unbind);
+        window.Show();
+        return window._result.Task;
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
     private void OnConfirmClick(object sender, RoutedEventArgs e)
     {
-        if (CanConfirm) DialogResult = true;
+        if (!CanConfirm) return;
+        CompleteResult(SelectedClient?.Id);
+        if (IsVisible) Close();
     }
 
-    private void OnCancelClick(object sender, RoutedEventArgs e) => DialogResult = false;
+    private void OnCancelClick(object sender, RoutedEventArgs e)
+    {
+        CompleteResult(null);
+        if (IsVisible) Close();
+    }
+
+    private void OnClosed(object? sender, EventArgs e) => CompleteResult(null);
+
+    private void CompleteResult(string? value)
+    {
+        if (_resultCompleted) return;
+        _resultCompleted = true;
+        _result.TrySetResult(value);
+    }
 
     private void OnUnbindClick(object sender, RoutedEventArgs e)
     {
@@ -84,20 +128,29 @@ public partial class BluetoothClientBindingWindow : Wpf.Ui.Controls.FluentWindow
         if (_isRefreshing) return;
         var selectedId = SelectedClient?.Id;
         _isRefreshing = true;
+        FeedbackText.SetResourceReference(System.Windows.Controls.TextBlock.TextProperty, "UiRefreshing");
         OnPropertyChanged(nameof(CanRefresh));
+        OnPropertyChanged(nameof(CanConfirm));
         try
         {
             var clients = await _refresh();
-            if (IsLoaded) ReplaceClients(clients, selectedId ?? _suggestedId);
+            if (IsLoaded)
+            {
+                ReplaceClients(clients, selectedId ?? _suggestedId);
+                FeedbackText.Text = string.Empty;
+            }
         }
         catch (Exception error)
         {
             DiagnosticLogger.Exception("bluetooth", "binding_client_refresh_failed", error);
+            if (IsLoaded) FeedbackText.SetResourceReference(
+                System.Windows.Controls.TextBlock.TextProperty, "UiBluetoothRefreshFailed");
         }
         finally
         {
             _isRefreshing = false;
             OnPropertyChanged(nameof(CanRefresh));
+            OnPropertyChanged(nameof(CanConfirm));
         }
     }
 

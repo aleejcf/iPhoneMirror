@@ -16,7 +16,7 @@ public sealed record DeveloperSurfaceItem(string Key, SymbolRegular Icon,
 
 public sealed record DeveloperOpenWindowItem(string Title, Window Window);
 
-public partial class DeveloperToolsWindow : Wpf.Ui.Controls.FluentWindow,
+public partial class DeveloperToolsWindow : IPhoneMirror.UI.Controls.RoundedWindow,
     INotifyPropertyChanged
 {
     private readonly MainWindow _owner;
@@ -31,7 +31,7 @@ public partial class DeveloperToolsWindow : Wpf.Ui.Controls.FluentWindow,
     public IReadOnlyList<DeveloperSurfaceItem> WorkspaceItems { get; private set; }
     public IReadOnlyList<DeveloperSurfaceItem> WindowItems { get; private set; }
     public IReadOnlyList<DeveloperOpenWindowItem> OpenWindows { get; private set; } = [];
-    public string StatusText { get => _statusText; private set => Set(ref _statusText, value); }
+    public string StatusText { get => LocalizationService.RefreshText(_statusText); private set => Set(ref _statusText, value); }
     public string OpacityText => $"{_owner.Opacity:P0}";
     public string DiagnosticsText { get; private set; } = string.Empty;
 
@@ -44,6 +44,7 @@ public partial class DeveloperToolsWindow : Wpf.Ui.Controls.FluentWindow,
             Surface("workspace-mirroring", SymbolRegular.ProjectionScreen20, "DeveloperMirroring", "DeveloperMirroringDescription"),
             Surface("workspace-devices", SymbolRegular.Phone20, "DeveloperDevices", "DeveloperDevicesDescription"),
             Surface("workspace-settings", SymbolRegular.Settings20, "DeveloperSettings", "DeveloperSettingsDescription"),
+            Surface("first-run-setup", SymbolRegular.Window20, "SetupReopen", "SetupTitle"),
             Surface("workspace-output", SymbolRegular.Speaker220, "DeveloperOutput", "DeveloperOutputDescription"),
             Surface("driver-manager", SymbolRegular.WrenchScrewdriver20, "DeveloperDriver", "DeveloperDriverDescription"),
             Surface("about", SymbolRegular.Info20, "DeveloperAbout", "DeveloperAboutDescription"),
@@ -51,7 +52,18 @@ public partial class DeveloperToolsWindow : Wpf.Ui.Controls.FluentWindow,
         WindowItems =
         [
             Surface("advanced-settings", SymbolRegular.Settings20, "DeveloperAdvancedSettings", "DeveloperAdvancedSettingsDescription"),
+            Surface("text-input", SymbolRegular.Edit20, "DeviceBindingRenameTitle", "DeveloperReadOnlyPreview"),
+            Surface("device-binding", SymbolRegular.Link20, "DeveloperDeviceBindingWindow", "DeveloperReadOnlyPreview"),
+            Surface("airplay-device-selection", SymbolRegular.Phone20, "DeveloperAirPlaySelectionWindow", "DeveloperReadOnlyPreview"),
+            Surface("bluetooth-connection", SymbolRegular.Bluetooth20, "DeveloperBluetoothConnectionWindow", "DeveloperReadOnlyPreview"),
+            Surface("bluetooth-client-binding", SymbolRegular.Bluetooth20, "DeveloperBluetoothClientBindingWindow", "DeveloperReadOnlyPreview"),
+            Surface("bluetooth-control-notice", SymbolRegular.Bluetooth20, "DeveloperBluetoothControlNoticeWindow", "DeveloperReadOnlyPreview"),
+            Surface("shortcut-settings", SymbolRegular.Keyboard20, "DeveloperShortcutSettingsWindow", "DeveloperReadOnlyPreview"),
+            Surface("reverse-control-status", SymbolRegular.Clock20, "DeveloperReverseControlStatusWindow", "DeveloperReadOnlyPreview"),
             Surface("prompt", SymbolRegular.QuestionCircle20, "DeveloperPrompt", "DeveloperPromptDescription"),
+            Surface("reverse-control-wired-prerequisite", SymbolRegular.UsbPlug20, "DeveloperReverseControlWiredPrerequisite", "DeveloperReverseControlWiredPrerequisiteDescription"),
+            Surface("reverse-control-wireless-prerequisite", SymbolRegular.Info20, "DeveloperReverseControlWirelessPrerequisite", "DeveloperReverseControlWirelessPrerequisiteDescription"),
+            Surface("reverse-control-error", SymbolRegular.ErrorCircle20, "DeveloperReverseControlError", "DeveloperReverseControlErrorDescription"),
             Surface("capture-error", SymbolRegular.ErrorCircle20, "DeveloperCaptureError", "DeveloperCaptureErrorDescription"),
             Surface("session-closed", SymbolRegular.ErrorCircle20, "DeveloperSessionClosed", "DeveloperSessionClosedDescription"),
             Surface("usb-config-error", SymbolRegular.UsbPlug20, "DeveloperUsbConfigError", "DeveloperUsbConfigErrorDescription"),
@@ -68,6 +80,7 @@ public partial class DeveloperToolsWindow : Wpf.Ui.Controls.FluentWindow,
         ];
         DataContext = this;
         InitializeComponent();
+        InitializeAutomationSettings();
         ThemeService.Attach(this);
         LocalizationService.LanguageChanged += OnLanguageChanged;
         _diagnosticsTimer.Tick += (_, _) => RefreshDiagnostics();
@@ -79,6 +92,7 @@ public partial class DeveloperToolsWindow : Wpf.Ui.Controls.FluentWindow,
         };
         Closed += (_, _) =>
         {
+            _owner.AutomationStateChanged -= RefreshAutomationState;
             _diagnosticsTimer.Stop();
             LocalizationService.LanguageChanged -= OnLanguageChanged;
         };
@@ -102,6 +116,7 @@ public partial class DeveloperToolsWindow : Wpf.Ui.Controls.FluentWindow,
                     "workspace-mirroring" => "DeveloperMirroring",
                     "workspace-devices" => "DeveloperDevices",
                     "workspace-settings" => "DeveloperSettings",
+                    "first-run-setup" => "SetupReopen",
                     "workspace-output" => "DeveloperOutput",
                     "driver-manager" => "DeveloperDriver",
                     _ => "DeveloperAbout",
@@ -111,6 +126,7 @@ public partial class DeveloperToolsWindow : Wpf.Ui.Controls.FluentWindow,
                     "workspace-mirroring" => "DeveloperMirroringDescription",
                     "workspace-devices" => "DeveloperDevicesDescription",
                     "workspace-settings" => "DeveloperSettingsDescription",
+                    "first-run-setup" => "SetupTitle",
                     "workspace-output" => "DeveloperOutputDescription",
                     "driver-manager" => "DeveloperDriverDescription",
                     _ => "DeveloperAboutDescription",
@@ -121,7 +137,18 @@ public partial class DeveloperToolsWindow : Wpf.Ui.Controls.FluentWindow,
             var titleKey = windows[index].Key switch
             {
                 "advanced-settings" => "DeveloperAdvancedSettings",
+                "text-input" => "DeviceBindingRenameTitle",
+                "device-binding" => "DeveloperDeviceBindingWindow",
+                "airplay-device-selection" => "DeveloperAirPlaySelectionWindow",
+                "bluetooth-connection" => "DeveloperBluetoothConnectionWindow",
+                "bluetooth-client-binding" => "DeveloperBluetoothClientBindingWindow",
+                "bluetooth-control-notice" => "DeveloperBluetoothControlNoticeWindow",
+                "shortcut-settings" => "DeveloperShortcutSettingsWindow",
+                "reverse-control-status" => "DeveloperReverseControlStatusWindow",
                 "prompt" => "DeveloperPrompt",
+                "reverse-control-wired-prerequisite" => "DeveloperReverseControlWiredPrerequisite",
+                "reverse-control-wireless-prerequisite" => "DeveloperReverseControlWirelessPrerequisite",
+                "reverse-control-error" => "DeveloperReverseControlError",
                 "capture-error" => "DeveloperCaptureError",
                 "session-closed" => "DeveloperSessionClosed",
                 "usb-config-error" => "DeveloperUsbConfigError",
@@ -136,7 +163,12 @@ public partial class DeveloperToolsWindow : Wpf.Ui.Controls.FluentWindow,
                 "protected-content" => "DeveloperProtectedContent",
                 _ => "DeveloperNativePreview",
             };
-            var descriptionKey = titleKey + "Description";
+            var descriptionKey = windows[index].Key is
+                "device-binding" or "airplay-device-selection" or
+                "bluetooth-connection" or "bluetooth-client-binding" or
+                "bluetooth-control-notice" or "shortcut-settings" or
+                "reverse-control-status"
+                ? "DeveloperReadOnlyPreview" : titleKey + "Description";
             windows[index] = windows[index] with
             {
                 Title = LocalizationService.Get(titleKey),
@@ -145,7 +177,9 @@ public partial class DeveloperToolsWindow : Wpf.Ui.Controls.FluentWindow,
         }
         ReplaceCollection(nameof(WorkspaceItems), workspace);
         ReplaceCollection(nameof(WindowItems), windows);
+        OnPropertyChanged(nameof(StatusText));
         SyncControls();
+        RefreshDiagnostics();
     }
 
     private void ReplaceCollection(string propertyName, IReadOnlyList<DeveloperSurfaceItem> value)
@@ -203,7 +237,7 @@ public partial class DeveloperToolsWindow : Wpf.Ui.Controls.FluentWindow,
         }
         catch (Exception error)
         {
-            StatusText = $"{LocalizationService.Get("DeveloperSurfaceOpenFailed")}: {error.Message}";
+            StatusText = LocalizationService.Format("DeveloperSurfaceOpenFailedFormat", error.Message);
             DiagnosticLogger.Exception("ui", "developer_surface_open_failed", error,
                 ("surface", key));
         }

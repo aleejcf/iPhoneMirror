@@ -45,6 +45,9 @@ struct VideoDimensions {
     std::uint32_t height{};
 };
 
+void normalize_wired_screen_mirroring_color(
+    media::DecodedFrame& frame) noexcept;
+
 [[nodiscard]] constexpr std::uint64_t pack_video_dimensions(
     std::uint32_t width, std::uint32_t height) noexcept {
     return (static_cast<std::uint64_t>(width) << 32U) | height;
@@ -100,6 +103,17 @@ private:
 // independent stream stall to recover within the same capture session.
 class FastStreamReconnectGate final {
 public:
+    [[nodiscard]] bool request_for_silence(std::chrono::milliseconds video,
+        std::chrono::milliseconds media) noexcept {
+        // Reconnect only when video AND audio both stall. iOS sends no video
+        // frames while the screen is static (game lobbies, menus), so a
+        // video-only silence with live audio is normal. Forcing the reconnect
+        // in that state made iOS 16 (iPhone 8 Plus) answer with SYNC stop +
+        // RELS and then never send CWPA again until the phone was restarted.
+        constexpr auto media_limit = std::chrono::milliseconds(2500);
+        return video >= media_limit && media >= media_limit && request();
+    }
+
     [[nodiscard]] bool request() noexcept {
         if (awaiting_video_frame_) return false;
         awaiting_video_frame_ = true;
@@ -265,6 +279,20 @@ private:
     std::unique_ptr<audio::WasapiRenderer> audio_renderer_;
     std::deque<std::shared_ptr<const AudioPacket>> audio_output_queue_;
     std::uint64_t audio_output_sequence_{};
+
+    // Result of the run() opening setup block. Carries the native display
+    // size and device fingerprint back to the caller so the worker can reuse
+    // them without re-running the side effects (atomic store + log write).
+    struct RunOpenState {
+        std::uint32_t native_width{};
+        std::uint32_t native_height{};
+        std::string device_fp;
+    };
+
+    // Publishes native_portrait_size_ and writes the capture_run begin log.
+    // Extracted from run() to lower its cyclomatic complexity; behavior is
+    // unchanged. Returns the native panel size and the device fingerprint.
+    [[nodiscard]] RunOpenState prepare_run_open_log() noexcept;
 
     void run(std::stop_token stop_token) noexcept;
     void acquire_usb_transition_gate() noexcept;

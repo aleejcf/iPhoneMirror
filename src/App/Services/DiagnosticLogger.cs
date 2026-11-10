@@ -15,6 +15,10 @@ internal readonly record struct LogCleanupResult(
 /// </summary>
 internal static class DiagnosticLogger
 {
+    // Call only for public component/update transport URLs after trust checking.
+    // Signed redirect queries, fragments and user credentials are never retained.
+    private sealed record DownloadLocation(Uri? Uri);
+    internal static object DownloadUrl(Uri? uri) => new DownloadLocation(uri);
     internal const long MaximumLogBytes = 8L * 1024 * 1024;
     internal const int RetainedArchives = 4;
     internal const int RetentionDays = 14;
@@ -30,6 +34,10 @@ internal static class DiagnosticLogger
         DirectoryPath, "application.log");
     internal static string NativeLogPath { get; } = System.IO.Path.Combine(
         DirectoryPath, "capture.log");
+    // Bluetooth, USB, and wireless reverse control share one focused log so a
+    // support capture does not need to be reconstructed from application.log.
+    internal static string ReverseControlLogPath { get; } = System.IO.Path.Combine(
+        DirectoryPath, "reverse-control.log");
     internal static string FallbackPath { get; } = System.IO.Path.Combine(
         System.IO.Path.GetTempPath(), "iPhoneMirror-fallback.log");
 
@@ -43,7 +51,10 @@ internal static class DiagnosticLogger
                 NativeLogPath, EnvironmentVariableTarget.Process);
             var cleanup = Cleanup(includeActiveLogs: false);
             Write("INFO", "lifecycle", "session_start",
-                ("version", Assembly.GetExecutingAssembly().GetName().Version),
+                ("version", Assembly.GetEntryAssembly()?
+                    .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+                    .InformationalVersion ??
+                    Assembly.GetExecutingAssembly().GetName().Version?.ToString()),
                 ("os", RuntimeInformation.OSDescription),
                 ("architecture", RuntimeInformation.ProcessArchitecture),
                 ("framework", RuntimeInformation.FrameworkDescription),
@@ -70,6 +81,18 @@ internal static class DiagnosticLogger
     internal static void Error(string category, string eventName,
         params (string Key, object? Value)[] fields) =>
         Write("ERROR", category, eventName, fields);
+
+    internal static void ReverseControl(string mode, string eventName,
+        params (string Key, object? Value)[] fields) =>
+        WriteReverseControl("INFO", mode, eventName, fields);
+
+    internal static void ReverseControlWarning(string mode, string eventName,
+        params (string Key, object? Value)[] fields) =>
+        WriteReverseControl("WARN", mode, eventName, fields);
+
+    internal static void ReverseControlError(string mode, string eventName,
+        params (string Key, object? Value)[] fields) =>
+        WriteReverseControl("ERROR", mode, eventName, fields);
 
     internal static void Exception(string category, string eventName,
         Exception error, params (string Key, object? Value)[] fields)
@@ -155,6 +178,48 @@ internal static class DiagnosticLogger
         }
     }
 
+    private static void WriteReverseControl(string level, string mode,
+        string eventName, params (string Key, object? Value)[] fields)
+    {
+        try
+        {
+            lock (Gate)
+            {
+                Directory.CreateDirectory(DirectoryPath);
+                var sessionStarted = false;
+                if (!TryRotateIfNeeded(ReverseControlLogPath, MaximumLogBytes,
+                        RetainedArchives, ref sessionStarted))
+                {
+                    TryWriteFallback(FormatEntry(level, "reverse_control", eventName,
+                        fields) + FormatEntry("ERROR", "logging", "rotation_failed",
+                        ("file", System.IO.Path.GetFileName(ReverseControlLogPath))));
+                    return;
+                }
+                if (!File.Exists(ReverseControlLogPath) ||
+                    new FileInfo(ReverseControlLogPath).Length == 0)
+                {
+                    File.AppendAllText(ReverseControlLogPath,
+                        FormatEntry("INFO", "reverse_control", "log_opened",
+                            ("pid", Environment.ProcessId),
+                            ("path", System.IO.Path.GetFileName(ReverseControlLogPath))),
+                        new UTF8Encoding(false));
+                }
+                var all = new (string Key, object? Value)[fields.Length + 1];
+                all[0] = ("mode", mode);
+                fields.CopyTo(all, 1);
+                File.AppendAllText(ReverseControlLogPath,
+                    FormatEntry(level, "reverse_control", eventName, all),
+                    new UTF8Encoding(false));
+            }
+        }
+        catch (Exception error)
+        {
+            TryWriteFallback(FormatEntry(level, "reverse_control", eventName,
+                fields) + FormatEntry("ERROR", "logging", "reverse_control_write_failed",
+                ("exception", error.GetType().FullName), ("message", error.Message)));
+        }
+    }
+
     private static void EnsureSessionHeader()
     {
         if (_sessionStarted) return;
@@ -180,7 +245,9 @@ internal static class DiagnosticLogger
         {
             if (string.IsNullOrWhiteSpace(key)) continue;
             var raw = Convert.ToString(value, CultureInfo.InvariantCulture);
-            var rendered = IsVersionField(key, raw)
+            var rendered = value is DownloadLocation location
+                ? location.Uri?.GetComponents(UriComponents.SchemeAndServer | UriComponents.Path, UriFormat.UriEscaped) ?? "unknown"
+                : IsVersionField(key, raw)
                 ? raw!
                 : AppLog.Message(raw);
             builder.Append(' ').Append(Token(key)).Append('=');
@@ -227,6 +294,7 @@ internal static class DiagnosticLogger
         {
             System.IO.Path.GetFileName(Path),
             System.IO.Path.GetFileName(NativeLogPath),
+            System.IO.Path.GetFileName(ReverseControlLogPath),
             "startup.log",
         };
         FileInfo[] files;

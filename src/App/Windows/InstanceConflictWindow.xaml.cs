@@ -7,7 +7,7 @@ using IPhoneMirror.App.Services;
 
 namespace IPhoneMirror.App.Windows;
 
-public partial class InstanceConflictWindow : Wpf.Ui.Controls.FluentWindow
+public partial class InstanceConflictWindow : IPhoneMirror.UI.Controls.RoundedWindow
 {
     private readonly SingleInstanceCoordinator? _coordinator;
     private bool _allowClose;
@@ -20,6 +20,8 @@ public partial class InstanceConflictWindow : Wpf.Ui.Controls.FluentWindow
         _coordinator = coordinator;
         _previewOnly = previewOnly;
         InitializeComponent();
+        LocalizationService.RefreshWhenLanguageChanges(this, () =>
+            ErrorText.Text = LocalizationService.RefreshText(ErrorText.Text));
         if (_previewOnly)
         {
             CloseOtherInstancesButton.IsEnabled = false;
@@ -87,7 +89,7 @@ public partial class InstanceConflictWindow : Wpf.Ui.Controls.FluentWindow
         CloseOtherInstancesButton.IsEnabled = !busy;
         CloseCurrentInstanceButton.IsEnabled = !busy;
         HeaderCloseButton.IsEnabled = !busy;
-        ErrorText.Visibility = Visibility.Collapsed;
+        if (busy) ErrorText.Visibility = Visibility.Collapsed;
         BusyPanel.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
         if (busy)
         {

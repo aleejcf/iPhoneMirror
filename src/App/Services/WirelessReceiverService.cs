@@ -5,6 +5,36 @@ using IPhoneMirror.App.Localization;
 
 namespace IPhoneMirror.App.Services;
 
+internal enum WirelessReceiverBackend
+{
+    Original,
+    UxPlay,
+}
+
+internal sealed class WirelessReceiverBackendOption(
+    WirelessReceiverBackend backend, string resourceKey) : INotifyPropertyChanged
+{
+    internal WirelessReceiverBackend Backend { get; } = backend;
+    public string Label => LocalizationService.Get(resourceKey);
+    public override string ToString() => Label;
+    internal void NotifyLanguageChanged() => PropertyChanged?.Invoke(this,
+        new PropertyChangedEventArgs(nameof(Label)));
+    public event PropertyChangedEventHandler? PropertyChanged;
+}
+
+internal sealed class WirelessReceiverRuntime(
+    WirelessReceiverBackend backend, string executableName, string overrideEnvironmentVariable,
+    string relativeDirectory, IReadOnlyList<string> requiredRuntimeFiles,
+    bool requiresBundleIntegrity)
+{
+    internal WirelessReceiverBackend Backend { get; } = backend;
+    internal string ExecutableName { get; } = executableName;
+    internal string OverrideEnvironmentVariable { get; } = overrideEnvironmentVariable;
+    internal string RelativeDirectory { get; } = relativeDirectory;
+    internal IReadOnlyList<string> RequiredRuntimeFiles { get; } = requiredRuntimeFiles;
+    internal bool RequiresBundleIntegrity { get; } = requiresBundleIntegrity;
+}
+
 internal sealed class WirelessDisplayProfile(
     string id, string resourceKey, uint width, uint height, uint frameRate) :
     INotifyPropertyChanged
@@ -24,14 +54,88 @@ internal static class WirelessReceiverConfiguration
 {
     internal const string DefaultReceiverName = "iPhoneMirror AirPlay";
     internal const string ExecutableName = "iPhoneMirror.WirelessHost.exe";
+    internal const string UxPlayExecutableName = "iPhoneMirror.UxPlayHost.exe";
+    private static readonly string[] OriginalRequiredRuntimeFiles =
+    [
+        "airplay2dll.dll",
+        "avcodec-58.dll",
+        "avutil-56.dll",
+        "dnssd.dll",
+        "swresample-3.dll",
+        "swscale-5.dll",
+    ];
+    private static readonly string[] UxPlayRequiredRuntimeFiles =
+    [
+        "uxplay.exe",
+        "LICENSE",
+        "SOURCE.md",
+        "bin\\libgstreamer-1.0-0.dll",
+        "bin\\libgstbase-1.0-0.dll",
+        "bin\\libgstvideo-1.0-0.dll",
+        "bin\\libgstaudio-1.0-0.dll",
+        "bin\\libgstapp-1.0-0.dll",
+        "bin\\libgstpbutils-1.0-0.dll",
+        "bin\\libgsttag-1.0-0.dll",
+        "bin\\libglib-2.0-0.dll",
+        "bin\\libgobject-2.0-0.dll",
+        "bin\\libplist-2.0.dll",
+        "bin\\libgcc_s_seh-1.dll",
+        "bin\\dnssd.dll",
+        "lib\\gstreamer-1.0\\libgstapp.dll",
+        "lib\\gstreamer-1.0\\libgstcoreelements.dll",
+        "lib\\gstreamer-1.0\\libgstplayback.dll",
+        "lib\\gstreamer-1.0\\libgstautodetect.dll",
+        "lib\\gstreamer-1.0\\libgstaudioconvert.dll",
+        "lib\\gstreamer-1.0\\libgstaudioresample.dll",
+        "lib\\gstreamer-1.0\\libgstlevel.dll",
+        "lib\\gstreamer-1.0\\libgstvolume.dll",
+        "lib\\gstreamer-1.0\\libgstvideoconvertscale.dll",
+        "lib\\gstreamer-1.0\\libgsty4m.dll",
+        "lib\\gstreamer-1.0\\libgstvideoparsersbad.dll",
+        "lib\\gstreamer-1.0\\libgstlibav.dll",
+    ];
+    private static readonly WirelessReceiverRuntime OriginalRuntime = new(
+        WirelessReceiverBackend.Original, ExecutableName, "IPHONE_MIRROR_AIRPLAY_HOST",
+        "Wireless", OriginalRequiredRuntimeFiles, requiresBundleIntegrity: true);
+    private static readonly WirelessReceiverRuntime UxPlayRuntime = new(
+        WirelessReceiverBackend.UxPlay, UxPlayExecutableName, "IPHONE_MIRROR_UXPLAY_HOST",
+        Path.Combine("Wireless", "UxPlay"), UxPlayRequiredRuntimeFiles,
+        requiresBundleIntegrity: false);
+    internal static IReadOnlyList<WirelessReceiverBackendOption> BackendOptions { get; } =
+    [
+        new(WirelessReceiverBackend.Original, "WirelessBackendOriginal"),
+        new(WirelessReceiverBackend.UxPlay, "WirelessBackendUxPlay"),
+    ];
     internal static IReadOnlyList<WirelessDisplayProfile> DisplayProfiles { get; } =
     [
-        new("maximum", "WirelessProfileMaximum", 5120, 2880, 60),
+        // Preserve the 2880-pixel long edge in either orientation. An asymmetric
+        // 5120x2880 display makes iOS request a 5K-wide encoder when rotating.
+        new("maximum", "WirelessProfileMaximum", 2880, 2880, 60),
         new("1080p", "WirelessProfile1080p", 1920, 1080, 60),
         new("720p", "WirelessProfile720p", 1280, 720, 30),
         new("540p", "WirelessProfile540p", 960, 540, 30),
     ];
     internal static WirelessDisplayProfile DefaultDisplayProfile => DisplayProfiles[1];
+
+    internal static WirelessReceiverBackend NormalizeBackend(
+        WirelessReceiverBackend backend) => Enum.IsDefined(backend)
+        ? backend
+        : WirelessReceiverBackend.Original;
+
+    internal static WirelessReceiverRuntime GetRuntime(WirelessReceiverBackend backend) =>
+        NormalizeBackend(backend) == WirelessReceiverBackend.UxPlay
+            ? UxPlayRuntime
+            : OriginalRuntime;
+
+    internal static WirelessReceiverBackendOption GetBackendOption(
+        WirelessReceiverBackend backend)
+    {
+        var normalized = NormalizeBackend(backend);
+        return BackendOptions.First(option => option.Backend == normalized);
+    }
+
+    internal static bool SupportsMediaCast(WirelessReceiverBackend backend) =>
+        NormalizeBackend(backend) == WirelessReceiverBackend.Original;
 
     internal static bool RequiresOriginalQualityWarning(WirelessDisplayProfile profile) =>
         string.Equals(profile.Id, "maximum", StringComparison.Ordinal);
@@ -52,18 +156,28 @@ internal static class WirelessReceiverConfiguration
         return string.IsNullOrWhiteSpace(normalized) ? DefaultReceiverName : normalized;
     }
 
-    internal static string? FindExecutable(string baseDirectory, string? overridePath = null)
+    internal static string? FindExecutable(string baseDirectory, string? overridePath = null) =>
+        FindExecutable(WirelessReceiverBackend.Original, baseDirectory, overridePath);
+
+    internal static string? FindExecutable(WirelessReceiverBackend backend,
+        string baseDirectory, string? overridePath = null)
     {
+        var runtime = GetRuntime(backend);
         if (!string.IsNullOrWhiteSpace(overridePath))
         {
             var expanded = Environment.ExpandEnvironmentVariables(overridePath.Trim().Trim('"'));
             if (File.Exists(expanded)) return Path.GetFullPath(expanded);
         }
 
-        var candidates = new[]
+        var candidates = runtime.Backend == WirelessReceiverBackend.Original
+            ? new[]
+            {
+                Path.Combine(baseDirectory, runtime.RelativeDirectory, runtime.ExecutableName),
+                Path.Combine(baseDirectory, runtime.ExecutableName),
+            }
+            : new[]
         {
-            Path.Combine(baseDirectory, "Wireless", ExecutableName),
-            Path.Combine(baseDirectory, ExecutableName),
+            Path.Combine(baseDirectory, runtime.RelativeDirectory, runtime.ExecutableName),
         };
         return candidates.FirstOrDefault(File.Exists);
     }
@@ -94,54 +208,84 @@ internal readonly record struct WirelessRuntimeProbeResult(
 
 internal sealed class WirelessReceiverService
 {
-    private static readonly string[] RequiredRuntimeFiles =
-    [
-        "airplay2dll.dll",
-        "avcodec-58.dll",
-        "avutil-56.dll",
-        "dnssd.dll",
-        "swresample-3.dll",
-        "swscale-5.dll",
-    ];
     private readonly object _probeLock = new();
-    private WirelessRuntimeProbeResult? _successfulProbe;
 
-    internal string? ExecutablePath => WirelessReceiverConfiguration.FindExecutable(
-        AppContext.BaseDirectory,
-        Environment.GetEnvironmentVariable("IPHONE_MIRROR_AIRPLAY_HOST"));
+    internal string? ExecutablePath => GetExecutablePath(WirelessReceiverBackend.Original);
 
-    internal bool IsAvailable
+    internal string? GetExecutablePath(WirelessReceiverBackend backend)
     {
-        get
-        {
-            var executable = ExecutablePath;
-            if (executable is null) return false;
-            var directory = Path.GetDirectoryName(executable);
-            return directory is not null &&
-                RequiredRuntimeFiles.All(file => File.Exists(Path.Combine(directory, file))) &&
-                RuntimeBinaryIntegrity.VerifyWirelessDirectory(directory, out _);
-        }
+        var runtime = WirelessReceiverConfiguration.GetRuntime(backend);
+        if (runtime.Backend == WirelessReceiverBackend.UxPlay &&
+            string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(runtime.OverrideEnvironmentVariable)) &&
+            UxPlayComponent.FindInstalledExecutable() is { } installed)
+            return installed;
+        return WirelessReceiverConfiguration.FindExecutable(runtime.Backend,
+            AppContext.BaseDirectory,
+            Environment.GetEnvironmentVariable(runtime.OverrideEnvironmentVariable));
     }
 
-    internal WirelessRuntimeProbeResult ProbeRuntime()
+    internal string? GetExecutablePath(WirelessReceiverBackend backend,
+        string baseDirectory, string? overridePath = null) =>
+        WirelessReceiverConfiguration.FindExecutable(backend, baseDirectory, overridePath);
+
+    internal bool IsAvailable => IsBackendAvailable(WirelessReceiverBackend.Original);
+
+    internal bool IsBackendAvailable(WirelessReceiverBackend backend)
     {
+        var runtime = WirelessReceiverConfiguration.GetRuntime(backend);
+        var executable = GetExecutablePath(runtime.Backend);
+        if (executable is null) return false;
+        var directory = Path.GetDirectoryName(executable);
+        return directory is not null &&
+            runtime.RequiredRuntimeFiles.All(file => File.Exists(Path.Combine(directory, file))) &&
+            (!runtime.RequiresBundleIntegrity ||
+                RuntimeBinaryIntegrity.VerifyWirelessDirectory(directory, out _));
+    }
+
+    internal WirelessRuntimeProbeResult ProbeRuntime() =>
+        ProbeRuntime(WirelessReceiverBackend.Original);
+
+    internal WirelessRuntimeProbeResult ProbeRuntime(WirelessReceiverBackend backend)
+    {
+        var runtime = WirelessReceiverConfiguration.GetRuntime(backend);
         lock (_probeLock)
         {
-            if (_successfulProbe is { } cached) return cached;
-            var executable = ExecutablePath;
+            var executable = GetExecutablePath(runtime.Backend);
             if (executable is null)
                 return new(WirelessRuntimeProbeStatus.LoadFailed, -1);
+            if (!UxPlayComponent.VerifyForLaunch(executable))
+                return new(WirelessRuntimeProbeStatus.CodeIntegrityBlocked, 40);
+            // A stopped receiver may have been upgraded or repaired since the
+            // last launch. A prior successful probe cannot attest to today's
+            // DLLs, executable or plugin set; each start gets a fresh preflight.
             var directory = Path.GetDirectoryName(executable);
             var integrityFailure = string.Empty;
             if (directory is null ||
-                !RuntimeBinaryIntegrity.VerifyWirelessDirectory(directory, out integrityFailure))
+                (runtime.RequiresBundleIntegrity &&
+                    !RuntimeBinaryIntegrity.VerifyWirelessDirectory(directory, out integrityFailure)))
             {
                 DiagnosticLogger.Info("wireless", "runtime_hash_mismatch",
+                    ("backend", runtime.Backend.ToString()),
                     ("detail", integrityFailure ?? "runtime directory is unavailable"));
                 return new(WirelessRuntimeProbeStatus.CodeIntegrityBlocked, 40);
             }
             try
             {
+                if (runtime.Backend == WirelessReceiverBackend.UxPlay)
+                {
+                    // The component tree is immutable. The versioned variable
+                    // takes precedence over the packaged host's GST_REGISTRY;
+                    // keep GStreamer's mutable index outside the verified tree.
+                    // GST_REGISTRY_UPDATE=no does not prevent its first write.
+                    var registryRoot = Path.Combine(Updater.UpdateSettingsStore.UserDataDirectory,
+                        "Cache", "GStreamer");
+                    Directory.CreateDirectory(registryRoot);
+                    var runtimeKey = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                        System.Text.Encoding.UTF8.GetBytes(Path.GetFullPath(directory).ToUpperInvariant())));
+                    Environment.SetEnvironmentVariable("GST_REGISTRY_1_0",
+                        Path.Combine(registryRoot, "uxplay-" + runtimeKey + ".bin"),
+                        EnvironmentVariableTarget.Process);
+                }
                 var start = new ProcessStartInfo
                 {
                     FileName = executable,
@@ -164,7 +308,6 @@ internal sealed class WirelessReceiverService
                     return new(WirelessRuntimeProbeStatus.TimedOut, -1);
                 }
                 var result = WirelessRuntimeProbeResult.FromExitCode(process.ExitCode);
-                if (result.Success) _successfulProbe = result;
                 return result;
             }
             catch (Win32Exception error) when (IsCodeIntegrityError(error.NativeErrorCode))

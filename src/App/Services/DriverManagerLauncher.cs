@@ -8,7 +8,8 @@ namespace IPhoneMirror.App.Services;
 internal sealed record DriverManagerLaunchResult(
     bool Success,
     string? ExecutablePath,
-    string Message);
+    string Message,
+    int? ProcessId = null);
 
 internal sealed class DriverManagerLauncher
 {
@@ -25,14 +26,14 @@ internal sealed class DriverManagerLauncher
                 Environment.GetEnvironmentVariable("IPHONE_MIRROR_DRIVER_MANAGER"),
                 Environment.CurrentDirectory);
             if (executablePath is null)
-                return new(false, null, "The driver manager executable could not be found.");
+                return new(false, null, LocalizationService.Get("DriverManagerExecutableMissing"));
             if (!string.Equals(Path.GetExtension(executablePath), ".exe",
                     StringComparison.OrdinalIgnoreCase))
                 return new(false, executablePath,
-                    "The driver manager path must point to an executable (.exe).");
+                    LocalizationService.Get("DriverManagerPathInvalid"));
 
-            if (TryActivateExisting(executablePath))
-                return new(true, executablePath, "The running driver manager was activated.");
+            if (TryActivateExisting(executablePath) is { } existingId)
+                return new(true, executablePath, LocalizationService.Get("DriverManagerActivated"), existingId);
 
             DiagnosticLogger.Info("driver", "manager_launch_requested",
                 ("file", Path.GetFileName(executablePath)),
@@ -53,8 +54,8 @@ internal sealed class DriverManagerLauncher
             start.ArgumentList.Add(ThemeService.Preference.ToString());
             using var process = Process.Start(start);
             return process is null
-                ? new(false, executablePath, "Windows did not start the driver manager process.")
-                : new(true, executablePath, "The driver manager was started.");
+                ? new(false, executablePath, LocalizationService.Get("DriverManagerProcessStartFailed"))
+                : new(true, executablePath, LocalizationService.Get("DriverManagerStarted"), process.Id);
         }
         catch (Exception error)
         {
@@ -94,7 +95,22 @@ internal sealed class DriverManagerLauncher
         return Path.IsPathRooted(path) ? path : Path.Combine(workingDirectory, path);
     }
 
-    private static bool TryActivateExisting(string executablePath)
+    internal async Task<DriverManagerLaunchResult> LaunchAndWaitAsync(CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        var result = Launch();
+        if (!result.Success || result.ProcessId is not { } id) return result;
+        try
+        {
+            using var process = Process.GetProcessById(id);
+            // Cancelling setup stops waiting, never an independent driver's installation.
+            await process.WaitForExitAsync(token);
+        }
+        catch (ArgumentException) { /* The window already exited. Recheck actual drivers. */ }
+        return result;
+    }
+
+    private static int? TryActivateExisting(string executablePath)
     {
         foreach (var process in Process.GetProcessesByName(
                      Path.GetFileNameWithoutExtension(ExecutableName)))
@@ -108,7 +124,7 @@ internal sealed class DriverManagerLauncher
                         continue;
                     _ = ShowWindowAsync(process.MainWindowHandle, SwRestore);
                     _ = SetForegroundWindow(process.MainWindowHandle);
-                    return true;
+                    return process.Id;
                 }
                 catch (Exception error)
                 {
@@ -118,7 +134,7 @@ internal sealed class DriverManagerLauncher
                 }
             }
         }
-        return false;
+        return null;
     }
 
     [DllImport("user32.dll")]

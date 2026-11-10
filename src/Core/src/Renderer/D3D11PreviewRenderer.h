@@ -26,11 +26,25 @@ struct OutputDiagnostics {
         media::ColorOutputPreference::Auto};
 };
 
+#ifdef IPHONEMIRROR_PREVIEW_TEST_HOOKS
+// Per-renderer fault injection for the opt-in synthetic GPU smoke test only.
+// S_OK from before_present delegates to the real swap-chain presentation.
+struct PreviewTestHooks {
+    std::function<bool()> before_upload;
+    std::function<HRESULT()> before_present;
+    std::function<void(HRESULT)> after_present;
+};
+#endif
+
 class D3D11PreviewRenderer {
 public:
     using FrameProvider = std::function<std::shared_ptr<const media::DecodedFrame>()>;
 
-    D3D11PreviewRenderer(HWND window, FrameProvider provider);
+    D3D11PreviewRenderer(HWND window, FrameProvider provider
+#ifdef IPHONEMIRROR_PREVIEW_TEST_HOOKS
+        , PreviewTestHooks test_hooks = {}
+#endif
+    );
     ~D3D11PreviewRenderer();
     D3D11PreviewRenderer(const D3D11PreviewRenderer&) = delete;
     D3D11PreviewRenderer& operator=(const D3D11PreviewRenderer&) = delete;
@@ -52,6 +66,8 @@ public:
     // previews remain rectangular because their WPF panel owns that shape.
     void set_corner_profile(float normalized_radius, float curve_exponent) noexcept;
     void set_rotation(std::int32_t quarter_turns) noexcept;
+    // Applies to this composition visual only, including its black background.
+    void set_opacity(float opacity) noexcept;
     void set_color_output_preference(media::ColorOutputPreference preference) noexcept;
     void set_image_adjustments(float brightness, float contrast,
         float saturation, float gamma) noexcept;

@@ -1,0 +1,52 @@
+iPhoneMirror Alejandro 1.8.5-pre3.alejandro.1
+
+INSTALAR
+Ejecuta iPhoneMirror-Alejandro-Setup-1.8.5-pre3.alejandro.1-x64.exe.
+Se instala para tu usuario y crea un acceso directo. Incluye .NET 10;
+no necesitas instalar .NET ni copiar la carpeta C:\dev.
+Para otra computadora, copia el instalador completo y ejecútalo allí.
+Requiere Windows 10 versión 2004 o posterior / Windows 11 de 64 bits x64.
+No es compatible con macOS ni Windows ARM64.
+
+PORTABLE
+Extrae TODO el ZIP en una carpeta y abre iPhoneMirror.exe.
+Mantén juntos los archivos y subcarpetas. No ejecutes desde dentro del ZIP.
+
+IPHONE POR USB
+Conecta el iPhone, desbloquéalo y acepta Confiar en esta computadora.
+Si faltan los controladores de Apple, usa la configuración inicial o
+iPhoneMirror.Driver.exe incluido. La instalación de controladores puede
+pedir permisos de administrador. El instalador de esta edición no modifica
+automáticamente controladores ni registros de confianza de Apple.
+
+AIRPLAY
+Conecta ambos dispositivos a la misma red local. En el iPhone abre el
+Centro de control > Duplicar pantalla y selecciona el receptor de la app.
+Windows puede solicitar permiso de red para el receptor inalámbrico.
+
+PERSONALIZACIÓN
+Incluye español, acciones automáticas de duplicación/cámara/ventana OBS,
+monitoreo de batería y temperatura, tarjeta de ya regreso y ajustes
+personalizados del núcleo de captura y audio.
+Los ajustes están en %LOCALAPPDATA%\iPhoneMirror. No se transfieren claves
+de emparejamiento, identificadores del iPhone ni credenciales de transmisión.
+Para personalizar la tarjeta de pausa, coloca tu imagen como
+%LOCALAPPDATA%\iPhoneMirror\ya-regreso.png.
+La cámara virtual necesita Windows 11 y su registro puede pedir elevación.
+Algunas funciones de control requieren Modo de desarrollador y preparación
+adicional en el iPhone. La compatibilidad final depende del dispositivo/iOS.
+
+ACTUALIZACIONES
+Las actualizaciones de la app original están bloqueadas en esta edición
+para conservar las modificaciones. Actualiza usando un nuevo instalador
+de la edición Alejandro. Los componentes opcionales siguen usando sus
+mecanismos originales de descarga y verificación.
+
+PROCEDENCIA
+Proyecto original: RayrenSX/iPhoneMirror, licencia GPL-3.0-only.
+La interfaz se recompiló desde el código modificado compartido.
+El núcleo nativo es la compilación personalizada suministrada:
+SHA256 da3c9130c5d8852f006c27225d5475703401b3876f16bdfae9adec301b2605c7.
+Componentes auxiliares: distribución oficial v1.8.5-pre3 verificada con
+SHA256SUMS de esa versión. Se conservan licencias y avisos de terceros.
+El código fuente modificado se entrega por separado en el ZIP de fuentes.

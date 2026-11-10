@@ -11,7 +11,9 @@ internal static class LocalizationService
     internal const string SystemLanguage = "system";
     internal const string SimplifiedChinese = "zh-CN";
     internal const string TraditionalChineseHongKong = "zh-HK";
+    internal const string TraditionalChineseTaiwan = "zh-TW";
     internal const string English = "en-US";
+    internal const string Spanish = "es-ES";
 
     private const string DictionaryPrefix = "Localization/Strings.";
     private static readonly string SettingsPath = Path.Combine(
@@ -40,17 +42,40 @@ internal static class LocalizationService
 
     internal static string Get(string key)
     {
-        if (Application.Current?.TryFindResource(key) is string value) return value;
+        if (Application.Current?.TryFindResource(key) is string value)
+            return LocalizedText.Resource(key, value);
         return key;
     }
 
+    internal static string GetOrDefault(string key, string fallback) =>
+        Application.Current?.TryFindResource(key) is string value
+            ? LocalizedText.Resource(key, value) : fallback;
+
     internal static string Format(string key, params object?[] arguments) =>
-        string.Format(_effectiveCulture, Get(key), arguments);
+        LocalizedText.Format(key, arguments);
+
+    internal static string RefreshText(string value) => LocalizedText.Refresh(value);
+
+    internal static string Join(string separator, IEnumerable<string?> values) =>
+        LocalizedText.Join(separator, values);
+
+    internal static void RefreshWhenLanguageChanges(Window window, Action refresh)
+    {
+        var closed = false;
+        void Changed(object? sender, EventArgs args)
+        {
+            if (closed || window.Dispatcher.HasShutdownStarted) return;
+            if (window.Dispatcher.CheckAccess()) refresh();
+            else window.Dispatcher.BeginInvoke(new Action(() => { if (!closed) refresh(); }));
+        }
+        LanguageChanged += Changed;
+        window.Closed += (_, _) => { closed = true; LanguageChanged -= Changed; };
+    }
 
     private static void ApplyLanguage(string language, bool persist, bool notify)
     {
         if (language is not (SystemLanguage or SimplifiedChinese or
-            TraditionalChineseHongKong or English))
+            TraditionalChineseHongKong or TraditionalChineseTaiwan or English or Spanish))
             language = SystemLanguage;
 
         var cultureName = language == SystemLanguage
@@ -100,8 +125,13 @@ internal static class LocalizationService
 
     internal static string ResolveCultureName(string cultureName)
     {
+        if (cultureName.Equals(TraditionalChineseTaiwan, StringComparison.OrdinalIgnoreCase) ||
+            cultureName.Equals("zh-Hant-TW", StringComparison.OrdinalIgnoreCase))
+            return TraditionalChineseTaiwan;
         if (IsHongKongTraditionalChinese(cultureName))
             return TraditionalChineseHongKong;
+        if (cultureName.StartsWith("es", StringComparison.OrdinalIgnoreCase))
+            return Spanish;
         return cultureName.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
             ? SimplifiedChinese
             : English;
@@ -112,15 +142,15 @@ internal static class LocalizationService
         cultureName.Equals("zh-CHT", StringComparison.OrdinalIgnoreCase) ||
         cultureName.Equals(TraditionalChineseHongKong,
             StringComparison.OrdinalIgnoreCase) ||
-        cultureName.Equals("zh-MO", StringComparison.OrdinalIgnoreCase) ||
-        cultureName.Equals("zh-TW", StringComparison.OrdinalIgnoreCase);
+        cultureName.Equals("zh-MO", StringComparison.OrdinalIgnoreCase);
 
-    private static string LoadLanguage()
+    private static string LoadLanguage(string? settingsPath = null)
     {
         try
         {
-            if (!File.Exists(SettingsPath)) return SystemLanguage;
-            return new UpdateSettingsStore(SettingsPath).Load().Language;
+            settingsPath ??= SettingsPath;
+            if (!File.Exists(settingsPath)) return SystemLanguage;
+            return new UpdateSettingsStore(settingsPath).Load().Language;
         }
         catch (Exception error)
         {
@@ -129,11 +159,11 @@ internal static class LocalizationService
         }
     }
 
-    private static void SaveLanguage(string language)
+    private static void SaveLanguage(string language, string? settingsPath = null)
     {
         try
         {
-            new UpdateSettingsStore(SettingsPath).Update(settings =>
+            new UpdateSettingsStore(settingsPath ?? SettingsPath).Update(settings =>
                 settings.Language = language);
         }
         catch (Exception error)

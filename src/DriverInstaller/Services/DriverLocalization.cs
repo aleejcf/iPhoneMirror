@@ -8,6 +8,7 @@ internal static class DriverLocalization
 {
     internal const string Chinese = "zh-CN";
     internal const string TraditionalChineseHongKong = "zh-HK";
+    internal const string TraditionalChineseTaiwan = "zh-TW";
     internal const string English = "en-US";
     private static readonly string SettingsPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -30,6 +31,9 @@ internal static class DriverLocalization
     internal static string Get(string key) =>
         Application.Current?.TryFindResource(key) as string ?? key;
 
+    internal static string GetOrDefault(string key, string fallback) =>
+        Application.Current?.TryFindResource(key) as string ?? fallback;
+
     internal static string Format(string key, params object?[] arguments) =>
         string.Format(Culture, Get(key), arguments);
 
@@ -37,6 +41,37 @@ internal static class DriverLocalization
     {
         Source = new Uri($"Localization/Strings.{Language}.xaml", UriKind.Relative),
     };
+
+
+    internal static string LocalizeOperationResult(string message)
+    {
+        if (message is "ParentBindingComplete" or "ParentBindingRestartRequired" or
+            "ParentResetRestartRequired" or "ParentResetComplete" or "ParentChangeRejected" or
+            "ParentChangeRolledBack" or "ParentRollbackRestartRequired" or "ParentChangeRecoveryNeeded")
+            return Get(message);
+        // Translate only known application messages, never arbitrary device names,
+        // paths, native diagnostics, or protocol fields.
+        (string Prefix, string Key)[] messages =
+        [
+            ("The incorrect Apple parent device was removed. Reconnect the iPhone to rebind usbccgp.", "DriverParentRemoved"),
+            ("Selected-device capture filter removed. Reconnect the device to complete unload.", "DriverFilterRemovedReconnect"),
+            ("Selected-device capture filter installed. Reconnect the device to complete activation.", "DriverFilterInstalledReconnect"),
+            ("Parent driver repair stopped after the removal request began. Reconnect the iPhone and review the operation log. ", "DriverParentRepairStopped"),
+            ("Parent driver repair was rejected before any system change. ", "DriverParentRepairRejected"),
+            ("Driver operation failed and all captured state was restored. ", "DriverOperationRolledBack"),
+            ("Driver operation failed and rollback was incomplete. Review the operation log. ", "DriverOperationRollbackIncomplete"),
+        ];
+        foreach (var (prefix, key) in messages)
+        {
+            if (!message.StartsWith(prefix, StringComparison.Ordinal)) continue;
+            var translated = Get(key);
+            if (translated == key) return message;
+            var detail = message[prefix.Length..];
+            return detail.Length == 0 ? translated
+                : translated + "\n" + Format("DriverOperationDetailsFormat", detail);
+        }
+        return message;
+    }
 
     private static string? ReadArgument(IReadOnlyList<string> arguments)
     {
@@ -59,6 +94,8 @@ internal static class DriverLocalization
 
     private static string ResolveLanguage(string? value)
     {
+        if (value is not null && IsTaiwanTraditionalChinese(value))
+            return TraditionalChineseTaiwan;
         if (string.Equals(value, Chinese, StringComparison.OrdinalIgnoreCase))
             return Chinese;
         if (value is not null && IsTraditionalChinese(value))
@@ -73,19 +110,24 @@ internal static class DriverLocalization
 
     internal static string ResolveCultureName(string cultureName)
     {
+        if (IsTaiwanTraditionalChinese(cultureName))
+            return TraditionalChineseTaiwan;
         if (IsTraditionalChinese(cultureName))
             return TraditionalChineseHongKong;
         return cultureName.StartsWith("zh", StringComparison.OrdinalIgnoreCase)
             ? Chinese : English;
     }
 
+    private static bool IsTaiwanTraditionalChinese(string cultureName) =>
+        cultureName.Equals(TraditionalChineseTaiwan, StringComparison.OrdinalIgnoreCase) ||
+        cultureName.Equals("zh-Hant-TW", StringComparison.OrdinalIgnoreCase);
+
     private static bool IsTraditionalChinese(string cultureName) =>
         cultureName.StartsWith("zh-Hant", StringComparison.OrdinalIgnoreCase) ||
         cultureName.Equals("zh-CHT", StringComparison.OrdinalIgnoreCase) ||
         cultureName.Equals(TraditionalChineseHongKong,
             StringComparison.OrdinalIgnoreCase) ||
-        cultureName.Equals("zh-MO", StringComparison.OrdinalIgnoreCase) ||
-        cultureName.Equals("zh-TW", StringComparison.OrdinalIgnoreCase);
+        cultureName.Equals("zh-MO", StringComparison.OrdinalIgnoreCase);
 
     private sealed record UserSettings(string Language);
 }

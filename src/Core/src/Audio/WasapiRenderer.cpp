@@ -176,7 +176,7 @@ WasapiRenderer::WasapiRenderer(const coremedia::AudioStreamBasicDescription& for
     high_water_frames_ = thresholds.high_water_frames;
 
     playback_enabled_.store(playback_enabled, std::memory_order_relaxed);
-    const auto initial_volume = std::isfinite(volume) ? std::clamp(volume, 0.0F, 1.0F) : 1.0F;
+    const auto initial_volume = std::isfinite(volume) ? std::clamp(volume, 0.0F, 2.0F) : 1.0F;
     const auto initial_units = static_cast<std::uint32_t>(std::lround(initial_volume * 10000.0F));
     volume_units_.store(initial_units, std::memory_order_relaxed);
     current_gain_units_ = playback_enabled ? initial_units : 0U;
@@ -292,7 +292,7 @@ void WasapiRenderer::set_enabled(bool enabled) noexcept {
 
 void WasapiRenderer::set_volume(float volume) noexcept {
     if (!std::isfinite(volume)) return;
-    const auto clamped = std::clamp(volume, 0.0F, 1.0F);
+    const auto clamped = std::clamp(volume, 0.0F, 2.0F);
     volume_units_.store(static_cast<std::uint32_t>(
         std::lround(clamped * 10000.0F)), std::memory_order_relaxed);
 }
@@ -328,8 +328,7 @@ std::size_t WasapiRenderer::dequeue(std::uint8_t* destination, std::size_t frame
                 static_cast<std::int64_t>(count);
         for (std::size_t channel{}; channel < channels; ++channel) {
             const auto index = frame * channels + channel;
-            const auto scaled = static_cast<std::int32_t>(samples[index]) * gain / 10000;
-            samples[index] = static_cast<std::int16_t>(scaled);
+            samples[index] = detail::apply_boosted_gain(samples[index], gain);
         }
     }
     current_gain_units_ = target_gain;
@@ -538,10 +537,11 @@ void WasapiRenderer::run_endpoint(std::stop_token token) {
                 const auto wait = WaitForMultipleObjects(2, render_events, FALSE, 1000);
                 if (wait == WAIT_OBJECT_0) break;
                 if (wait == WAIT_OBJECT_0 + 1) {
-                    if (write_available(true)) {
-                        needs_rebuffer = true;
-                        break;
-                    }
+                    // A network source can briefly arrive just below one
+                    // endpoint buffer. write_available() already fills the
+                    // remainder with silence; restarting WASAPI here causes
+                    // an audible click and a stop/start storm under jitter.
+                    (void)write_available(true);
                 } else if (wait == WAIT_TIMEOUT) {
                     throw std::runtime_error("WASAPI render event timed out");
                 } else {

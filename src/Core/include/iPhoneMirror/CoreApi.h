@@ -217,7 +217,7 @@ struct CaptureOptions {
     std::uint32_t requested_height;
     std::uint32_t target_fps; // Local renderer cap; does not negotiate source FPS.
     std::int32_t play_audio;
-    float audio_volume; // Linear gain in the inclusive range [0.0, 1.0].
+    float audio_volume; // Linear gain in the inclusive range [0.0, 2.0]; above 1.0 is a soft-limited boost.
     std::uint32_t reserved[5];
 };
 
@@ -427,9 +427,10 @@ IM_API std::int32_t IM_CALL im_session_copy_latest_video_frame(
     iPhoneMirror::SessionHandle handle, iPhoneMirror::VideoFrameInfo* info,
     std::uint8_t* buffer, std::uint32_t* buffer_size,
     std::uint32_t max_width, std::uint32_t max_height);
-// Copies the latest frame into an exact-size, tightly packed 8-bit NV12 canvas.
-// The source is downscaled if needed, aspect ratio is preserved, and unused
-// canvas pixels are filled with YUV black. P010 sources are reduced to 8-bit.
+// Copies the latest frame into an exact-size, tightly packed 8-bit full-range
+// BT.709 SDR NV12 canvas. The source is downscaled if needed, aspect ratio is
+// preserved, and unused canvas pixels are filled with full-range YUV black.
+// P010/HDR and non-BT.709 sources are converted before being reduced to 8-bit.
 IM_API std::int32_t IM_CALL im_session_copy_latest_video_frame_nv12(
     iPhoneMirror::SessionHandle handle, iPhoneMirror::VideoFrameInfo* info,
     std::uint8_t* buffer, std::uint32_t* buffer_size,
@@ -446,8 +447,14 @@ IM_API std::int32_t IM_CALL im_session_force_preview_refresh(
 IM_API std::int32_t IM_CALL im_session_set_window_corner_profile(
     iPhoneMirror::SessionHandle handle, void* hwnd, float normalized_radius,
     float curve_exponent);
+// Clockwise quarter turns, normalized modulo four. Rotates only this preview;
+// source capture geometry and the USB/AirPlay stream remain unchanged.
 IM_API std::int32_t IM_CALL im_session_set_window_rotation(
     iPhoneMirror::SessionHandle handle, void* hwnd, std::int32_t quarter_turns);
+// Local composition preview only; 0.1 = most transparent, 1 = opaque.
+// Does not modify captured frames, recordings, or other session windows.
+IM_API std::int32_t IM_CALL im_session_set_window_opacity(
+    iPhoneMirror::SessionHandle handle, void* hwnd, float opacity);
 
 
 IM_API const wchar_t* IM_CALL im_last_error();

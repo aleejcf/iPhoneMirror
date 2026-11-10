@@ -13,7 +13,7 @@ internal static class DriverCleanupHost
     private const string ScriptFileName = "remove_selected_iphone_drivers.ps1";
     private const string ScriptResourceName = "DriverCleanup.Script.ps1";
     private const string ScriptHash =
-        "1CC19CCE6F784729BB5AD7D025355C9A4B833C9032D1831D99D91C3B862625E6";
+        "09F2B297792AE560846AD6E2EDB19D84754B36B7CB262E9365617F439B4AE67F";
 
     internal static bool IsRequested(IReadOnlyList<string> arguments) =>
         arguments.Count >= 1 && string.Equals(arguments[0], Switch,
@@ -29,27 +29,21 @@ internal static class DriverCleanupHost
     {
         if (!DriverOperationClient.EnsureElevationBoundary(out var boundaryError))
             throw new InvalidOperationException(
-                "The driver manager executable could not be protected before elevation.",
+                DriverLocalization.GetOrDefault("DriverCleanupProtectionFailed",
+                    "The driver manager executable could not be protected before elevation."),
                 boundaryError);
 
-        var executable = Environment.ProcessPath ??
-            Process.GetCurrentProcess().MainModule?.FileName ??
-            throw new FileNotFoundException("The driver manager executable is missing.");
-        var start = new ProcessStartInfo(executable)
-        {
-            UseShellExecute = true,
-            Verb = "runas",
-            WorkingDirectory = Path.GetDirectoryName(executable)!,
-        };
-        start.ArgumentList.Add(Switch);
+        var arguments = new List<string> { Switch };
         if (parentProcessId is > 0)
         {
-            start.ArgumentList.Add(ParentProcessIdSwitch);
-            start.ArgumentList.Add(parentProcessId.Value.ToString(
+            arguments.Add(ParentProcessIdSwitch);
+            arguments.Add(parentProcessId.Value.ToString(
                 System.Globalization.CultureInfo.InvariantCulture));
         }
+        var start = DriverOperationClient.BuildElevatedStartInfo(arguments);
         using var process = Process.Start(start) ?? throw new InvalidOperationException(
-            "The elevated driver cleanup host did not start.");
+            DriverLocalization.GetOrDefault("DriverCleanupHostStartFailed",
+                "The elevated driver cleanup host did not start."));
         if (!waitForExit) return 0;
         process.WaitForExit();
         return process.ExitCode;
@@ -122,14 +116,29 @@ internal static class DriverCleanupHost
         DriverPayload.EnsureNoReparsePoints(scriptPath);
         if (File.Exists(scriptPath) && IsTrustedScript(scriptPath)) return scriptPath;
 
-        if (File.Exists(scriptPath)) File.Delete(scriptPath);
         using var source = Assembly.GetExecutingAssembly().GetManifestResourceStream(
             ScriptResourceName) ?? throw new InvalidOperationException(
             "The embedded driver cleanup script is missing.");
-        using (var destination = new FileStream(scriptPath, FileMode.CreateNew,
-                   FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.WriteThrough))
-            source.CopyTo(destination);
-        ValidateTrustedScriptHash(scriptPath);
+        // Write to a temporary path first, validate the hash, then atomically
+        // rename into place. This closes the TOCTOU window between File.Delete
+        // and FileMode.CreateNew where a peer-privileged process could plant a
+        // symlink at the target path.
+        var tempPath = scriptPath + ".tmp-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            using (var destination = new FileStream(tempPath, FileMode.CreateNew,
+                       FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.WriteThrough))
+                source.CopyTo(destination);
+            ValidateTrustedScriptHash(tempPath);
+            File.Move(tempPath, scriptPath, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(tempPath))
+            {
+                try { File.Delete(tempPath); } catch { }
+            }
+        }
         return scriptPath;
     }
 
@@ -141,7 +150,13 @@ internal static class DriverCleanupHost
             ValidateTrustedScriptHash(path);
             return true;
         }
-        catch { return false; }
+        // Only swallow failures that reflect an untrusted or unreadable script.
+        // Fatal errors (OOM, ThreadAbort, etc.) must propagate to the caller.
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException
+            or CryptographicException or System.Security.SecurityException)
+        {
+            return false;
+        }
     }
 
     private static void ValidateTrustedScriptHash(string path)

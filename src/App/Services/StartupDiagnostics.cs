@@ -110,6 +110,8 @@ internal static class StartupDiagnostics
 
     internal static string UserMessage(Exception error, string language)
     {
+        var taiwan = language.Equals("zh-TW", StringComparison.OrdinalIgnoreCase) ||
+            language.Equals("zh-Hant-TW", StringComparison.OrdinalIgnoreCase);
         var hongKong = language.Equals("zh-HK", StringComparison.OrdinalIgnoreCase) ||
             language.Equals("zh-Hant-HK", StringComparison.OrdinalIgnoreCase) ||
             language.Equals("zh-MO", StringComparison.OrdinalIgnoreCase);
@@ -120,17 +122,50 @@ internal static class StartupDiagnostics
                 FileNotFoundException);
         if (nativeLoadFailure)
         {
+            if (taiwan)
+                return "無法載入應用程式所需的原生元件。請重新安裝最新的完整安裝套件；詳細診斷資訊已寫入下方記錄檔。";
             if (hongKong)
                 return "無法載入應用程式所需的原生元件。請重新安裝最新的完整安裝程式；詳細診斷資料已寫入下方記錄。";
             return simplifiedChinese
                 ? "无法加载程序所需的原生组件。请重新安装最新的完整安装包；详细诊断已写入下方日志。"
                 : "A required native component could not be loaded. Reinstall the latest full Setup package; detailed diagnostics were written to the log below.";
         }
+        if (taiwan)
+            return "iPhoneMirror 啟動時發生錯誤。詳細診斷資訊已寫入下方記錄檔。";
         if (hongKong)
             return "iPhoneMirror 啟動時發生錯誤。詳細診斷資料已寫入下方記錄。";
         return simplifiedChinese
             ? "iPhoneMirror 启动时遇到错误。详细诊断已写入下方日志。"
             : "iPhoneMirror encountered an error during startup. Detailed diagnostics were written to the log below.";
+    }
+
+    internal static string Label(string key, string language)
+    {
+        if (Localization.LocalizationService.ResolveCultureName(language) == "zh-TW")
+            return key switch
+            {
+                "StartupErrorHeading" => "iPhoneMirror 無法啟動",
+                "StartupErrorLogLabel" => "診斷記錄檔",
+                "StartupErrorDetails" => "錯誤詳細資料",
+                "StartupErrorOpenLog" => "開啟記錄檔位置",
+                "StartupErrorClose" => "關閉",
+                _ => throw new ArgumentOutOfRangeException(nameof(key)),
+            };
+        var labels = key switch
+        {
+            "StartupErrorHeading" => ("iPhoneMirror 无法启动", "iPhoneMirror 無法啟動", "iPhoneMirror could not start"),
+            "StartupErrorLogLabel" => ("诊断日志", "診斷記錄", "Diagnostic log"),
+            "StartupErrorDetails" => ("错误详情", "錯誤詳細資料", "Error details"),
+            "StartupErrorOpenLog" => ("打开日志位置", "開啟記錄位置", "Open log location"),
+            "StartupErrorClose" => ("关闭", "關閉", "Close"),
+            _ => throw new ArgumentOutOfRangeException(nameof(key)),
+        };
+        return Localization.LocalizationService.ResolveCultureName(language) switch
+        {
+            "zh-CN" => labels.Item1,
+            "zh-HK" => labels.Item2,
+            _ => labels.Item3,
+        };
     }
 
     private static bool Find(Exception error, Func<Exception, bool> predicate)
@@ -161,6 +196,8 @@ internal static class StartupDiagnostics
         yield return ("iPhoneMirror.VirtualCamera.Admin.exe", false);
         yield return (Path.Combine("tools", "ffmpeg", "ffmpeg.exe"), false);
         yield return (Path.Combine("Wireless", "iPhoneMirror.WirelessHost.exe"), false);
+        yield return (Path.Combine("Wireless", "UxPlay", "iPhoneMirror.UxPlayHost.exe"), false);
+        yield return (Path.Combine("Wireless", "UxPlay", "uxplay.exe"), false);
         yield return (Path.Combine("Wireless", "dnssd.dll"), false);
         yield return (Path.Combine("Wireless", "airplay2dll.dll"), false);
         yield return (Path.Combine("Wireless", "avcodec-58.dll"), false);

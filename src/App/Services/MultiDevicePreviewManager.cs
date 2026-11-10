@@ -10,7 +10,6 @@ namespace IPhoneMirror.App.Services;
 internal sealed class MultiDevicePreviewManager : IDisposable
 {
     private readonly MainViewModel viewModel;
-    private readonly Func<bool> _isReverseControlHotkeyRegistered;
     private readonly Func<string, nint, bool> _isReverseControlEnabledForWindow;
     private readonly Dictionary<string, NativePreviewWindow> _windows =
         new(StringComparer.OrdinalIgnoreCase);
@@ -18,24 +17,28 @@ internal sealed class MultiDevicePreviewManager : IDisposable
         new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, ProtectedContentPresentation> _protectionStates =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _sessionRecoveries =
+        new(StringComparer.OrdinalIgnoreCase);
     private bool _disposing;
     private bool _disposed;
 
     internal event Action<string, nint>? ReverseControlRequested;
+    internal event Action<string, nint>? UsbControlRequested;
+    internal event Action<string, nint>? WirelessControlRequested;
     internal event Action<string>? PreviewClosed;
     internal event Action<string, PreviewPointerEventArgs>? PointerInput;
     internal event Action<string, PreviewKeyboardEventArgs>? KeyboardInput;
+    internal event Action<string, nint, bool>? KeyboardFocusChanged;
 
     internal MultiDevicePreviewManager(MainViewModel viewModel,
-        Func<bool>? isReverseControlHotkeyRegistered = null,
         Func<string, nint, bool>? isReverseControlEnabledForWindow = null)
     {
         this.viewModel = viewModel;
-        _isReverseControlHotkeyRegistered = isReverseControlHotkeyRegistered ?? (() => false);
         _isReverseControlEnabledForWindow = isReverseControlEnabledForWindow ??
             ((udid, _) => viewModel.BluetoothControlIsInputEnabled &&
                 viewModel.IsBluetoothControlTarget(udid));
         viewModel.DeviceSessionHandleChanged += OnDeviceSessionHandleChanged;
+        viewModel.DeviceSessionRecoveryStateChanged += OnDeviceSessionRecoveryStateChanged;
         viewModel.DeviceProtectionStateChanged += OnDeviceProtectionStateChanged;
         LocalizationService.LanguageChanged += OnLanguageChanged;
     }
@@ -44,11 +47,33 @@ internal sealed class MultiDevicePreviewManager : IDisposable
         _windows.ContainsKey(device.Udid);
     internal bool HasAnyOpen => _windows.Count != 0;
 
+    internal nint GetWindowHandle(string? udid) =>
+        !string.IsNullOrWhiteSpace(udid) && _windows.TryGetValue(udid, out var window)
+            ? window.Handle : 0;
+
+    internal bool ContainsWindow(nint handle) => handle != 0 && _windows.Values.Any(w => w.Handle == handle);
+    internal bool IsFullScreenWindow(nint handle) => _windows.Values.Any(w => w.Handle == handle && w.IsFullScreen);
+    internal bool ToggleFullScreenWindow(nint handle)
+    {
+        var window = _windows.Values.FirstOrDefault(w => w.Handle == handle);
+        if (window is null) return false;
+        window.ToggleFullScreen();
+        return true;
+    }
+
     internal bool Activate(string? udid)
     {
         if (string.IsNullOrWhiteSpace(udid) ||
             !_windows.TryGetValue(udid, out var window)) return false;
         window.Activate();
+        return true;
+    }
+
+    internal bool PrepareUsbControlWindow(string? udid)
+    {
+        if (string.IsNullOrWhiteSpace(udid) ||
+            !_windows.TryGetValue(udid, out var window)) return false;
+        window.PrepareForUsbControl();
         return true;
     }
 
@@ -63,8 +88,13 @@ internal sealed class MultiDevicePreviewManager : IDisposable
         return width != 0 && height != 0;
     }
 
-    internal Task<(bool Success, string Message)> ShowAsync(DeviceViewModel device)
+    internal bool IsFullScreen(string udid) =>
+        _windows.TryGetValue(udid, out var window) && window.IsFullScreen;
+
+    internal Task<(bool Success, string Message)> ShowAsync(DeviceViewModel device,
+        CancellationToken cancellation = default)
     {
+        cancellation.ThrowIfCancellationRequested();
         viewModel.AddDiagnosticLog(AppLog.Event("independent_preview_show_requested",
             ("device", AppLog.Device(device.Udid)),
             ("kind", device.IsWireless ? "wireless" : "wired"),
@@ -86,9 +116,11 @@ internal sealed class MultiDevicePreviewManager : IDisposable
             _windows.Remove(device.Udid);
             existing.Dispose();
         }
-        if (_opening.TryGetValue(device.Udid, out var pending)) return pending;
+        // A joining request may stop waiting, but does not own another
+        // caller's window/session creation and must not cancel it.
+        if (_opening.TryGetValue(device.Udid, out var pending)) return pending.WaitAsync(cancellation);
 
-        var opening = ShowCoreAsync(device);
+        var opening = ShowCoreAsync(device, cancellation);
         _opening[device.Udid] = opening;
         return CompleteOpeningAsync(device.Udid, opening);
     }
@@ -107,9 +139,16 @@ internal sealed class MultiDevicePreviewManager : IDisposable
         }
     }
 
-    private async Task<(bool Success, string Message)> ShowCoreAsync(DeviceViewModel device)
+    private async Task<(bool Success, string Message)> ShowCoreAsync(DeviceViewModel device,
+        CancellationToken cancellation)
     {
-        var started = await viewModel.StartBackgroundSessionAsync(device);
+        var started = await viewModel.StartBackgroundSessionAsync(device, cancellation);
+        if (cancellation.IsCancellationRequested)
+        {
+            if (started.Created)
+                await viewModel.StopDeviceSessionAsync(device.Udid, started.Handle);
+            cancellation.ThrowIfCancellationRequested();
+        }
         if (!started.Success)
         {
             viewModel.AddDiagnosticLog(AppLog.Event("independent_preview_session_failed",
@@ -152,7 +191,9 @@ internal sealed class MultiDevicePreviewManager : IDisposable
                  args => PointerInput?.Invoke(device.Udid, args),
                  args => KeyboardInput?.Invoke(device.Udid, args),
                  hwnd => ReverseControlRequested?.Invoke(device.Udid, hwnd),
-                 _isReverseControlHotkeyRegistered) || window is null)
+                 () => viewModel.IsUsbControlTarget(device.Udid),
+                 hwnd => UsbControlRequested?.Invoke(device.Udid, hwnd),
+                 hwnd => WirelessControlRequested?.Invoke(device.Udid, hwnd)) || window is null)
         {
             if (started.Created)
                 await viewModel.StopDeviceSessionAsync(
@@ -160,6 +201,9 @@ internal sealed class MultiDevicePreviewManager : IDisposable
             return (false, LocalizationService.Get("PreviewRendererAttachFailed"));
         }
         _windows[device.Udid] = window;
+        window.ActivationChanged += active =>
+            KeyboardFocusChanged?.Invoke(device.Udid, window.Handle, active);
+        KeyboardFocusChanged?.Invoke(device.Udid, window.Handle, true);
         if (_protectionStates.TryGetValue(device.Udid, out var protection))
             window.SetProtectedContent(protection.IsProtected,
                 protection.AudioDisplay);
@@ -173,18 +217,20 @@ internal sealed class MultiDevicePreviewManager : IDisposable
                 !ReferenceEquals(tracked, window)) return;
             _windows.Remove(device.Udid);
             PreviewClosed?.Invoke(device.Udid);
+            var closingHandle = window.SessionHandle;
             viewModel.AddDiagnosticLog(AppLog.Event("independent_preview_closed",
                 ("device", AppLog.Device(device.Udid)),
-                ("handle", AppLog.Handle(started.Handle)),
+                ("handle", AppLog.Handle(closingHandle)),
                 ("created_session", started.Created),
                 ("disposing", _disposing)));
-            if (_disposing || !started.Created) return;
+            if (_disposing || (!started.Created && !viewModel.IsTrayApplicationMode)) return;
             try
             {
                 // The selected-main check is performed under the same core
                 // gate that revokes the handle, closing the selection race.
                 await viewModel.StopDeviceSessionAsync(
-                    device.Udid, started.Handle, preserveIfSelected: true);
+                    device.Udid, closingHandle, preserveIfSelected: true,
+                    pauseWireless: viewModel.IsTrayApplicationMode);
             }
             catch (Exception error)
             {
@@ -203,9 +249,25 @@ internal sealed class MultiDevicePreviewManager : IDisposable
     private void OnDeviceSessionHandleChanged(string udid, ulong handle)
     {
         _protectionStates.Remove(udid);
-        if (!_windows.TryGetValue(udid, out var window) ||
-            window.SessionHandle == handle)
+        if (!_windows.TryGetValue(udid, out var window))
             return;
+
+        if (handle == 0 && _sessionRecoveries.Contains(udid))
+        {
+            viewModel.AddDiagnosticLog(AppLog.Event(
+                "independent_preview_recovery_pending",
+                ("device", AppLog.Device(udid)),
+                ("old_handle", AppLog.Handle(window.SessionHandle))));
+            return;
+        }
+
+        if (handle != 0 && _sessionRecoveries.Contains(udid) &&
+            window.RebindSession(handle))
+        {
+            return;
+        }
+        if (window.SessionHandle == handle) return;
+
         _windows.Remove(udid);
         PreviewClosed?.Invoke(udid);
         viewModel.AddDiagnosticLog(AppLog.Event("independent_preview_handle_invalidated",
@@ -225,6 +287,34 @@ internal sealed class MultiDevicePreviewManager : IDisposable
                 DiagnosticLogger.Exception("window", "preview_dispose_ui_failed",
                     uiError, ("device", AppLog.Device(udid)));
             }
+        }
+    }
+
+    private void OnDeviceSessionRecoveryStateChanged(string udid, bool recovering)
+    {
+        if (recovering)
+        {
+            _sessionRecoveries.Add(udid);
+            return;
+        }
+
+        _sessionRecoveries.Remove(udid);
+        if (viewModel.GetDeviceSessionHandle(udid) != 0 ||
+            !_windows.TryGetValue(udid, out var window)) return;
+
+        _windows.Remove(udid);
+        PreviewClosed?.Invoke(udid);
+        viewModel.AddDiagnosticLog(AppLog.Event(
+            "independent_preview_recovery_failed",
+            ("device", AppLog.Device(udid)),
+            ("old_handle", AppLog.Handle(window.SessionHandle))));
+        try { window.Dispose(); }
+        catch (Exception error)
+        {
+            viewModel.AddDiagnosticLog(AppLog.Event(
+                "independent_preview_dispose_failed",
+                ("handle", AppLog.Handle(window.SessionHandle)),
+                ("error", AppLog.Error(error))));
         }
     }
 
@@ -318,6 +408,7 @@ internal sealed class MultiDevicePreviewManager : IDisposable
         viewModel.AddDiagnosticLog(AppLog.Event("independent_preview_manager_dispose",
             ("count", _windows.Count)));
         viewModel.DeviceSessionHandleChanged -= OnDeviceSessionHandleChanged;
+        viewModel.DeviceSessionRecoveryStateChanged -= OnDeviceSessionRecoveryStateChanged;
         viewModel.DeviceProtectionStateChanged -= OnDeviceProtectionStateChanged;
         LocalizationService.LanguageChanged -= OnLanguageChanged;
         foreach (var window in _windows.Values.ToArray())
@@ -332,6 +423,7 @@ internal sealed class MultiDevicePreviewManager : IDisposable
             }
         }
         _windows.Clear();
+        _sessionRecoveries.Clear();
         _protectionStates.Clear();
     }
 }

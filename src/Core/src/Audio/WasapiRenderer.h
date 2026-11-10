@@ -2,6 +2,7 @@
 
 #include "Media/CoreMedia.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -43,6 +44,26 @@ struct WasapiEnqueuePlan {
 [[nodiscard]] WasapiEnqueuePlan plan_wasapi_enqueue(
     std::size_t queued_frames, std::size_t incoming_frames,
     std::size_t capacity_frames, WasapiQueueThresholds thresholds) noexcept;
+
+// Applies a 0..20000 gain (100% = 10000) to one 16-bit sample. Up to 100% this
+// is the plain linear scale; above that, peaks past the knee are compressed
+// 4:1 and hard-limited so a boosted quiet stream does not crackle.
+[[nodiscard]] constexpr std::int16_t apply_boosted_gain(
+    std::int16_t sample, std::int64_t gain_units) noexcept {
+    constexpr std::int64_t knee = 24576;
+    constexpr std::int64_t limit = 32767;
+    auto scaled = static_cast<std::int64_t>(sample) * gain_units / 10000;
+    if (gain_units > 10000) {
+        const auto magnitude = scaled < 0 ? -scaled : scaled;
+        if (magnitude > knee) {
+            const auto compressed = std::min(knee + (magnitude - knee) / 4, limit);
+            scaled = scaled < 0 ? -compressed : compressed;
+        }
+    }
+    if (scaled > limit) scaled = limit;
+    if (scaled < -limit - 1) scaled = -limit - 1;
+    return static_cast<std::int16_t>(scaled);
+}
 
 } // namespace detail
 
@@ -106,7 +127,7 @@ private:
     std::atomic_uint64_t underruns_{};
     std::atomic_uint64_t queue_catchups_{};
     std::atomic_bool playback_enabled_{true};
-    // Linear gain encoded as 0..10000 to keep the real-time sample loop free
+    // Linear gain encoded as 0..20000 (100% = 10000) to keep the real-time sample loop free
     // from floating point atomics and platform-specific lock fallbacks.
     std::atomic_uint32_t volume_units_{10000};
     std::uint32_t current_gain_units_{10000};

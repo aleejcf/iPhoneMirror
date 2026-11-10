@@ -1,3 +1,4 @@
+using IPhoneMirror.App.Localization;
 using System.Buffers;
 using System.Diagnostics;
 using System.IO;
@@ -18,6 +19,7 @@ internal enum UpdateDownloadPhase
     Download,
     ConnectivityTest,
     ThroughputTest,
+    Verification,
 }
 
 internal sealed record UpdateDownloadProgress(
@@ -131,6 +133,7 @@ internal sealed class GitHubReleaseClient : IDisposable
     private static readonly TimeSpan CandidateThroughputWindow =
         TimeSpan.FromSeconds(12);
     private static readonly TimeSpan DownloadStallTimeout = TimeSpan.FromSeconds(30);
+    private const int MaximumRankedRoutes = 4;
     private static readonly (string Name, Uri Uri)[] ReleaseEndpoints =
     [
         ("github-api", new Uri(
@@ -284,7 +287,31 @@ internal sealed class GitHubReleaseClient : IDisposable
     }
 
     internal async Task<ReleaseInfo?> GetLatestAsync(UpdateSettings settings,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        await GetLatestCoreAsync(settings, false, cancellationToken);
+
+    // Components follow the latest public application release, including previews.
+    // Resolve the list before selecting its ZIP: a missing new component must not
+    // silently send the user back to a stale release or embedded URL.
+    internal async Task<ReleaseInfo> GetLatestUxPlayAsync(bool allowMirrorFallback,
+        CancellationToken cancellationToken)
+    {
+        var release = await GetLatestCoreAsync(new UpdateSettings
+        {
+            NotifyStableReleases = true, NotifyPrereleaseReleases = true,
+            AllowMirrorFallback = allowMirrorFallback,
+        }, true, cancellationToken);
+        if (release?.UxPlayAsset is not { } asset)
+            throw new HttpRequestException("The latest application release has no UxPlay ZIP.",
+                null, HttpStatusCode.NotFound);
+        if (asset.Size is <= 0 or > 200_000_000)
+            throw new InvalidDataException("Invalid UxPlay package size.");
+        var expected = await GetExpectedSha256Async(release, asset, allowMirrorFallback, cancellationToken);
+        return release with { InstallerAsset = null, ZipAsset = asset with { Sha256 = expected } };
+    }
+
+    private async Task<ReleaseInfo?> GetLatestCoreAsync(UpdateSettings settings,
+        bool requireApplicationAsset, CancellationToken cancellationToken)
     {
         DiagnosticLogger.Info("updater", "release_check_begin",
             ("stable", settings.NotifyStableReleases),
@@ -302,7 +329,7 @@ internal sealed class GitHubReleaseClient : IDisposable
                 var json = await ReadReleaseListAsync(endpoint.Uri, cancellationToken);
                 var release = ReleaseParser.ParseLatest(json,
                     settings.NotifyStableReleases,
-                    settings.NotifyPrereleaseReleases);
+                    settings.NotifyPrereleaseReleases, requireApplicationAsset);
                 DiagnosticLogger.Info("updater", "release_check_complete",
                     ("release", release?.TagName ?? "none"),
                     ("endpoint", endpoint.Name));
@@ -323,7 +350,7 @@ internal sealed class GitHubReleaseClient : IDisposable
         }
 
         throw new HttpRequestException(
-            "All configured update endpoints are unavailable.", lastError);
+            LocalizationService.Get("UpdateEndpointsUnavailable"), lastError);
     }
 
     internal async Task<ReleaseInfo> EnrichReleaseNotesAsync(ReleaseInfo release,
@@ -341,11 +368,11 @@ internal sealed class GitHubReleaseClient : IDisposable
             if (finalUri is null || finalUri.Scheme != Uri.UriSchemeHttps ||
                 !finalUri.Host.Equals(notesUri.Host, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException(
-                    "The release notes endpoint redirected to an untrusted host.");
+                    LocalizationService.Get("UpdateUntrustedNotesRedirect"));
             response.EnsureSuccessStatusCode();
             var notes = await ReadReleaseNotesAsync(response.Content, timeout.Token);
             if (!string.IsNullOrWhiteSpace(notes))
-                return release with { Body = notes.Trim() };
+                release = release with { Body = notes.Trim() };
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -358,7 +385,40 @@ internal sealed class GitHubReleaseClient : IDisposable
             DiagnosticLogger.Exception("updater", "release_notes_failed", error,
                 ("release", release.TagName));
         }
+        if (LocalizationService.EffectiveCulture.Name == LocalizationService.TraditionalChineseTaiwan)
+            release = await EnrichTaiwanReleaseNotesAsync(release, cancellationToken);
         return release;
+    }
+
+    internal async Task<ReleaseInfo> EnrichTaiwanReleaseNotesAsync(ReleaseInfo release,
+        CancellationToken cancellationToken)
+    {
+        if (release.TaiwanNotesChecked) return release;
+        release = release with { TaiwanNotesChecked = true };
+        var uri = new Uri($"https://raw.githubusercontent.com/RayrenSX/iPhoneMirror/{release.TagName}/CHANGELOG.zh-TW.md");
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(5));
+            using var response = await _httpClient.GetAsync(uri,
+                HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+            var finalUri = response.RequestMessage?.RequestUri;
+            if (finalUri is null || finalUri.Scheme != Uri.UriSchemeHttps ||
+                !finalUri.Host.Equals(uri.Host, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException(LocalizationService.Get("UpdateUntrustedNotesRedirect"));
+            response.EnsureSuccessStatusCode();
+            var changelog = await ReadReleaseNotesAsync(response.Content, timeout.Token);
+            return release with { TaiwanBody = LocalizedReleaseNotes.FindSection(changelog, release.TagName) };
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception error) when (error is HttpRequestException or OperationCanceledException or InvalidDataException)
+        {
+            // Older tags predate Taiwan support; the embedded reviewed history
+            // supplies their translation without another language dictionary.
+            DiagnosticLogger.Exception("updater", "taiwan_release_notes_unavailable", error,
+                ("release", release.TagName));
+            return release;
+        }
     }
 
     private static async Task<string> ReadReleaseNotesAsync(HttpContent content,
@@ -376,35 +436,70 @@ internal sealed class GitHubReleaseClient : IDisposable
         var finalUri = response.RequestMessage?.RequestUri;
         if (finalUri is null || finalUri.Scheme != Uri.UriSchemeHttps ||
             !finalUri.Host.Equals(endpoint.Host, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidDataException("The update endpoint redirected to an untrusted host.");
+            throw new InvalidDataException(LocalizationService.Get("UpdateUntrustedRedirect"));
         response.EnsureSuccessStatusCode();
         if (response.Content.Headers.ContentLength is > MaximumReleaseListCharacters)
-            throw new InvalidDataException("The update release list is unexpectedly large.");
+            throw new InvalidDataException(LocalizationService.Get("UpdateReleaseListTooLarge"));
         return await ReadBoundedTextAsync(response.Content,
-            MaximumReleaseListCharacters, "The update release list is unexpectedly large.",
+            MaximumReleaseListCharacters, LocalizationService.Get("UpdateReleaseListTooLarge"),
             timeout.Token);
     }
+
+    // A missing official component cannot be recovered by probing 115 mirrors.
+    // Network failures still allow mirror fallback; only an authoritative 404
+    // terminates the install. Do this after the component's verified-cache check.
+    internal async Task CheckComponentAvailabilityAsync(ReleaseAsset asset, CancellationToken cancellationToken)
+    {
+        if (!ReleaseParser.IsTrustedGitHubAssetUri(asset.DownloadUri))
+            throw new InvalidDataException(LocalizationService.Get("UpdateUntrustedAssetUrl"));
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(CandidatePingWindow);
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, asset.DownloadUri);
+            request.Headers.Range = new RangeHeaderValue(0, 0);
+            using var response = await _httpClient.SendAsync(request,
+                HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+            EnsureTrustedDownloadResponse(asset.DownloadUri, response);
+            LogDownloadResponse(asset.DownloadUri, response, "component_availability");
+            if (response.StatusCode == HttpStatusCode.NotFound)
+                throw new HttpRequestException("UxPlay release asset has not been published.", null, response.StatusCode);
+        }
+        catch (Exception error) when (!cancellationToken.IsCancellationRequested &&
+            (error is OperationCanceledException || error is HttpRequestException { StatusCode: not HttpStatusCode.NotFound }))
+        {
+            DiagnosticLogger.Exception("components", "uxplay_origin_check_unavailable", error,
+                ("request_url", DiagnosticLogger.DownloadUrl(asset.DownloadUri)));
+        }
+    }
+
+    private static void LogDownloadResponse(Uri requestUri, HttpResponseMessage response, string phase) =>
+        DiagnosticLogger.Info("updater", "download_http_response", ("phase", phase),
+            ("http_status", (int)response.StatusCode),
+            ("request_url", DiagnosticLogger.DownloadUrl(requestUri)),
+            ("final_url", DiagnosticLogger.DownloadUrl(response.RequestMessage?.RequestUri)));
 
     internal async Task<DownloadedUpdate> DownloadAsync(ReleaseInfo release,
         IProgress<UpdateDownloadProgress>? progress = null,
         CancellationToken cancellationToken = default,
         bool allowMirrorFallback = true,
-        bool? preferInstaller = null)
+        bool? preferInstaller = null,
+        bool stopOnOfficialNotFound = false)
     {
         var useInstaller = preferInstaller ?? DeploymentLayout.UsesSharedRuntime();
         var asset = release.SelectAsset(useInstaller) ?? throw new InvalidOperationException(
             useInstaller
-                ? "This release does not provide a Windows installer package."
-                : "This release does not provide a portable ZIP package.");
+                ? LocalizationService.Get("UpdateInstallerPackageMissing")
+                : LocalizationService.Get("UpdatePortablePackageMissing"));
         DiagnosticLogger.Info("updater", "asset_selected",
             ("deployment", useInstaller ? "installer" : "portable"),
             ("asset", asset.Name));
         var fileName = Path.GetFileName(asset.Name);
         if (!string.Equals(fileName, asset.Name, StringComparison.Ordinal) ||
             string.IsNullOrWhiteSpace(fileName))
-            throw new InvalidDataException("The update asset has an unsafe file name.");
+            throw new InvalidDataException(LocalizationService.Get("UpdateUnsafeFileName"));
         if (asset.Size > MaximumUpdateBytes)
-            throw new InvalidDataException("The update package is unexpectedly large.");
+            throw new InvalidDataException(LocalizationService.Get("UpdatePackageTooLarge"));
         var directory = Path.Combine(_downloadRoot,
             SanitizeDirectoryName(release.TagName));
         Directory.CreateDirectory(directory);
@@ -415,8 +510,17 @@ internal sealed class GitHubReleaseClient : IDisposable
         Exception? lastError = null;
         var downloadCandidates = await RankDownloadCandidatesAsync(asset,
             allowMirrorFallback, progress, cancellationToken);
-        foreach (var downloadUri in downloadCandidates)
+        // Try at most three measured mirrors plus the official route. A second
+        // pass is only for transient failures; 404s and bad hashes are not retried.
+        var routes = downloadCandidates.Take(MaximumRankedRoutes - 1).ToList();
+        if (!routes.Contains(asset.DownloadUri)) routes.Add(asset.DownloadUri);
+        var attempts = new Queue<(Uri Uri, bool Retried)>(routes.Select(uri => (uri, false)));
+        var attemptNumber = 0;
+        while (attempts.TryDequeue(out var attempt))
         {
+            var downloadUri = attempt.Uri;
+            ++attemptNumber;
+            if (attempt.Retried) await Task.Delay(500, cancellationToken);
             TryDelete(partial);
             progress?.Report(new UpdateDownloadProgress(0,
                 asset.Size > 0 ? asset.Size : null, 0));
@@ -424,20 +528,24 @@ internal sealed class GitHubReleaseClient : IDisposable
             {
                 DiagnosticLogger.Info("updater", "download_begin",
                     ("release", release.TagName), ("asset", asset.Name),
-                    ("bytes", asset.Size), ("endpoint", downloadUri.Host));
+                    ("bytes", asset.Size), ("endpoint", downloadUri.Host),
+                    ("request_url", DiagnosticLogger.DownloadUrl(downloadUri)),
+                    ("attempt", attemptNumber), ("retry_count", attempt.Retried ? 1 : 0));
                 using var stallTimeout =
                     CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 stallTimeout.CancelAfter(DownloadStallTimeout);
                 var segmentCount = await DownloadFileAsync(asset, downloadUri, partial, progress,
                     stallTimeout, stallTimeout.Token);
                 stallTimeout.CancelAfter(Timeout.InfiniteTimeSpan);
+                progress?.Report(new UpdateDownloadProgress(asset.Size, asset.Size, 0,
+                    UpdateDownloadPhase.Verification));
                 var verifiedSha256 = await VerifyAsync(release, asset, partial, allowMirrorFallback,
                     cancellationToken);
                 File.Move(partial, destination, overwrite: true);
                 DiagnosticLogger.Info("updater", "download_complete",
                     ("release", release.TagName), ("asset", asset.Name),
                     ("sha256_verified", true), ("endpoint", downloadUri.Host),
-                    ("segments", segmentCount));
+                    ("segments", segmentCount), ("downloaded_bytes", new FileInfo(destination).Length));
                 return new DownloadedUpdate(release, asset, destination,
                     HashVerified: true, VerifiedSha256: verifiedSha256);
             }
@@ -448,27 +556,46 @@ internal sealed class GitHubReleaseClient : IDisposable
             }
             catch (Exception error) when (error is HttpRequestException or
                                            OperationCanceledException or
+                                           HttpIOException or
                                            EndOfStreamException or
                                            InvalidDataException)
             {
                 lastError = error;
                 DiagnosticLogger.Exception("updater", "download_endpoint_failed",
                     error, ("release", release.TagName), ("asset", asset.Name),
-                    ("endpoint", downloadUri.Host));
+                    ("endpoint", downloadUri.Host), ("attempt", attemptNumber),
+                    ("retry_count", attempt.Retried ? 1 : 0),
+                    ("http_status", (error as HttpRequestException)?.StatusCode),
+                    ("request_url", DiagnosticLogger.DownloadUrl(downloadUri)));
+                if (stopOnOfficialNotFound && downloadUri == asset.DownloadUri &&
+                    error is HttpRequestException { StatusCode: HttpStatusCode.NotFound })
+                    throw;
+                if (!attempt.Retried && IsTransientDownloadFailure(error))
+                    attempts.Enqueue((downloadUri, true));
             }
         }
 
         TryDelete(partial);
         if (lastError is InvalidDataException invalidData) throw invalidData;
         throw new HttpRequestException(
-            "All configured update download endpoints are unavailable.", lastError);
+            LocalizationService.Get("UpdateDownloadEndpointsUnavailable"), lastError,
+            (lastError as HttpRequestException)?.StatusCode);
     }
+
+    private static bool IsTransientDownloadFailure(Exception error) => error switch
+    {
+        OperationCanceledException or EndOfStreamException or HttpIOException => true,
+        HttpRequestException { StatusCode: null } => true,
+        HttpRequestException { StatusCode: var status } =>
+            status is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests || (int?)status >= 500,
+        _ => false,
+    };
 
     internal static IReadOnlyList<Uri> BuildDownloadCandidates(
         ReleaseAsset asset, bool allowMirrorFallback)
     {
         if (!ReleaseParser.IsTrustedGitHubAssetUri(asset.DownloadUri))
-            throw new InvalidDataException("The update asset URL is not trusted.");
+            throw new InvalidDataException(LocalizationService.Get("UpdateUntrustedAssetUrl"));
         if (!allowMirrorFallback || asset.Sha256 is null)
             return [asset.DownloadUri];
         var candidates = DownloadMirrorPrefixes.Select(prefix =>
@@ -528,12 +655,14 @@ internal sealed class GitHubReleaseClient : IDisposable
             ("reachable", reachable.Length), ("measured", available.Length),
             ("selected", available.FirstOrDefault()?.Uri.Host ?? "unmeasured"),
             ("probe_bytes", MirrorProbeBytes));
-        return available.Length > 0
-            ? available.Select(probe => probe.Uri).ToArray()
+        var ranked = available.Length > 0
+            ? available.Select(probe => probe.Uri).ToList()
             : successfulPings
                 .OrderBy(result => result.Milliseconds)
                 .Select(result => result.Uri)
-                .ToArray();
+                .ToList();
+        if (!ranked.Contains(asset.DownloadUri)) ranked.Add(asset.DownloadUri);
+        return ranked;
     }
 
     private async Task<ReachableDownloadCandidate?> PingDownloadCandidateAsync(
@@ -580,6 +709,7 @@ internal sealed class GitHubReleaseClient : IDisposable
             using var response = await _httpClient.SendAsync(request,
                 HttpCompletionOption.ResponseHeadersRead, cancellationToken);
             EnsureTrustedDownloadResponse(uri, response);
+            LogDownloadResponse(uri, response, "throughput_probe");
             response.EnsureSuccessStatusCode();
 
             var expectedSampleBytes = checked((int)(probeEnd + 1));
@@ -676,7 +806,8 @@ internal sealed class GitHubReleaseClient : IDisposable
                 MaximumUpdateBytes,
                 asset.Size > 0 ? asset.Size : null),
             finalUri => IsTrustedDownloadFinalUri(downloadUri, finalUri),
-            downloadProgress, cancellationToken);
+            downloadProgress, cancellationToken,
+            (requestUri, response) => LogDownloadResponse(requestUri, response, "download"));
         return result.SegmentCount;
     }
 
@@ -688,24 +819,31 @@ internal sealed class GitHubReleaseClient : IDisposable
     private async Task<string> VerifyAsync(ReleaseInfo release, ReleaseAsset asset,
         string path, bool allowMirrorFallback, CancellationToken cancellationToken)
     {
+        var expected = await GetExpectedSha256Async(release, asset, allowMirrorFallback, cancellationToken);
+        await using var stream = File.OpenRead(path);
+        var actual = Convert.ToHexString(
+            await SHA256.HashDataAsync(stream, cancellationToken)).ToLowerInvariant();
+        if (!actual.Equals(expected, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException(LocalizationService.Get("UpdateChecksumFailed"));
+        return actual;
+    }
+
+    private async Task<string> GetExpectedSha256Async(ReleaseInfo release, ReleaseAsset asset,
+        bool allowMirrorFallback, CancellationToken cancellationToken)
+    {
         var expected = asset.Sha256;
         if (expected is null)
         {
             var checksumAsset = release.ChecksumAsset ??
                 throw new InvalidDataException(
-                    "The release does not provide a trusted SHA256 value.");
+                    LocalizationService.Get("UpdateChecksumRequired"));
             var manifest = await ReadChecksumManifestAsync(checksumAsset,
                 allowMirrorFallback, cancellationToken);
             expected = ReleaseParser.FindExpectedSha256(manifest, asset.Name) ??
                 throw new InvalidDataException(
-                    $"SHA256SUMS.txt does not contain {asset.Name}.");
+                    LocalizationService.Format("UpdateChecksumEntryMissingFormat", asset.Name));
         }
-        await using var stream = File.OpenRead(path);
-        var actual = Convert.ToHexString(
-            await SHA256.HashDataAsync(stream, cancellationToken)).ToLowerInvariant();
-        if (!actual.Equals(expected, StringComparison.OrdinalIgnoreCase))
-            throw new InvalidDataException("The downloaded update failed SHA256 verification.");
-        return actual;
+        return expected;
     }
 
     private async Task<string> ReadChecksumManifestAsync(ReleaseAsset checksumAsset,
@@ -726,13 +864,13 @@ internal sealed class GitHubReleaseClient : IDisposable
                 response.EnsureSuccessStatusCode();
                 if (response.Content.Headers.ContentLength is > MaximumChecksumCharacters)
                     throw new InvalidDataException(
-                        "The checksum manifest is unexpectedly large.");
+                        LocalizationService.Get("UpdateChecksumListTooLarge"));
                 var bytes = await ReadBoundedBytesAsync(response.Content,
                     MaximumChecksumCharacters,
-                    "The checksum manifest is unexpectedly large.", timeout.Token);
+                    LocalizationService.Get("UpdateChecksumListTooLarge"), timeout.Token);
                 if (checksumAsset.Size > 0 && bytes.LongLength != checksumAsset.Size)
                     throw new InvalidDataException(
-                        "The checksum manifest size does not match the release metadata.");
+                        LocalizationService.Get("UpdateChecksumSizeMismatch"));
                 if (checksumAsset.Sha256 is not null)
                 {
                     var actual = Convert.ToHexString(SHA256.HashData(bytes))
@@ -740,7 +878,7 @@ internal sealed class GitHubReleaseClient : IDisposable
                     if (!actual.Equals(checksumAsset.Sha256,
                             StringComparison.OrdinalIgnoreCase))
                         throw new InvalidDataException(
-                            "The checksum manifest failed SHA256 verification.");
+                            LocalizationService.Get("UpdateChecksumListInvalid"));
                 }
                 return Encoding.UTF8.GetString(bytes);
             }
@@ -758,7 +896,7 @@ internal sealed class GitHubReleaseClient : IDisposable
 
         if (lastError is InvalidDataException invalidData) throw invalidData;
         throw new HttpRequestException(
-            "All checksum download endpoints are unavailable.", lastError);
+            LocalizationService.Get("UpdateChecksumDownloadUnavailable"), lastError);
     }
 
     private static async Task<string> ReadBoundedTextAsync(HttpContent content,
@@ -813,10 +951,10 @@ internal sealed class GitHubReleaseClient : IDisposable
         HttpResponseMessage response)
     {
         var finalUri = response.RequestMessage?.RequestUri ??
-            throw new InvalidDataException("The update response has no final URL.");
+            throw new InvalidDataException(LocalizationService.Get("UpdateResponseUrlMissing"));
         if (!IsTrustedDownloadFinalUri(requestedUri, finalUri))
             throw new InvalidDataException(
-                "The update download redirected to an untrusted host.");
+                LocalizationService.Get("UpdateDownloadUntrustedRedirect"));
     }
 
     private static bool IsTrustedDownloadFinalUri(Uri requestedUri, Uri finalUri) =>

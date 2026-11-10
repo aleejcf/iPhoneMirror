@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Windows;
 using System.Windows.Documents;
 using System.Windows.Media;
+using IPhoneMirror.App.Localization;
 using Markdig;
 using Markdig.Syntax;
 using Markdig.Syntax.Inlines;
@@ -18,15 +19,16 @@ internal static class MarkdownFlowDocumentRenderer
         var flow = new FlowDocument
         {
             PagePadding = new Thickness(0),
-            FontFamily = new FontFamily("Segoe UI Variable Text, Segoe UI"),
-            FontSize = 13,
-            LineHeight = 21,
         };
+        flow.SetResourceReference(FlowDocument.ForegroundProperty, "TextBrush");
+        flow.SetResourceReference(FlowDocument.FontFamilyProperty, "AppFontFamily");
+        flow.SetResourceReference(FlowDocument.FontSizeProperty, "BodyFontSize");
+        flow.SetResourceReference(FlowDocument.LineHeightProperty, "ReleaseNotesLineHeight");
         var document = Markdown.Parse(markdown ?? string.Empty, Pipeline);
         foreach (var block in document)
             AddBlock(flow.Blocks, block);
         if (flow.Blocks.Count == 0)
-            flow.Blocks.Add(new Paragraph(new Run("No release notes were provided.")));
+            flow.Blocks.Add(new Paragraph(new Run(LocalizationService.Get("ReleaseNotesEmpty"))));
         return flow;
     }
 
@@ -37,12 +39,13 @@ internal static class MarkdownFlowDocumentRenderer
             case HeadingBlock heading:
                 var headingParagraph = CreateParagraph(heading.Inline);
                 headingParagraph.FontWeight = FontWeights.SemiBold;
-                headingParagraph.FontSize = heading.Level switch
+                headingParagraph.SetResourceReference(TextElement.FontSizeProperty, heading.Level switch
                 {
-                    1 => 22,
-                    2 => 18,
-                    _ => 15,
-                };
+                    1 => "FontSize22",
+                    2 => "FontSize18",
+                    _ => "FontSize15",
+                });
+                headingParagraph.LineHeight = double.NaN;
                 headingParagraph.Margin = new Thickness(0,
                     heading.Level == 1 ? 0 : 16, 0, 8);
                 target.Add(headingParagraph);
@@ -74,36 +77,42 @@ internal static class MarkdownFlowDocumentRenderer
                 {
                     Margin = new Thickness(14, 4, 0, 12),
                     Padding = new Thickness(12, 2, 0, 2),
-                    BorderBrush = new SolidColorBrush(Color.FromRgb(96, 205, 255)),
                     BorderThickness = new Thickness(3, 0, 0, 0),
                 };
+                section.SetResourceReference(System.Windows.Documents.Block.BorderBrushProperty, "AccentBrush");
                 foreach (var child in quote)
                     AddBlock(section.Blocks, child);
                 target.Add(section);
                 break;
             case CodeBlock code:
-                target.Add(new Paragraph(new Run(code.Lines.ToString()))
+                var codeParagraph = WithBrush(new Paragraph(new Run(code.Lines.ToString()))
                 {
-                    FontFamily = new FontFamily("Cascadia Mono, Consolas"),
-                    FontSize = 12,
-                    Background = new SolidColorBrush(Color.FromArgb(45, 128, 128, 128)),
                     Padding = new Thickness(12),
                     Margin = new Thickness(0, 4, 0, 12),
-                });
+                }, TextElement.BackgroundProperty, "ControlFillBrush");
+                codeParagraph.SetResourceReference(TextElement.FontFamilyProperty, "CodeFontFamily");
+                codeParagraph.SetResourceReference(TextElement.FontSizeProperty, "SecondaryFontSize");
+                target.Add(codeParagraph);
                 break;
             case ThematicBreakBlock:
-                target.Add(new Paragraph
+                target.Add(WithBrush(new Paragraph
                 {
-                    BorderBrush = new SolidColorBrush(Color.FromArgb(80, 128, 128, 128)),
                     BorderThickness = new Thickness(0, 0, 0, 1),
                     Margin = new Thickness(0, 6, 0, 14),
-                });
+                }, System.Windows.Documents.Block.BorderBrushProperty, "BorderBrush"));
                 break;
             case ContainerBlock container:
                 foreach (var child in container)
                     AddBlock(target, child);
                 break;
         }
+    }
+
+    private static T WithBrush<T>(T element, DependencyProperty property, string key)
+        where T : FrameworkContentElement
+    {
+        element.SetResourceReference(property, key);
+        return element;
     }
 
     private static Paragraph CreateParagraph(ContainerInline? inline)
@@ -124,11 +133,9 @@ internal static class MarkdownFlowDocumentRenderer
                     target.Add(new Run(literal.Content.ToString()));
                     break;
                 case CodeInline code:
-                    target.Add(new Run(code.Content)
-                    {
-                        FontFamily = new FontFamily("Cascadia Mono, Consolas"),
-                        Background = new SolidColorBrush(Color.FromArgb(40, 128, 128, 128)),
-                    });
+                    var codeRun = WithBrush(new Run(code.Content), TextElement.BackgroundProperty, "ControlFillBrush");
+                    codeRun.SetResourceReference(TextElement.FontFamilyProperty, "CodeFontFamily");
+                    target.Add(codeRun);
                     break;
                 case LineBreakInline:
                     target.Add(new LineBreak());
@@ -141,7 +148,7 @@ internal static class MarkdownFlowDocumentRenderer
                     target.Add(span);
                     break;
                 case LinkInline link:
-                    var hyperlink = new Hyperlink();
+                    var hyperlink = WithBrush(new Hyperlink(), TextElement.ForegroundProperty, "AccentBrush");
                     AddInlines(hyperlink.Inlines, link);
                     if (Uri.TryCreate(link.Url, UriKind.Absolute, out var uri) &&
                         uri.Scheme is "https" or "http")

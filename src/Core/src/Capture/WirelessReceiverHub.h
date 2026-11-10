@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Capture/ICaptureSession.h"
+#include "IpcProtocol.h"
 
 #include <atomic>
 #include <chrono>
@@ -24,6 +25,14 @@ struct MessageHeader;
 }
 
 namespace iPhoneMirror::capture {
+
+// RAII wrapper for Win32 HANDLEs. The deleter is declared here and defined in
+// the translation unit that includes <Windows.h>, keeping this header free of
+// platform headers.
+struct HandleDeleter {
+    void operator()(void* handle) const noexcept;
+};
+using ScopedHandle = std::unique_ptr<void, HandleDeleter>;
 
 struct WirelessReceiverHubTestAccess;
 
@@ -96,6 +105,8 @@ public:
         std::span<const std::uint8_t> payload);
     void publish_audio(const wireless::MessageHeader& header,
         std::span<const std::uint8_t> payload);
+    void set_mirror_state(wireless::MirrorSenderState state);
+    void set_mirror_geometry(const wireless::MessageHeader& header);
 
 private:
     friend struct WirelessReceiverHubTestAccess;
@@ -105,10 +116,11 @@ private:
     std::wstring os_version_;
     mutable std::mutex mutex_;
     bool connected_{};
+    wireless::MirrorSenderState mirror_state_{wireless::MirrorSenderState::Active};
+    std::uint32_t source_width_{}, source_height_{}, output_width_{}, output_height_{};
     std::uint32_t attachments_{};
     Snapshot snapshot_;
     std::shared_ptr<const media::DecodedFrame> latest_frame_;
-    std::deque<std::shared_ptr<const media::DecodedFrame>> render_queue_;
     std::atomic_uint32_t target_fps_{60};
     std::atomic_bool play_audio_{true};
     std::atomic<float> local_audio_volume_{1.0F};
@@ -128,6 +140,7 @@ private:
     std::uint64_t rejected_audio_messages_{};
 
     void clear_media() noexcept;
+    void reset_video_for_attach() noexcept;
     void stop_audio_renderer() noexcept;
     [[nodiscard]] float effective_audio_volume() const noexcept;
 };
@@ -166,9 +179,9 @@ private:
     std::wstring stop_event_name_;
     std::jthread worker_;
     std::jthread playback_worker_;
-    void* pipe_{};
-    void* stop_event_{};
-    void* process_{};
+    ScopedHandle pipe_;
+    ScopedHandle stop_event_;
+    ScopedHandle process_;
     std::atomic_bool stopping_{};
     std::atomic_bool ready_{};
     std::atomic_bool pipe_disconnected_{};

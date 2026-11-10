@@ -19,29 +19,34 @@
 </p>
 
 > [!IMPORTANT]
-> This is a public preview. The application is not commercially Authenticode
-> signed, so Windows may show SmartScreen or unknown-publisher warnings. Apple
-> Screen Capture is a private protocol and can change in future iOS versions.
+> This is a public preview and is not commercially Authenticode-signed, so Windows
+> may show SmartScreen or unknown-publisher warnings. Apple Screen Capture uses a
+> private protocol and may require updates for future iOS versions. Official builds
+> currently support Windows x64 only; Windows ARM64 is unsupported because the USB
+> kernel driver and wireless runtime are not available for ARM64.
 
-> [!NOTE]
-> **Windows ARM64 is not supported.** The complete USB mirroring path depends on
-> x64-only `libusb-win32 1.2.6.0` binaries, including the `libusb0.dll` runtime
-> and `libusb0.sys` kernel filter driver. The bundled AirPlayServer/FFmpeg
-> receiver runtime is also available only as x64 binaries. Windows 11 ARM64 can
-> emulate many x64 user-mode applications, but it cannot load an x64 kernel
-> driver as an ARM64 driver. Shipping a wireless-only ARM64 edition would omit
-> the USB and driver-management capabilities promised by this project, so
-> official builds remain Windows x64 and x64 emulation on ARM64 is not treated
-> as a supported configuration. ARM64 will be reconsidered only when the USB
-> driver, wireless runtime, and their full verification chain are ARM64-ready.
+## Community Ports and Special Thanks
+
+Thank you to the community developers bringing iPhoneMirror to more platforms!
+Each port below is independently maintained by its author. We invite you to
+follow, try, and support their work.
+
+| Platform | Contributor | Adaptation focus | Project and documentation |
+|---|---|---|---|
+| **Linux** | **[@furruka](https://github.com/furruka)** | Native Linux UI, audio/video, and device communication | [Repository](https://github.com/furruka/iPhoneMirror) · [Port notes](https://github.com/furruka/iPhoneMirror/blob/linux-port/docs/LINUX_PORT.md) |
+| **HarmonyOS (PC)** | **[@zhangziqizZ](https://github.com/zhangziqizZ)**<br>Bilibili: **@Fantasy_zzq** | USB and AirPlay mirroring with native audio/video for HarmonyOS NEXT / 2in1 | [Repository](https://github.com/zhangziqizZ/iPhoneMirror) · [Port notes](https://github.com/zhangziqizZ/iPhoneMirror/blob/main/docs/移植说明.md) |
+
+See each project's README and port notes for feature coverage, release packages,
+build instructions, and known limitations.
 
 ## Download
 
 Download `iPhoneMirror-Setup-v*-x64.exe` from
-[Releases](https://github.com/RayrenSX/iPhoneMirror/releases). The bilingual
+[Releases](https://github.com/RayrenSX/iPhoneMirror/releases). The three-language
 Setup wizard supports a custom destination, defaults to
-`C:\Program Files\iPhoneMirror`, creates Start menu entries, and offers an
-optional desktop shortcut. For portable use, download
+`C:\Program Files\iPhoneMirror` for an administrator install, creates Start menu
+entries, and offers an optional desktop shortcut. A per-user install uses the
+Windows user-program directory. For portable use, download
 `iPhoneMirror-v*-win-x64.zip`, extract it completely, and run
 `iPhoneMirror.exe`. If Windows reports **Bad Image** or `0xc0e90002` for a
 wireless DLL, use Setup. If portable use is required, open the downloaded
@@ -63,15 +68,21 @@ startup.
 
 The [complete user guide (Chinese)](docs/USER_GUIDE.md) covers every main interface and workflow.
 
-The computer still needs either Apple Devices from Microsoft Store or the
-desktop iTunes package containing Apple Mobile Device Support. Wireless
-discovery uses the DNS-SD support built into Windows 10/11; no Bonjour service
-or administrator access is required.
+See the [documentation index](docs/README.md), [development and testing guide](docs/DEVELOPMENT.md),
+and [architecture](docs/ARCHITECTURE.md) for source-level details (Chinese).
 
-The driver manager now installs missing Apple USB support automatically. It
-prefers the pinned Apple Devices Microsoft Store product through `winget`, then
-falls back to Apple's signed desktop iTunes package from Apple's official HTTPS
-download. Apple binaries are not redistributed by iPhoneMirror.
+The computer needs Apple USB support. If it is missing, the driver manager first
+uses a trusted local `AppleMobileDeviceSupport64.msi`, then downloads the
+standalone MSI from Apple's Software Update catalog, and finally falls back to
+the official signed desktop iTunes package and extracts its Apple Mobile Device
+Support component. Apple Devices from Microsoft Store remains a supported manual
+option; Apple binaries are not redistributed by this project. Wireless discovery
+uses the DNS-SD support built into Windows 10/11 and does not install Bonjour;
+discovery itself does not require administrator access. An administrator Setup
+adds the `iPhoneMirror Wireless AirPlay` local-subnet firewall rule. The rule is
+constrained to `WirelessHost.exe` and the local subnet, while allowing the
+TCP/UDP media ports negotiated per AirPlay session; it is removed on uninstall.
+Portable packages do not change the firewall automatically.
 
 ## Project description
 
@@ -80,7 +91,7 @@ wired USB capture and local-network AirPlay reception behind one session,
 preview, audio, screenshot, detached-window, OBS and multi-device workflow,
 without cloud relay.
 
-The project has three explicit boundaries: the C++ core owns Apple's private
+The project has four explicit boundaries: the C++ core owns Apple's private
 USB protocol, QuickTime/CoreMedia parsing, H.264 decoding, D3D11 rendering and
 WASAPI audio; the WPF app owns device discovery, session control and UI; and an
 isolated wireless host owns AirPlay protocol and decode, sending bounded media
@@ -115,7 +126,7 @@ geometry, not Apple-published industrial measurements.
 - USB Screen Capture and local-network AirPlay share one device, preview, audio and OBS workflow.
 - Each phone has its own session and detached window; multiple devices can keep running together.
 - Device cards support press-and-hold reordering, and a new wireless sender auto-selects only once.
-- H.264/CoreMedia and AirPlay media are decoded locally and presented through D3D11/DirectComposition.
+- H.264/CoreMedia and AirPlay screen-mirroring frames are decoded locally and presented through D3D11/DirectComposition.
 - Media does not pass through an iPhoneMirror cloud relay, and USB capture does not depend on the network.
 - Clean detached windows are ready for OBS, while screenshots read the decoded frame without application UI.
 - Optional BLE HID mouse/keyboard control through iOS AssistiveTouch, with no phone-side app or jailbreak required.
@@ -143,13 +154,17 @@ AirPlay implementation may require updates for future iOS releases.
 |---|---|
 | Wired capture | Direct USB with per-device Demo, experimental AirPlay, and Aisi-compatible modes |
 | Wireless capture | Local-network AirPlay integrated with the main preview and every output feature |
-| Video | CoreMedia/AVCC H.264 and low-latency Media Foundation decode |
-| Rendering | Native D3D11/DirectComposition preview |
+| Video-app casting | AirPlay/DLNA HTTP(S)/HLS playback, controls, and source audio |
+| Video | CoreMedia/AVCC H.264, HEVC description parsing, and Media Foundation auto/hardware/software policies |
+| Rendering | Native D3D11/DirectComposition preview with full-range BT.709 metadata |
 | Audio | USB 48 kHz PCM and AirPlay PCM with WASAPI playback, mute and volume |
 | Devices | iPhone/iPad metadata, trust status, stable refresh and safe switching |
 | Quality | Native/1080p/720p/540p local limits and 24/30/60/120 FPS limits |
 | Preview | Main, detached, full-screen, rotation, aspect lock and device-aware corners |
-| OBS | Stable-title dedicated window for Window Capture |
+| OBS | Clean per-device detached window for Window Capture |
+| Bluetooth control | Per-device BLE HID mouse/keyboard binding, system navigation, and configurable global shortcuts |
+| USB/wireless reverse control | Separate CoreDevice bridge; requires Developer Mode, a matching DDI and verified device HID services |
+| Image adjustments | Preview-only brightness, contrast, saturation, and gamma |
 | Tools | Screenshot, force refresh, shortcuts, live logs, Simplified Chinese, Traditional Chinese (Hong Kong), and English UI |
 | Driver | Strict per-device check before wired capture; opens the standalone driver manager on failure |
 
@@ -170,7 +185,7 @@ the selection applies only to the current USB device.
 1. Run the Release Setup and launch iPhoneMirror from the Start menu. For the
    portable package, extract the ZIP completely and run `iPhoneMirror.exe`.
 2. Connect the iPhone or iPad over USB, unlock it and choose **Trust This Computer**.
-3. Click **Driver manager** in the top bar and run one-click installation for the
+3. Click **Driver manager** in the left navigation and run one-click installation for the
    target device. The tool installs missing Apple USB support and the capture
    filter as needed.
 4. Select the phone and click **Start Mirroring**. If the selected wired device
@@ -191,7 +206,7 @@ the same cleanup path.
 
 `iPhoneMirror.exe` only reads driver state. Installation, repair and removal are
 performed by the standalone `iPhoneMirror.Driver.exe` in the same directory.
-The **Driver manager** button in the top bar opens it at any time; if that exact
+The **Driver manager** button in the left navigation opens it at any time; if that exact
 tool is already running, the existing window is activated.
 
 When **Start Mirroring** is clicked for a wired device, the app verifies the
@@ -254,6 +269,22 @@ volume, screenshots, detached/full-screen windows, simultaneous previews and OBS
 
 There is no fixed application-level wireless device count; practical capacity
 depends on CPU/GPU resources, memory and local-network bandwidth.
+The same receiver identity also handles video-app AirPlay/DLNA casting. Fixed
+control/discovery ports are RAOP `5001`, AirPlay `7001`, DLNA `8090`, and SSDP
+`1900`; mirroring and RAOP media ports are negotiated dynamically per session.
+
+An administrator Setup creates the `iPhoneMirror Wireless AirPlay` local-subnet
+firewall rule for the wireless host. It is scoped to the host process and local
+subnet, but allows the dynamic TCP/UDP media ports returned during AirPlay
+`SETUP`; it is removed on uninstall. Existing installations need a package
+containing this fix to migrate the old rule. A portable package does not change
+the firewall automatically. Add the equivalent process-scoped rule manually on a
+trusted network when incoming AirPlay or DLNA connections are blocked.
+
+If a sender connects to a black screen and drops after about ten seconds, check
+that both rules show `LocalPort: Any` and point to the current
+`Wireless\iPhoneMirror.WirelessHost.exe`; this pattern means the control
+connection succeeded but the negotiated mirror port was blocked.
 
 During the AirPlay `SETUP` handshake, the receiver reads the sender's
 `deviceID`, `model` (Apple ProductType such as `iPhone9,1`) and `osVersion`
@@ -276,6 +307,35 @@ An audio-only session carries no video. The preview shows an **AirPlay Music** s
 and screenshot, detached-preview and full-screen tools remain disabled until the sender
 starts delivering video.
 
+## Video-app casting
+
+Video apps use the same AirPlay receiver identity but send a playback URL rather
+than screen-mirroring frames. Select the receiver from the app's Cast/AirPlay
+button; iPhoneMirror opens a separate playback window and supports ordinary
+HTTP(S) video and HLS, playback controls, recording, streaming and virtual-camera
+output. DRM-protected, login-bound or private playback URLs may not be available
+to a third-party receiver.
+
+## Bluetooth reverse control
+
+Enable iOS AssistiveTouch and use a Windows Bluetooth adapter that supports BLE
+peripheral mode. On the first connection, confirm the matching phone in the
+Bluetooth client-binding dialog; bindings are stored per mirrored device and can
+be removed from Settings. The shortcut window configures Bluetooth, wired and
+wireless control, Control Center, Notification Center, App Switcher, Home, Boss
+key, volume, lock-screen, Dock and Siri actions. F12 is reserved; F1-F11 and
+right/middle mouse buttons can be captured directly.
+Unbound actions stay disabled, duplicate bindings are rejected, and `Backspace`
+or `Delete` clears a binding. The default Bluetooth-control key is `F9` and the
+default Boss key is `Ctrl+Alt+B`.
+
+Wired and wireless reverse control use the bundled `iUsbBridge.exe`. Wired
+control requires an unlocked trusted device and Developer Mode when requested;
+the matching Developer Disk Image is resolved and verified from official GitHub
+metadata on first use. Wireless control requires pairing and local-network
+reachability. The first USB or AirPlay connection opens device-profile guidance
+so both identities can be associated with the same phone.
+
 ## Third-party dependencies and licensing
 
 | Dependency | Purpose | License/source |
@@ -284,7 +344,9 @@ starts delivering video.
 | libusb 1.0.29 | Optional USB transport compatibility layer | LGPL-2.1-or-later, `third_party/libusb/` |
 | libusb-win32 1.2.6.0 | `libusb0` filter driver used by the standalone manager | LGPL-3.0 and upstream terms, `src/DriverInstaller/Assets/` |
 | AirPlayServer 1.1.2 | Wireless AirPlay, FairPlay, video and audio decode | GPL-3.0, LGPL-2.1-or-later and upstream terms, `third_party/airplay-server/` |
-| FFmpeg 4.4.2 runtime | AirPlay video/audio decode dependency | LGPL-2.1-or-later, distributed with AirPlayServer |
+| FFmpeg 63b2b0f47d runtime | Compact H.264/ALAC runtime preserving the original AirPlay receiver ABI | LGPL-2.1-or-later, source and build recipe recorded in this repository |
+| FFmpeg 8.1.2 runtime | Recording, live output and HLS media-cast bridge | GPL-3.0, bundled by default under `tools/ffmpeg/` |
+| iUsbBridge | USB/wireless CoreDevice reverse-control bridge | [iUsbBridge](https://github.com/RayrenSX/iUsbBridge) noncommercial license; see [component notices](docs/USB_TOUCH_THIRD_PARTY_LICENSES.md) for the recipe and USBMux source boundaries |
 | quicktime_video_hack fixtures | QuickTime protocol regression vectors | MIT, test fixtures only |
 
 Apple Devices, Apple Mobile Device Support, iTunes and Windows system
@@ -311,7 +373,16 @@ These are tested combinations, not a guarantee for every iPhone or iOS build.
 ## Build from source
 
 Requirements: Windows 10/11 x64, Visual Studio 2026 Build Tools with MSVC,
-Windows SDK and CMake, plus the .NET 10 SDK with Windows Desktop support.
+Windows SDK and CMake, the .NET 10 SDK with Windows Desktop support, and MSYS2
+UCRT64 with CMake, Ninja, the UCRT64 toolchain, GStreamer (base, good, bad, libav),
+libplist and OpenSSL for the optional UxPlay component. The compact FFmpeg build also
+needs x264, Opus, SRT, oneVPL, AMF/NVENC headers and nasm; see the Windows workflow
+for the full package list. The USB bridge build uses Python 3.13 x64.
+
+The build packages this repository's `tools/usb_touch_bridge.py` and `tools/iostouch`
+using `scripts/usb-bridge-recipe`; it does not clone the latest upstream backend.
+`IPHONE_MIRROR_USB_BRIDGE_ROOT` may override the compatible recipe directory.
+See the pinned recipe's [source record](scripts/usb-bridge-recipe/SOURCE.md).
 
 ```powershell
 git clone https://github.com/RayrenSX/iPhoneMirror.git
@@ -326,34 +397,47 @@ self-contained WPF application under `outputs/iPhoneMirror`, including:
 outputs/iPhoneMirror/iPhoneMirror.exe
 outputs/iPhoneMirror/iPhoneMirror.Driver.exe
 outputs/iPhoneMirror/iPhoneMirror.Core.dll
+outputs/iPhoneMirror/iUsbBridge.exe
+outputs/iPhoneMirror/iUsbBridge.runtime.json
+outputs/iPhoneMirror/_internal/
 outputs/iPhoneMirror/iPhoneMirror.VirtualCamera.dll
 outputs/iPhoneMirror/iPhoneMirror.VirtualCamera.Admin.exe
 outputs/iPhoneMirror/tools/ffmpeg/ffmpeg.exe
 outputs/iPhoneMirror/Wireless/iPhoneMirror.WirelessHost.exe
+outputs/components/iPhoneMirror-UxPlay-v<version>-win-x64.zip
 ```
 
 `outputs/iPhoneMirror` is the portable build with .NET/WPF dependencies bundled
 inside its executables. The installer uses `outputs/iPhoneMirror.Installer`,
-where the app and driver manager share external runtime DLLs to reduce download
-size.
+where the app uses external runtime DLLs and the driver remains independently
+self-contained. Solid installer compression reduces repeated runtime data.
 
-The default build bundles the FFmpeg 8 media-output runtime so recording and
-RTMP/SRT/WHIP streaming work out of the box. Build the compact edition only
-when minimum size is required and a system FFmpeg dependency is acceptable:
+The default build bundles the full FFmpeg 8.1.2 essentials runtime with recording,
+media-source audio and RTMP/SRT/WHIP streaming. The custom compact profile was
+withdrawn after audio compatibility tests found missing existing decoders.
+UxPlay is a separate optional component, downloaded through
+mirrors when first selected, with a progress/speed dialog supporting cancellation
+and retry. Use `-IncludeUxPlayRuntime` for an offline bundle. Working components
+take priority over the 100 MB size target. Omit FFmpeg only when media output is
+not required. External FFmpeg candidates must still match the
+application's pinned SHA-256; an arbitrary system build is not accepted, and
+dependent output features remain unavailable without a trusted runtime:
 
 ```powershell
 .\build.ps1 -Configuration Release -OmitMediaOutputRuntime
 ```
 
 Pass `-OmitMediaOutputRuntime` to the release packaging script as well when
-publishing the compact edition.
+publishing an edition without the media-output runtime.
 
 Build all Release assets (Setup, ZIP, checksums, and SBOM):
 
 ```powershell
-./scripts/package_release.ps1 -Version 1.6.8 -GenerateSbom
+./scripts/package_release.ps1 -GenerateSbom
 ```
 
+The script reads the project version and requires the app and driver manager to
+agree. See the [development guide](docs/DEVELOPMENT.md) for parameters and focused tests.
 Pass `-UpdateReleaseManifest` when producing the assets that will be uploaded.
 The release script then synchronizes sizes and SHA256 digests for the matching
 entry in `updates/releases.json`, keeping the fallback update endpoint valid.
@@ -363,16 +447,24 @@ The script downloads hash-pinned Inno Setup 6.7.3 and its Simplified and
 Traditional Chinese translations into `work/tools`; no global Inno Setup
 installation is required.
 
+Build and run the test suites without publishing the self-contained app:
+
+```powershell
+./build.ps1 -Configuration Debug -NoPublish
+```
+
 ## Architecture
 
 ```text
 iPhone/iPad
-  ├─ USB / QuickTime ─► H.264 / PCM decode ─┐
-  └─ AirPlay ─► WirelessHost ─► I420 / PCM ─┤
-                                             └─► native session
-                                                  ├─► D3D11 previews
-                                                  ├─► screenshot / OBS
-                                                  └─► WASAPI audio
+  ├─ USB / QuickTime ─► H.264 / PCM decode ─────────────┐
+  └─ AirPlay ─► WirelessHost / UxPlayHost ─► I420 / PCM ─┤
+                                                     └─► native session
+                                                   ├─► D3D11 previews
+                                                   ├─► screenshot / OBS
+                                                   ├─► FFmpeg MP4 / RTMP / SRT / WHIP
+                                                   ├─► Windows 11 virtual camera
+                                                   └─► WASAPI audio
 ```
 
 See [protocol](docs/PROTOCOL.md), [architecture](docs/ARCHITECTURE.md),
@@ -381,14 +473,19 @@ See [protocol](docs/PROTOCOL.md), [architecture](docs/ARCHITECTURE.md),
 [WASAPI audio](docs/WASAPI_AUDIO.md) documentation. Planned work is tracked in
 the [upgrade roadmap](docs/ROADMAP.md); roadmap items are not implemented features.
 
+For scripted device inspection and control, see the
+[local HTTP API](docs/api/README.md) and its Python and curl examples.
+
 ## Current limitations
 
-- Built-in recording and RTMP, SRT, and WebRTC/WHIP output include mirrored PCM audio when available and start immediately as video-only output otherwise; MP4, RTMP, and SRT encode AAC while WHIP encodes Opus.
+- Built-in recording and RTMP, SRT, and WebRTC/WHIP output include source audio when the audio track and required encoder are available, and otherwise start immediately as video-only output; MP4, RTMP, and SRT encode AAC while WHIP encodes Opus.
 - The app is not commercially code-signed.
 - The external driver installation matrix needs broader testing.
 - Apple does not publish Screen Capture as a stable third-party API.
 - AirPlay compatibility is unofficial and can change with future iOS releases.
 - Bluetooth control depends on BLE peripheral mode and iOS AssistiveTouch, and is limited to pointer-style single-touch operations.
+- Hardware decode availability depends on the Windows MFT and GPU driver; unsupported systems automatically use software decode while the preview remains D3D11-backed.
+- SDR outputs are tagged as full-range BT.709; HDR presentation still depends on the source, display, and receiving client.
 
 ## Contributing and security
 

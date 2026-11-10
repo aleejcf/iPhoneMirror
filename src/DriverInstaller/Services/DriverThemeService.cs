@@ -89,13 +89,21 @@ internal static class DriverThemeService
         {
             SwapThemeDictionary(application.Resources,
                 IsDark ? DarkThemePath : LightThemePath);
+            Wpf.Ui.Appearance.ApplicationThemeManager.Apply(
+                SystemParameters.HighContrast ? Wpf.Ui.Appearance.ApplicationTheme.HighContrast :
+                IsDark ? Wpf.Ui.Appearance.ApplicationTheme.Dark : Wpf.Ui.Appearance.ApplicationTheme.Light,
+                Wpf.Ui.Controls.WindowBackdropType.None, updateAccent: false);
+            IPhoneMirror.UI.Services.AccessibilityAppearance.Apply(application);
             foreach (Window window in application.Windows)
             {
                 ApplyBackdrop(window);
-                if (window.IsLoaded)
+                if (window.IsLoaded && SystemParameters.ClientAreaAnimation)
+                {
+                    var opacity = (double)window.GetAnimationBaseValue(UIElement.OpacityProperty);
                     window.BeginAnimation(UIElement.OpacityProperty,
-                        new DoubleAnimation(0.88, 1,
-                            TimeSpan.FromMilliseconds(180)));
+                        new DoubleAnimation(opacity * 0.88, opacity,
+                            TimeSpan.FromMilliseconds(180)) { FillBehavior = FillBehavior.Stop });
+                }
             }
         }
         if (persist) Save();
@@ -152,7 +160,7 @@ internal static class DriverThemeService
             return;
         var replacement = new ResourceDictionary
         {
-            Source = new Uri(path, UriKind.Relative),
+            Source = new Uri($"/{typeof(DriverThemeService).Assembly.GetName().Name};component/{path}", UriKind.Relative),
         };
         if (existing is null) resources.MergedDictionaries.Insert(0, replacement);
         else resources.MergedDictionaries[resources.MergedDictionaries.IndexOf(existing)] =
@@ -169,9 +177,9 @@ internal static class DriverThemeService
     private static void OnSystemPreferenceChanged(object sender,
         UserPreferenceChangedEventArgs args)
     {
-        if (Preference != DriverThemeMode.System || Application.Current is null) return;
+        if (Application.Current is null) return;
         _ = Application.Current.Dispatcher.BeginInvoke(() =>
-            Apply(DriverThemeMode.System, persist: false));
+            Apply(Preference, persist: false));
     }
 
     private static bool IsSystemDark()
@@ -201,7 +209,7 @@ internal static class DriverThemeService
             window.WindowState == WindowState.Maximized;
         var dark = IsDark ? 1 : 0;
         var corner = flushToDisplayEdge ? DwmDoNotRound : DwmRound;
-        var backdrop = DwmBackdropMica;
+        var backdrop = SystemParameters.HighContrast ? 1 : DwmBackdropMica;
         var border = flushToDisplayEdge ? DwmColorNone : DwmColorDefault;
         _ = DwmSetWindowAttribute(handle, DwmUseImmersiveDarkMode, ref dark, sizeof(int));
         _ = DwmSetWindowAttribute(handle, DwmWindowCornerPreference, ref corner, sizeof(int));

@@ -10,9 +10,11 @@ internal static partial class DriverConstants
     ];
 
     internal const string ElevatedSwitch = "--elevated-driver-operation";
+    internal const string RepairBonjourSwitch = "--repair-bonjour";
     internal const string AppleStoreProductId = "9NP83LWLPZ9K";
     internal const string AppleStoreSource = "msstore";
     internal const string AppleSupportMsiFileName = "AppleMobileDeviceSupport64.msi";
+    internal const string BonjourMsiFileName = "Bonjour64.msi";
     internal const string OfficialItunesDownloadUrl =
         "https://www.apple.com/itunes/download/win64";
     internal const string QqGroupNumber = "1050045279";
@@ -30,16 +32,28 @@ internal static partial class DriverConstants
     internal const string Dll32Hash =
         "00CACA07869B19D10B370552AC7CC2F6F2EE246FC15DB11650F6CD3F4EF9B666";
 
-    internal static string DataRoot => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-        "iPhoneMirror.Driver");
+    // .NET resolves CommonApplicationData from the ProgramData environment variable.
+    // The elevated bootstrap deliberately clears that environment. Read the
+    // machine's expanded shell-folder registration in both processes instead.
+    internal static string DataRoot => Path.Combine(GetMachineDataDirectory(), "iPhoneMirror.Driver");
+    private static string GetMachineDataDirectory()
+    {
+        using var machine = Microsoft.Win32.RegistryKey.OpenBaseKey(Microsoft.Win32.RegistryHive.LocalMachine,
+            Microsoft.Win32.RegistryView.Registry64);
+        using var folders = machine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders");
+        var path = folders?.GetValue("Common AppData", null,
+            Microsoft.Win32.RegistryValueOptions.DoNotExpandEnvironmentNames) as string;
+        if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path) || path.Contains('%'))
+            throw new IOException("Windows did not return an absolute shared driver data directory.");
+        return path;
+    }
     internal static string OperationsRoot => Path.Combine(DataRoot, "Operations");
     internal static string BackupsRoot => Path.Combine(DataRoot, "Backups");
     internal static string PackagesRoot => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "iPhoneMirror.Driver", "Packages");
 
-    [GeneratedRegex(@"^USB\\VID_05AC&PID_[0-9A-Fa-f]{4}\\[A-Za-z0-9][A-Za-z0-9-]{6,38}$",
+    [GeneratedRegex(@"^USB\\VID_05AC&PID_[0-9A-Fa-f]{4}\\[A-Za-z0-9][A-Za-z0-9-]{6,39}\z",
         RegexOptions.CultureInvariant)]
     private static partial Regex AppleParentPattern();
 
@@ -64,11 +78,6 @@ internal static partial class DriverConstants
 
     internal static bool IsValidOperationId(string value) =>
         Guid.TryParseExact(value, "N", out _);
-
-    internal static bool IsKnownReplaceableParentService(string service) =>
-        service.Equals("WinUSB", StringComparison.OrdinalIgnoreCase) ||
-        service.Equals("libusb0", StringComparison.OrdinalIgnoreCase) ||
-        service.Equals("libusbK", StringComparison.OrdinalIgnoreCase);
 
     internal static string NormalizeSerial(string value) => new(
         value.Where(char.IsLetterOrDigit).Select(char.ToUpperInvariant).ToArray());

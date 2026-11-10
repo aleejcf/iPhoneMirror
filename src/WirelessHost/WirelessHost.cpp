@@ -3,6 +3,7 @@
 #include "IpcProtocol.h"
 #include "DlnaRenderer.h"
 #include "HttpUrl.h"
+#include "HostCommon.h"
 
 #include <Windows.h>
 #include <bcrypt.h>
@@ -11,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -29,6 +31,8 @@
 #include <vector>
 
 namespace {
+
+using namespace iPhoneMirror::host_common;
 
 constexpr char StartExport[] = "?fgServerStart@@YAPEAXQEBDIIPEAVIAirServerCallback@@@Z";
 constexpr char StopExport[] = "?fgServerStop@@YAXPEAX@Z";
@@ -162,37 +166,63 @@ std::optional<DeviceMetadata> parse_device_metadata(std::string_view message) {
     };
 }
 
-bool write_all(HANDLE pipe, const void* source, std::size_t size,
-    DWORD* failure_reason = nullptr) noexcept {
-    const auto* bytes = static_cast<const std::uint8_t*>(source);
-    while (size != 0) {
-        DWORD written{};
-        const auto request = static_cast<DWORD>(std::min<std::size_t>(size, 1024U * 1024U));
-        if (!WriteFile(pipe, bytes, request, &written, nullptr)) {
-            if (failure_reason) *failure_reason = GetLastError();
-            return false;
+std::optional<iPhoneMirror::wireless::MessageHeader> parse_mirror_event(
+    std::string_view message) {
+    using namespace iPhoneMirror::wireless;
+    MessageHeader header;
+    std::size_t count{};
+    if (message.starts_with("IPHONE_MIRROR_VIDEO_STATE\t")) {
+        message.remove_prefix(std::string_view("IPHONE_MIRROR_VIDEO_STATE\t").size());
+        header.type = MessageType::MirrorState;
+        count = 2;
+    } else if (message.starts_with("IPHONE_MIRROR_VIDEO_GEOMETRY\t")) {
+        message.remove_prefix(std::string_view("IPHONE_MIRROR_VIDEO_GEOMETRY\t").size());
+        header.type = MessageType::MirrorGeometry;
+        count = 5;
+    } else return std::nullopt;
+    std::array<std::string_view, 5> fields{};
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto separator = message.find('\t');
+        if (index + 1 == count) {
+            if (separator != std::string_view::npos) return std::nullopt;
+            fields[index] = message;
+        } else {
+            if (separator == std::string_view::npos) return std::nullopt;
+            fields[index] = message.substr(0, separator);
+            message.remove_prefix(separator + 1);
         }
-        if (written == 0) {
-            if (failure_reason) *failure_reason = ERROR_BROKEN_PIPE;
-            return false;
-        }
-        bytes += written;
-        size -= written;
     }
-    return true;
+    if (fields[0].empty() || fields[0].size() >= DeviceIdBytes ||
+        !std::ranges::all_of(fields[0], [](unsigned char c) { return c >= 32 && c <= 126; }))
+        return std::nullopt;
+    std::memcpy(header.device_id, fields[0].data(), fields[0].size());
+    std::array<std::uint32_t, 4> numbers{};
+    for (std::size_t index = 1; index < count; ++index) {
+        const auto field = fields[index];
+        const auto [end, error] = std::from_chars(field.data(), field.data() + field.size(), numbers[index - 1]);
+        if (error != std::errc{} || end != field.data() + field.size()) return std::nullopt;
+    }
+    if (header.type == MessageType::MirrorState) {
+        if (numbers[0] > static_cast<std::uint32_t>(MirrorSenderState::Reconnecting)) return std::nullopt;
+        header.reserved = numbers[0];
+    } else {
+        if (!std::ranges::all_of(numbers, [](auto value) { return value > 0 && value <= 16384; }))
+            return std::nullopt;
+        header.stride[0] = numbers[0]; header.stride[1] = numbers[1];
+        header.width = numbers[2]; header.height = numbers[3];
+    }
+    return header;
 }
 
-bool read_all(HANDLE pipe, void* destination, std::size_t size) noexcept {
-    auto* bytes = static_cast<std::uint8_t*>(destination);
-    while (size != 0) {
-        DWORD read{};
-        const auto request = static_cast<DWORD>(std::min<std::size_t>(size, 1024U * 1024U));
-        if (!ReadFile(pipe, bytes, request, &read, nullptr) || read == 0) return false;
-        bytes += read;
-        size -= read;
-    }
-    return true;
+float airplay_decibels_to_linear_gain(float decibels) noexcept {
+    // The bundled AirPlay SDK reports RAOP volume in dB: 0 is full scale and
+    // -144 is mute. iPhone/iPad use -30..0 dB as the volume slider range,
+    // while the IPC contract and WASAPI renderer use a 0..1 slider value.
+    if (!std::isfinite(decibels) || decibels <= -30.0F) return 0.0F;
+    return std::clamp((decibels + 30.0F) / 30.0F, 0.0F, 1.0F);
 }
+
+
 
 class IpcWriter {
 public:
@@ -222,6 +252,10 @@ public:
             }
 
             if (header.type == iPhoneMirror::wireless::MessageType::Video) {
+                // Keep one latest pending frame per device, including while
+                // another frame is inside WriteFile. Equal dimensions do not
+                // imply equal pixels; a static AirPlay screen may never send
+                // another frame after its final update.
                 for (auto position = queue_.begin(); position != queue_.end();) {
                     if (position->header.type == iPhoneMirror::wireless::MessageType::Video &&
                         std::strncmp(position->header.device_id, header.device_id,
@@ -397,6 +431,30 @@ private:
                 }
                 message = std::move(queue_.front());
                 queue_.pop_front();
+            }
+
+            // A large original-quality frame may still be in the writer's
+            // local buffer when iOS rotates. If a newer frame for the same
+            // device is already queued, discard this stale frame before
+            // entering WriteFile so rotation is not hidden behind an old
+            // multi-megabyte payload.
+            if (message.header.type == iPhoneMirror::wireless::MessageType::Video) {
+                std::scoped_lock lock(mutex_);
+                const auto newer = std::ranges::any_of(queue_,
+                    [&message](const QueuedMessage& queued) {
+                        return queued.header.type ==
+                                iPhoneMirror::wireless::MessageType::Video &&
+                            std::strncmp(queued.header.device_id,
+                                message.header.device_id,
+                                iPhoneMirror::wireless::DeviceIdBytes) == 0 &&
+                            queued.header.sequence > message.header.sequence;
+                    });
+                if (newer) {
+                    buffered_bytes_ -= message.size();
+                    --buffered_messages_;
+                    dropped_video_.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
             }
 
             DWORD write_error = ERROR_SUCCESS;
@@ -691,7 +749,8 @@ public:
     void setVolume(float volume, const char* remote_name,
         const char* remote_device_id) override {
         const auto valid = std::isfinite(volume);
-        const auto normalized = valid ? std::clamp(volume, 0.0F, 1.0F) : 0.0F;
+        const auto normalized = valid
+            ? airplay_decibels_to_linear_gain(volume) : 0.0F;
         iPhoneMirror::wireless::MessageHeader header;
         header.type = iPhoneMirror::wireless::MessageType::MediaVolume;
         header.reserved = static_cast<std::uint32_t>(
@@ -708,11 +767,11 @@ public:
         if (valid && has_device && !sent)
             media_send_failures_.fetch_add(1, std::memory_order_relaxed);
         diagnostic(std::format(
-            "callback volume remote_fp={} device_fp={} value={:.3f} "
+            "callback volume remote_fp={} device_fp={} db={:.3f} gain={:.3f} "
             "valid={} has_device={} sent={}",
             anonymous_label(safe_text(remote_name)),
             anonymous_label(safe_text(remote_device_id)),
-            normalized, valid, has_device, sent));
+            volume, normalized, valid, has_device, sent));
     }
 
     void mediaVolume(double volume,
@@ -761,6 +820,29 @@ public:
 
     void log(int level, const char* message) override {
         const auto text = safe_text(message);
+        constexpr std::string_view video_diagnostic_prefix = "IPHONE_MIRROR_VIDEO_DIAG ";
+        if (text.starts_with(video_diagnostic_prefix)) {
+            auto fields = text.substr(video_diagnostic_prefix.size());
+            std::array<int, 7> numbers{};
+            bool valid = true;
+            for (auto& number : numbers) {
+                const auto separator = fields.find(' ');
+                const auto field = fields.substr(0, separator);
+                const auto [end, error] = std::from_chars(field.data(), field.data() + field.size(), number);
+                if (error != std::errc{} || end != field.data() + field.size()) { valid = false; break; }
+                if (separator == std::string_view::npos) fields = {};
+                else fields.remove_prefix(separator + 1);
+            }
+            if (valid && fields.empty()) {
+                diagnostic(std::format("video_diag event={} values={},{},{},{},{},{}",
+                    numbers[0], numbers[1], numbers[2], numbers[3], numbers[4], numbers[5], numbers[6]));
+                return;
+            }
+        }
+        if (const auto event = parse_mirror_event(text)) {
+            if (!writer_.send(*event)) send_failures_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         if (const auto metadata = parse_device_metadata(text)) {
             const auto sent = writer_.send_device_info(*metadata);
             diagnostic(std::format("device metadata device_fp={} model={} os={} sent={}",
@@ -921,8 +1003,11 @@ public:
 private:
     IpcWriter& writer_;
     std::mutex playback_mutex_;
-    std::uint64_t media_command_id_{GetTickCount64() << 16};
-    std::atomic_uint64_t mirror_volume_command_id_{GetTickCount64() << 16};
+    // Mask the tick count to 48 bits before shifting so the high bits are not
+    // truncated, keeping the command ids distinct from mirror_volume_command_id_.
+    static constexpr std::uint64_t TickMask = 0x0000FFFFFFFFFFFFULL;
+    std::uint64_t media_command_id_{(GetTickCount64() & TickMask) << 16};
+    std::atomic_uint64_t mirror_volume_command_id_{(GetTickCount64() & TickMask) << 16};
     PlaybackState playback_;
     std::atomic_uint64_t audio_callbacks_{};
     std::atomic_uint64_t video_callbacks_{};
@@ -937,17 +1022,6 @@ private:
     std::atomic_uint64_t suppressed_log_callbacks_{};
 };
 
-std::wstring argument_value(int argc, wchar_t** argv, std::wstring_view name) {
-    for (int index = 1; index + 1 < argc; ++index)
-        if (std::wstring_view(argv[index]) == name) return argv[index + 1];
-    return {};
-}
-
-bool has_argument(int argc, wchar_t** argv, std::wstring_view name) noexcept {
-    for (int index = 1; index < argc; ++index)
-        if (std::wstring_view(argv[index]) == name) return true;
-    return false;
-}
 
 unsigned int argument_uint(int argc, wchar_t** argv, std::wstring_view name,
     unsigned int fallback) noexcept {
@@ -963,24 +1037,7 @@ unsigned int argument_uint(int argc, wchar_t** argv, std::wstring_view name,
     }
 }
 
-bool supported_capability(unsigned int width, unsigned int height,
-    unsigned int fps) noexcept {
-    return (width == 5120 && height == 2880 && fps == 60) ||
-        (width == 1920 && height == 1080 && fps == 60) ||
-        (width == 1280 && height == 720 && fps == 30) ||
-        (width == 960 && height == 540 && fps == 30);
-}
 
-std::string utf8(std::wstring_view value) {
-    if (value.empty()) return {};
-    const auto length = WideCharToMultiByte(CP_UTF8, 0, value.data(),
-        static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
-    if (length <= 0) return {};
-    std::string result(static_cast<std::size_t>(length), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
-        result.data(), length, nullptr, nullptr);
-    return result;
-}
 
 bool set_airplay_environment(std::wstring_view name,
     std::wstring_view value) {
@@ -1064,13 +1121,6 @@ std::wstring dlna_receiver_name(std::wstring name) {
     return name;
 }
 
-std::filesystem::path executable_directory() {
-    std::wstring path(32768, L'\0');
-    const auto length = GetModuleFileNameW(nullptr, path.data(),
-        static_cast<DWORD>(path.size()));
-    path.resize(length);
-    return std::filesystem::path(path).parent_path();
-}
 
 struct AirPlayLibraryLoad {
     HMODULE library{};
@@ -1096,14 +1146,6 @@ void close_airplay_library(const AirPlayLibraryLoad& loaded) noexcept {
     if (loaded.search_cookie) RemoveDllDirectory(loaded.search_cookie);
 }
 
-bool is_code_integrity_error(DWORD error) noexcept {
-    return error == ERROR_INVALID_IMAGE_HASH ||
-        error == ERROR_ACCESS_DISABLED_BY_POLICY ||
-        (error >= ERROR_SYSTEM_INTEGRITY_ROLLBACK_DETECTED &&
-            error <= ERROR_SYSTEM_INTEGRITY_REPUTATION_OFFLINE) ||
-        (error >= ERROR_SYSTEM_INTEGRITY_REPUTATION_UNFRIENDLY_FILE &&
-            error <= ERROR_SYSTEM_INTEGRITY_WHQL_NOT_SATISFIED);
-}
 
 DWORD probe_image(const std::filesystem::path& path) noexcept {
     const auto file = CreateFileW(path.c_str(), GENERIC_READ,
@@ -1155,17 +1197,6 @@ int preflight_airplay_runtime(const std::filesystem::path& path) noexcept {
     return exports_available ? 0 : 42;
 }
 
-HANDLE connect_pipe(const std::wstring& pipe_name) {
-    for (int attempt = 0; attempt < 100; ++attempt) {
-        const auto pipe = CreateFileW(pipe_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (pipe != INVALID_HANDLE_VALUE) return pipe;
-        if (GetLastError() != ERROR_PIPE_BUSY && GetLastError() != ERROR_FILE_NOT_FOUND)
-            return INVALID_HANDLE_VALUE;
-        WaitNamedPipeW(pipe_name.c_str(), 100);
-    }
-    return INVALID_HANDLE_VALUE;
-}
 
 bool receive_playback_updates(HANDLE pipe, AirPlayCallback& callback,
     iPhoneMirror::wireless::DlnaRenderer& dlna, DWORD* failure_reason = nullptr) noexcept {
@@ -1202,6 +1233,7 @@ bool receive_playback_updates(HANDLE pipe, AirPlayCallback& callback,
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    using namespace iPhoneMirror::host_common;
     // LoadLibrary failures must be reported through IPC/preflight instead of a
     // system "Bad Image" dialog that incorrectly describes policy blocks as corruption.
     SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS);
@@ -1219,7 +1251,12 @@ int wmain(int argc, wchar_t** argv) {
     const auto airplay_port = argument_uint(argc, argv, L"--airplay-port", 7001);
     const auto dlna_port = argument_uint(argc, argv, L"--dlna-port", 8090);
     const auto dlna_ssdp_port = argument_uint(argc, argv, L"--dlna-ssdp-port", 1900);
-    const auto directory = executable_directory();
+    std::filesystem::path directory;
+    try {
+        directory = executable_directory();
+    } catch (...) {
+        return 4;
+    }
     const auto library_path = library_override.empty()
         ? directory / L"airplay2dll.dll"
         : std::filesystem::absolute(std::filesystem::path(library_override));

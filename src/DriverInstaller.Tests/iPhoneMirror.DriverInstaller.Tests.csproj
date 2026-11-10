@@ -12,13 +12,21 @@
     <Compile Include="..\Shared\Networking\SegmentedHttpDownloader.cs" Link="Networking\SegmentedHttpDownloader.cs" />
     <Compile Include="..\Shared\Security\ElevationPathLock.cs" Link="Security\ElevationPathLock.cs" />
     <Compile Include="..\DriverInstaller\Models\DriverModels.cs" Link="DriverModels.cs" />
+    <Compile Include="..\DriverInstaller\Services\DriverOperationSafety.cs" Link="DriverOperationSafety.cs" />
     <Compile Include="..\DriverInstaller\Services\DriverConstants.cs" Link="DriverConstants.cs" />
+    <Compile Include="..\DriverInstaller\Services\ParentDriverPolicy.cs" Link="ParentDriverPolicy.cs" />
+    <Compile Include="..\DriverInstaller\Services\ParentDriverNative.cs" Link="ParentDriverNative.cs" />
+    <Compile Include="..\DriverInstaller\Services\ParentDriverChange.cs" Link="ParentDriverChange.cs" />
     <Compile Include="..\DriverInstaller\Services\DriverPayload.cs" Link="DriverPayload.cs" />
     <Compile Include="..\DriverInstaller\Services\DriverLogger.cs" Link="DriverLogger.cs" />
     <Compile Include="..\DriverInstaller\Services\DriverOperationClient.cs" Link="DriverOperationClient.cs" />
+    <Compile Include="..\DriverInstaller\Services\DriverElevationBootstrap.cs" Link="DriverElevationBootstrap.cs" />
+    <EmbeddedResource Include="..\DriverInstaller\Services\DriverElevation.Bootstrap.ps1"
+                      LogicalName="DriverElevation.Bootstrap.ps1" />
     <Compile Include="..\DriverInstaller\Services\DriverLocalization.cs" Link="DriverLocalization.cs" />
     <Compile Include="..\DriverInstaller\Services\DeviceCatalog.cs" Link="DeviceCatalog.cs" />
     <Compile Include="..\DriverInstaller\Services\AppleDeviceMetadataReader.cs" Link="AppleDeviceMetadataReader.cs" />
+    <Compile Include="..\DriverInstaller\Services\AppleMuxSupportProbe.cs" Link="AppleMuxSupportProbe.cs" />
     <Compile Include="..\DriverInstaller\Services\AppleProductNames.cs" Link="AppleProductNames.cs" />
     <Compile Include="..\DriverInstaller\Services\AppleSoftwareUpdateCatalog.cs" Link="AppleSoftwareUpdateCatalog.cs" />
     <Compile Include="..\DriverInstaller\Services\AppleSupportInstaller.cs" Link="AppleSupportInstaller.cs" />

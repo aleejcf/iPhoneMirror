@@ -1,0 +1,66 @@
+{
+  "repository": "doronz88/DeveloperDiskImage",
+  "revision": "6eae353ae694bda1c421d4a3eee5459ae59c99a1",
+  "bundles": [
+    {
+      "directory": "Xcode_iOS_DDI_Personalized",
+      "build": "27A5228h",
+      "files": [
+        {
+          "name": "Image.dmg",
+          "upstream_name": "Image.dmg",
+          "size": 15733248,
+          "sha256": "05fd807da5e19f030fa4941f24800c965c6c77982ab572dd5d1ef778fb69f9ca"
+        },
+        {
+          "name": "BuildManifest.plist",
+          "upstream_name": "BuildManifest.plist",
+          "size": 801505,
+          "sha256": "8edd4a2f4f4ef1fbd7bfe49785d8badc673d1395d1d94d85b132ca8ab5ecaf54"
+        },
+        {
+          "name": "Image.trustcache",
+          "upstream_name": "Image.dmg.trustcache",
+          "size": 1895,
+          "sha256": "36af60889ff5a737874a26daeb8e1a0139ebfebec6ec2e4d8f6a3c1bf1dce35c"
+        }
+      ]
+    },
+    {
+      "directory": "Xcode_iOS_DDI_Cryptex",
+      "build": "27A5228h",
+      "files": [
+        {
+          "name": "BuildManifest.plist",
+          "upstream_name": "BuildManifest.plist",
+          "size": 804946,
+          "sha256": "27385d7582b03b36bb3104e22b520aee0c47d72fecb4e8ecfe12ef5d966c7012"
+        },
+        {
+          "name": "Image.dmg",
+          "upstream_name": "Image.dmg",
+          "size": 15895040,
+          "sha256": "873097f695a8b9734e2abc54f795a8874d40ff6fd11208ecb01ef29534c7c176"
+        },
+        {
+          "name": "Image.dmg.trustcache",
+          "upstream_name": "Image.dmg.trustcache",
+          "size": 1895,
+          "sha256": "f7f21986074eee03a215aca16ecfc78d6bf183600d8a0d2fb691f9896782e6f0"
+        },
+        {
+          "name": "Image.dmg.cryptex_info",
+          "upstream_name": "Image.dmg.cryptex_info",
+          "size": 430,
+          "sha256": "edf49aef55aacc063d4d7be05b713bb545ce2993b3f62bcc15eccd75e610ee6c"
+        },
+        {
+          "name": "Image.dmg.root_hash",
+          "upstream_name": "Image.dmg.root_hash",
+          "size": 229,
+          "sha256": "3543fad2805b88119695c417e12679380b3b5a2742994bbcc839c8e2de5d7302"
+        }
+      ]
+    }
+  ]
+}

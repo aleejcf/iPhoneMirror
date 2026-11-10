@@ -10,9 +10,9 @@ using IPhoneMirror.App.Updater;
 
 namespace IPhoneMirror.App.Windows;
 
-public partial class UpdateWindow : Wpf.Ui.Controls.FluentWindow, INotifyPropertyChanged
+public partial class UpdateWindow : IPhoneMirror.UI.Controls.RoundedWindow, INotifyPropertyChanged
 {
-    private readonly ReleaseInfo _release;
+    private ReleaseInfo _release;
     private readonly GitHubReleaseClient _client;
     private readonly bool _allowMirrorFallback;
     private readonly bool _readOnlyPreview;
@@ -24,20 +24,22 @@ public partial class UpdateWindow : Wpf.Ui.Controls.FluentWindow, INotifyPropert
     private string _statusText;
     private string _speedText = string.Empty;
     private string _updateButtonText;
+    private string _displayedReleaseBody = string.Empty;
+    private bool _loadingTaiwanNotes;
 
     public event PropertyChangedEventHandler? PropertyChanged;
     public string CurrentVersion => VersionManager.DisplayVersion;
     public string LatestVersion => _release.TagName;
-    public string ReleaseName => _release.Name;
+    public string ReleaseName => LocalizationService.RefreshText(_release.Name);
     public string PublishedAt => _release.PublishedAt.LocalDateTime.ToString("yyyy-MM-dd");
     public Visibility ProgressVisibility => _downloading || !string.IsNullOrWhiteSpace(StatusText)
         ? Visibility.Visible : Visibility.Collapsed;
     public bool CanUpdate => !_downloading && !_readOnlyPreview;
     public double ProgressValue { get => _progressValue; private set { _progressValue = value; OnPropertyChanged(); } }
     public bool IsIndeterminate { get => _isIndeterminate; private set { _isIndeterminate = value; OnPropertyChanged(); } }
-    public string StatusText { get => _statusText; private set { _statusText = value; OnPropertyChanged(); OnPropertyChanged(nameof(ProgressVisibility)); } }
+    public string StatusText { get => LocalizationService.RefreshText(_statusText); private set { _statusText = value; OnPropertyChanged(); OnPropertyChanged(nameof(ProgressVisibility)); } }
     public string SpeedText { get => _speedText; private set { _speedText = value; OnPropertyChanged(); } }
-    public string UpdateButtonText { get => _updateButtonText; private set { _updateButtonText = value; OnPropertyChanged(); } }
+    public string UpdateButtonText { get => LocalizationService.RefreshText(_updateButtonText); private set { _updateButtonText = value; OnPropertyChanged(); } }
 
     // Keep the historical constructor shape available to reflection-based
     // runtime tests and other in-process preview callers. Optional parameters
@@ -62,12 +64,51 @@ public partial class UpdateWindow : Wpf.Ui.Controls.FluentWindow, INotifyPropert
         DataContext = this;
         InitializeComponent();
         ThemeService.Attach(this);
-        ReleaseNotesViewer.Document = MarkdownFlowDocumentRenderer.Render(release.Body);
+        LocalizationService.RefreshWhenLanguageChanges(this, () =>
+        {
+            OnPropertyChanged(nameof(StatusText));
+            OnPropertyChanged(nameof(UpdateButtonText));
+            OnPropertyChanged(nameof(ReleaseName));
+            RefreshReleaseNotes();
+            _ = EnsureTaiwanReleaseNotesAsync();
+        });
+        RefreshReleaseNotes();
         Loaded += (_, _) =>
         {
+            _ = EnsureTaiwanReleaseNotesAsync();
             if (autoDownload) _ = DownloadAndInstallAsync();
         };
         Closing += OnClosing;
+    }
+
+    private void RefreshReleaseNotes()
+    {
+        var body = LocalizationService.RefreshText(_readOnlyPreview
+            ? _release.Body : LocalizedReleaseNotes.Body(_release));
+        if (body == _displayedReleaseBody && ReleaseNotesViewer.Document is not null) return;
+        _displayedReleaseBody = body;
+        ReleaseNotesViewer.Document = MarkdownFlowDocumentRenderer.Render(body);
+    }
+
+    private async Task EnsureTaiwanReleaseNotesAsync()
+    {
+        if (_readOnlyPreview || !IsLoaded || _loadingTaiwanNotes || _release.TaiwanNotesChecked ||
+            LocalizationService.EffectiveCulture.Name != LocalizationService.TraditionalChineseTaiwan ||
+            LocalizedReleaseNotes.TaiwanBody(_release) is not null) return;
+        _loadingTaiwanNotes = true;
+        var token = _cancellation.Token;
+        try
+        {
+            _release = await _client.EnrichTaiwanReleaseNotesAsync(_release, token);
+            if (!token.IsCancellationRequested) RefreshReleaseNotes();
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception error)
+        {
+            DiagnosticLogger.Exception("updater", "taiwan_notes_refresh_failed", error,
+                ("release", _release.TagName));
+        }
+        finally { _loadingTaiwanNotes = false; }
     }
 
     private async void OnUpdateClick(object sender, RoutedEventArgs e) =>
@@ -76,6 +117,10 @@ public partial class UpdateWindow : Wpf.Ui.Controls.FluentWindow, INotifyPropert
     private async Task DownloadAndInstallAsync()
     {
         if (_downloading) return;
+        // Capture the token up front. OnClosing disposes _cancellation; reading
+        // _cancellation.IsCancellationRequested in the catch filter after that
+        // would throw ObjectDisposedException.
+        var token = _cancellation.Token;
         _downloading = true;
         UpdateButtonText = LocalizationService.Get("DownloadingUpdate");
         StatusText = LocalizationService.Get("PreparingDownload");
@@ -88,23 +133,25 @@ public partial class UpdateWindow : Wpf.Ui.Controls.FluentWindow, INotifyPropert
                 IsIndeterminate = true;
                 ProgressValue = 0;
                 SpeedText = string.Empty;
-                StatusText = LocalizationService.Get(value.Phase ==
-                    UpdateDownloadPhase.ConnectivityTest
-                        ? "TestingUpdateRoutes"
-                        : "MeasuringUpdateRoutes");
+                StatusText = LocalizationService.Get(value.Phase switch
+                {
+                    UpdateDownloadPhase.ConnectivityTest => "TestingUpdateRoutes",
+                    UpdateDownloadPhase.Verification => "VerifyingDownload",
+                    _ => "MeasuringUpdateRoutes",
+                });
                 return;
             }
             IsIndeterminate = value.Percentage is null;
             ProgressValue = value.Percentage ?? 0;
             StatusText = value.Percentage is double percentage
-                ? string.Format(LocalizationService.Get("DownloadProgressFormat"), percentage)
+                ? LocalizationService.Format("DownloadProgressFormat", percentage)
                 : LocalizationService.Get("DownloadingUpdate");
             SpeedText = FormatSpeed(value.BytesPerSecond);
         });
         try
         {
             var downloaded = await _client.DownloadAsync(_release, progress,
-                _cancellation.Token, _allowMirrorFallback);
+                token, _allowMirrorFallback);
             StatusText = downloaded.HashVerified
                 ? LocalizationService.Get("UpdateVerified")
                 : LocalizationService.Get("UpdateDownloadedNoChecksum");
@@ -118,7 +165,7 @@ public partial class UpdateWindow : Wpf.Ui.Controls.FluentWindow, INotifyPropert
             // if Setup is cancelled or fails earlier, the app remains usable.
             Close();
         }
-        catch (OperationCanceledException) when (_cancellation.IsCancellationRequested)
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
             DiagnosticLogger.Info("updater", "download_cancelled",
                 ("release", _release.TagName));
@@ -128,7 +175,7 @@ public partial class UpdateWindow : Wpf.Ui.Controls.FluentWindow, INotifyPropert
         {
             DiagnosticLogger.Exception("updater", "update_workflow_failed", error,
                 ("release", _release.TagName));
-            StatusText = string.Format(LocalizationService.Get("UpdateDownloadFailedFormat"),
+            StatusText = LocalizationService.Format("UpdateDownloadFailedFormat",
                 FriendlyError(error));
             UpdateButtonText = LocalizationService.Get("RetryUpdate");
             IsIndeterminate = false;
@@ -160,6 +207,8 @@ public partial class UpdateWindow : Wpf.Ui.Controls.FluentWindow, INotifyPropert
     private void OnClosing(object? sender, CancelEventArgs e)
     {
         if (!_installationStarted) _cancellation.Cancel();
+        // Release the cancellation source now that the window is closing.
+        _cancellation.Dispose();
     }
 
     private void OnLaterClick(object sender, RoutedEventArgs e) => Close();
@@ -176,7 +225,7 @@ public partial class UpdateWindow : Wpf.Ui.Controls.FluentWindow, INotifyPropert
             DiagnosticLogger.Exception("shell", "open_target_failed", error,
                 ("target", target));
             AppPromptWindow.Inform(LocalizationService.Get("OpenLinkFailedTitle"),
-                error.Message);
+                LocalizationService.Get("GeneralOperationFailed"));
         }
     }
 

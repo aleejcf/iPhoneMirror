@@ -1,6 +1,16 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(iPhoneMirror VERSION 1.8.1 LANGUAGES CXX)
+project(iPhoneMirror VERSION 1.8.4 LANGUAGES CXX)
+
+set(IPHONEMIRROR_VERSION "${PROJECT_VERSION}" CACHE STRING
+    "Product version embedded in native binaries")
+string(REGEX REPLACE "^([0-9]+\\.[0-9]+\\.[0-9]+)(-.*)?$" "\\1" IPHONEMIRROR_BASE_VERSION "${IPHONEMIRROR_VERSION}")
+string(REPLACE "." "," IPHONEMIRROR_FILE_VERSION "${IPHONEMIRROR_BASE_VERSION}")
+set(IPHONEMIRROR_FILE_VERSION "${IPHONEMIRROR_FILE_VERSION},0")
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Core/resources/iPhoneMirror.Core.rc.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/src/Core/iPhoneMirror.Core.rc"
+    @ONLY)
 
 if(NOT WIN32)
     message(FATAL_ERROR "iPhoneMirror currently targets Windows 10/11 only")
@@ -21,4 +31,5 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 add_subdirectory(src/Core)
 add_subdirectory(src/WirelessHost)
+add_subdirectory(src/UxPlayHost)
 add_subdirectory(src/VirtualCamera)

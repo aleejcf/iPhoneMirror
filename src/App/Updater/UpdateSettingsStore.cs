@@ -1,6 +1,7 @@
 using System.IO;
 using System.Text.Json;
 using IPhoneMirror.App.Services;
+using IPhoneMirror.App.Models;
 
 namespace IPhoneMirror.App.Updater;
 
@@ -15,18 +16,26 @@ public enum ApplicationDisplayMode
 {
     Complete,
     Lightweight,
+    Tray,
 }
 
 internal sealed class UpdateSettings
 {
+    public Services.Automation.AutomationSettings AutomationApi { get; set; } = new();
+    public Dictionary<string, DeviceVideoPreferences> DeviceVideoPreferences { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public KeyboardMappingSettings KeyboardMapping { get; set; } = new();
     public bool CheckOnStartup { get; set; } = true;
     public bool AutoDownload { get; set; }
-    public bool AllowMirrorFallback { get; set; } = true;
+    public bool AllowMirrorFallback { get; set; } = false;
     public bool NotifyStableReleases { get; set; } = true;
     public bool NotifyPrereleaseReleases { get; set; }
     public AppTheme Theme { get; set; } = AppTheme.System;
     public ApplicationDisplayMode ApplicationDisplayMode { get; set; } =
         ApplicationDisplayMode.Complete;
+    public WirelessReceiverBackend WirelessReceiverBackend { get; set; } =
+        WirelessReceiverBackend.Original;
+    public string WirelessDisplayProfileId { get; set; } = "1080p";
+    public string WirelessReceiverName { get; set; } = WirelessReceiverConfiguration.DefaultReceiverName;
     public string Language { get; set; } = "system";
     public double BluetoothMouseSensitivity { get; set; } = 500;
     public int BluetoothMouseSensitivitySchema { get; set; }
@@ -43,13 +52,24 @@ internal sealed class UpdateSettings
     public int BluetoothControlShortcutVirtualKey { get; set; } = 0x78;
     public int BluetoothControlShortcutModifiers { get; set; }
     public int BluetoothControlShortcutSchema { get; set; }
+    public int BluetoothModeShortcutVirtualKey { get; set; } = 0x78;
+    public int BluetoothModeShortcutModifiers { get; set; }
+    public int BluetoothModeShortcutSchema { get; set; }
+    public int WirelessModeShortcutVirtualKey { get; set; }
+    public int WirelessModeShortcutModifiers { get; set; }
+    public int WiredModeShortcutVirtualKey { get; set; }
+    public int WiredModeShortcutModifiers { get; set; }
+    public int BluetoothVolumeUpShortcutVirtualKey { get; set; }
+    public int BluetoothVolumeUpShortcutModifiers { get; set; }
+    public int BluetoothVolumeDownShortcutVirtualKey { get; set; }
+    public int BluetoothVolumeDownShortcutModifiers { get; set; }
     public int BluetoothControlCenterShortcutVirtualKey { get; set; }
     public int BluetoothControlCenterShortcutModifiers { get; set; }
     public int BluetoothNotificationCenterShortcutVirtualKey { get; set; }
     public int BluetoothNotificationCenterShortcutModifiers { get; set; }
-    public int BluetoothAppSwitcherShortcutVirtualKey { get; set; }
+    public int BluetoothAppSwitcherShortcutVirtualKey { get; set; } = (int)KeyboardShortcut.MouseMiddle;
     public int BluetoothAppSwitcherShortcutModifiers { get; set; }
-    public int BluetoothHomeShortcutVirtualKey { get; set; }
+    public int BluetoothHomeShortcutVirtualKey { get; set; } = (int)KeyboardShortcut.MouseRight;
     public int BluetoothHomeShortcutModifiers { get; set; }
     public int BluetoothBackShortcutVirtualKey { get; set; }
     public int BluetoothBackShortcutModifiers { get; set; }
@@ -83,6 +103,9 @@ internal sealed class UpdateSettings
 
     internal UpdateSettings Clone() => new()
     {
+        AutomationApi = (AutomationApi ?? new()).Clone(),
+        DeviceVideoPreferences = new(DeviceVideoPreferences ?? [], StringComparer.OrdinalIgnoreCase),
+        KeyboardMapping = KeyboardMapping.Clone(),
         CheckOnStartup = CheckOnStartup,
         AutoDownload = AutoDownload,
         AllowMirrorFallback = AllowMirrorFallback,
@@ -90,6 +113,9 @@ internal sealed class UpdateSettings
         NotifyPrereleaseReleases = NotifyPrereleaseReleases,
         Theme = Theme,
         ApplicationDisplayMode = ApplicationDisplayMode,
+        WirelessReceiverBackend = WirelessReceiverBackend,
+        WirelessDisplayProfileId = WirelessDisplayProfileId,
+        WirelessReceiverName = WirelessReceiverName,
         Language = Language,
         BluetoothMouseSensitivity = BluetoothMouseSensitivity,
         BluetoothMouseSensitivitySchema = BluetoothMouseSensitivitySchema,
@@ -106,6 +132,17 @@ internal sealed class UpdateSettings
         BluetoothControlShortcutVirtualKey = BluetoothControlShortcutVirtualKey,
         BluetoothControlShortcutModifiers = BluetoothControlShortcutModifiers,
         BluetoothControlShortcutSchema = BluetoothControlShortcutSchema,
+        BluetoothModeShortcutVirtualKey = BluetoothModeShortcutVirtualKey,
+        BluetoothModeShortcutModifiers = BluetoothModeShortcutModifiers,
+        BluetoothModeShortcutSchema = BluetoothModeShortcutSchema,
+        WirelessModeShortcutVirtualKey = WirelessModeShortcutVirtualKey,
+        WirelessModeShortcutModifiers = WirelessModeShortcutModifiers,
+        WiredModeShortcutVirtualKey = WiredModeShortcutVirtualKey,
+        WiredModeShortcutModifiers = WiredModeShortcutModifiers,
+        BluetoothVolumeUpShortcutVirtualKey = BluetoothVolumeUpShortcutVirtualKey,
+        BluetoothVolumeUpShortcutModifiers = BluetoothVolumeUpShortcutModifiers,
+        BluetoothVolumeDownShortcutVirtualKey = BluetoothVolumeDownShortcutVirtualKey,
+        BluetoothVolumeDownShortcutModifiers = BluetoothVolumeDownShortcutModifiers,
         BluetoothControlCenterShortcutVirtualKey = BluetoothControlCenterShortcutVirtualKey,
         BluetoothControlCenterShortcutModifiers = BluetoothControlCenterShortcutModifiers,
         BluetoothNotificationCenterShortcutVirtualKey = BluetoothNotificationCenterShortcutVirtualKey,
@@ -175,6 +212,7 @@ internal sealed class UpdateSettingsStore
                 BluetoothMouseSettingsSchema = 1,
                 BluetoothMouseDirectionSchema = 1,
                 BluetoothControlShortcutSchema = 1,
+                BluetoothModeShortcutSchema = 1,
                 BluetoothShortcutSchema = 6,
                 BluetoothHidReportMapVersion = BluetoothHidProtocol.ReportMapVersion,
                 BluetoothHidReportMapAcknowledgedVersion = BluetoothHidProtocol.ReportMapVersion,
@@ -185,6 +223,32 @@ internal sealed class UpdateSettingsStore
             if (!Enum.IsDefined(settings.ApplicationDisplayMode))
             {
                 settings.ApplicationDisplayMode = ApplicationDisplayMode.Complete;
+                migrationChanged = true;
+            }
+            if (!Enum.IsDefined(settings.WirelessReceiverBackend))
+            {
+                settings.WirelessReceiverBackend = WirelessReceiverBackend.Original;
+                migrationChanged = true;
+            }
+            var normalizedProfileId = settings.WirelessDisplayProfileId?.Trim().ToLowerInvariant();
+            if (!WirelessReceiverConfiguration.DisplayProfiles.Any(profile =>
+                    string.Equals(profile.Id, normalizedProfileId, StringComparison.OrdinalIgnoreCase)))
+            {
+                settings.WirelessDisplayProfileId = "1080p";
+                migrationChanged = true;
+            }
+            else if (!string.Equals(settings.WirelessDisplayProfileId, normalizedProfileId,
+                StringComparison.Ordinal))
+            {
+                settings.WirelessDisplayProfileId = normalizedProfileId!;
+                migrationChanged = true;
+            }
+            var normalizedReceiverName = WirelessReceiverConfiguration.SanitizeReceiverName(
+                settings.WirelessReceiverName);
+            if (!string.Equals(settings.WirelessReceiverName, normalizedReceiverName,
+                StringComparison.Ordinal))
+            {
+                settings.WirelessReceiverName = normalizedReceiverName;
                 migrationChanged = true;
             }
             settings.BluetoothControlDeviceBindings = NormalizeBluetoothBindings(
@@ -235,6 +299,22 @@ internal sealed class UpdateSettingsStore
                 settings.BluetoothControlShortcutVirtualKey = 0x78;
                 settings.BluetoothControlShortcutModifiers = 0;
                 settings.BluetoothControlShortcutSchema = 1;
+            }
+            if (settings.BluetoothModeShortcutSchema < 1)
+            {
+                // Older builds persisted this field as zero even though the
+                // intended default shortcut is F9. Preserve valid custom
+                // shortcuts, but migrate the legacy zero value once.
+                if (!KeyboardShortcut.IsValid(settings.BluetoothModeShortcutModifiers,
+                        settings.BluetoothModeShortcutVirtualKey) ||
+                    settings.BluetoothModeShortcutVirtualKey == 0 &&
+                    settings.BluetoothModeShortcutModifiers == 0)
+                {
+                    settings.BluetoothModeShortcutVirtualKey = 0x78;
+                    settings.BluetoothModeShortcutModifiers = 0;
+                }
+                settings.BluetoothModeShortcutSchema = 1;
+                migrationChanged = true;
             }
             if (settings.BluetoothShortcutSchema < 3)
             {
@@ -324,12 +404,14 @@ internal sealed class UpdateSettingsStore
                 settings.BluetoothSiriShortcutModifiers = 0;
                 settings.BluetoothShortcutSchema = 6;
             }
-            if (!KeyboardShortcut.IsValid(settings.BluetoothBossShortcutModifiers,
-                    settings.BluetoothBossShortcutVirtualKey))
+            var bossKey = KeyboardShortcut.FromSettings(settings, BluetoothShortcutAction.BossKey);
+            if (settings.BluetoothBossShortcutModifiers != (int)bossKey.Modifiers ||
+                settings.BluetoothBossShortcutVirtualKey != (int)bossKey.VirtualKey)
             {
-                settings.BluetoothBossShortcutVirtualKey = 0x42;
-                settings.BluetoothBossShortcutModifiers = 0x0003;
+                settings.BluetoothBossShortcutVirtualKey = (int)bossKey.VirtualKey;
+                settings.BluetoothBossShortcutModifiers = (int)bossKey.Modifiers;
                 settings.BluetoothShortcutSchema = 6;
+                migrationChanged = true;
             }
             settings.BluetoothWheelSensitivity = Math.Clamp(
                 double.IsFinite(settings.BluetoothWheelSensitivity)

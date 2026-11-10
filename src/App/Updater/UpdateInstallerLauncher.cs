@@ -1,3 +1,5 @@
+using IPhoneMirror.App.Localization;
+using System.Collections;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -6,7 +8,6 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
-using System.Text.Json;
 using IPhoneMirror.App.Services;
 
 namespace IPhoneMirror.App.Updater;
@@ -32,11 +33,19 @@ internal static class UpdateInstallerLauncher
         "IPhoneMirror.App.Updater.Apply-ZipUpdate.ps1";
     private const string VerifiedScriptBootstrap = """
         $ErrorActionPreference = 'Stop'
-        $payloadJson = [Text.Encoding]::UTF8.GetString(
-            [Convert]::FromBase64String('$PAYLOAD_BASE64$'))
-        $payload = $payloadJson | ConvertFrom-Json
+        # The verified helper uses standard cmdlets. Resolve those only from
+        # Windows' protected modules, before any module can be autoloaded.
+        $env:PSModulePath = [IO.Path]::Combine([Environment]::SystemDirectory,
+            'WindowsPowerShell\v1.0\Modules')
+        $scriptPath = [Text.Encoding]::UTF8.GetString(
+            [Convert]::FromBase64String('$SCRIPT_PATH_BASE64$'))
+        $expectedSha256 = '$EXPECTED_SHA256$'
+        $cleanupDirectory = $CLEANUP_DIRECTORY$
+        $scriptArguments = @(foreach ($argument in @($ARGUMENTS_BASE64$)) {
+            [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($argument))
+        })
         try {
-            $stream = [IO.File]::Open([string]$payload.ScriptPath,
+            $stream = [IO.File]::Open($scriptPath,
                 [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
             try {
                 $algorithm = [Security.Cryptography.SHA256]::Create()
@@ -45,7 +54,7 @@ internal static class UpdateInstallerLauncher
                         $algorithm.ComputeHash($stream)).Replace('-', '')
                 }
                 finally { $algorithm.Dispose() }
-                if (-not $actual.Equals([string]$payload.ExpectedSha256,
+                if (-not $actual.Equals($expectedSha256,
                         [StringComparison]::OrdinalIgnoreCase)) {
                     throw 'The elevated update helper changed after verification.'
                 }
@@ -54,7 +63,6 @@ internal static class UpdateInstallerLauncher
                 $reader = [IO.StreamReader]::new($stream, $encoding, $true, 4096, $true)
                 try { $scriptText = $reader.ReadToEnd() }
                 finally { $reader.Dispose() }
-                $scriptArguments = @($payload.Arguments)
                 if (($scriptArguments.Count % 2) -ne 0) {
                     throw 'The elevated update helper received malformed arguments.'
                 }
@@ -72,10 +80,10 @@ internal static class UpdateInstallerLauncher
             finally { $stream.Dispose() }
         }
         finally {
-            if ($payload.CleanupDirectory) {
+            if ($cleanupDirectory) {
                 try {
                     [IO.Directory]::Delete(
-                        [IO.Path]::GetDirectoryName([string]$payload.ScriptPath), $true)
+                        [IO.Path]::GetDirectoryName($scriptPath), $true)
                 }
                 catch { }
             }
@@ -83,22 +91,23 @@ internal static class UpdateInstallerLauncher
         """;
     private const string VerifiedInstallerBootstrap = """
         $ErrorActionPreference = 'Stop'
-        $payloadJson = [Text.Encoding]::UTF8.GetString(
-            [Convert]::FromBase64String('$PAYLOAD_BASE64$'))
-        $payload = $payloadJson | ConvertFrom-Json
+        $packagePath = [Text.Encoding]::UTF8.GetString(
+            [Convert]::FromBase64String('$PACKAGE_PATH_BASE64$'))
+        $expectedSha256 = '$EXPECTED_SHA256$'
+        $argumentLine = [Text.Encoding]::UTF8.GetString(
+            [Convert]::FromBase64String('$ARGUMENT_LINE_BASE64$'))
         $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
         $principal = [Security.Principal.WindowsPrincipal]::new($identity)
         $isElevated = $principal.IsInRole(
             [Security.Principal.WindowsBuiltInRole]::Administrator)
         if (-not $isElevated) { throw 'The update installer bootstrap is not elevated.' }
-        $root = [Environment]::GetFolderPath(
-            [Environment+SpecialFolder]::CommonApplicationData)
-        $directory = [IO.Path]::Combine($root,
+        $directory = [IO.Path]::Combine([Environment]::SystemDirectory,
             'iPhoneMirror-Installer-' + [Guid]::NewGuid().ToString('N'))
         $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
         $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
         $security = [Security.AccessControl.DirectorySecurity]::new()
         $security.SetAccessRuleProtection($true, $false)
+        $security.SetOwner($administrators)
         $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
             [Security.AccessControl.InheritanceFlags]::ObjectInherit
         $propagation = [Security.AccessControl.PropagationFlags]::None
@@ -108,9 +117,11 @@ internal static class UpdateInstallerLauncher
             $administrators, $rights, $inheritance, $propagation, $allow))
         $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
             $system, $rights, $inheritance, $propagation, $allow))
-        [IO.DirectoryInfo]::new($directory).Create($security)
+        $directoryInfo = [IO.DirectoryInfo]::new($directory)
+        if ($directoryInfo.Exists) { throw 'The installer staging directory already exists.' }
+        $directoryInfo.Create($security)
         try {
-            $source = [IO.File]::Open([string]$payload.PackagePath,
+            $source = [IO.File]::Open($packagePath,
                 [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
             try {
                 $algorithm = [Security.Cryptography.SHA256]::Create()
@@ -119,13 +130,13 @@ internal static class UpdateInstallerLauncher
                         $algorithm.ComputeHash($source)).Replace('-', '')
                 }
                 finally { $algorithm.Dispose() }
-                if (-not $actual.Equals([string]$payload.ExpectedSha256,
+                if (-not $actual.Equals($expectedSha256,
                         [StringComparison]::OrdinalIgnoreCase)) {
                     throw 'The update installer changed after verification.'
                 }
                 $source.Position = 0
                 $destination = [IO.Path]::Combine($directory,
-                    [IO.Path]::GetFileName([string]$payload.PackagePath))
+                    [IO.Path]::GetFileName($packagePath))
                 $output = [IO.File]::Open($destination, [IO.FileMode]::CreateNew,
                     [IO.FileAccess]::Write, [IO.FileShare]::None)
                 try { $source.CopyTo($output); $output.Flush() }
@@ -134,9 +145,18 @@ internal static class UpdateInstallerLauncher
             finally { $source.Dispose() }
             $start = [Diagnostics.ProcessStartInfo]::new()
             $start.FileName = $destination
-            $start.Arguments = [string]$payload.ArgumentLine
+            $start.Arguments = $argumentLine
             $start.WorkingDirectory = $directory
             $start.UseShellExecute = $false
+            $start.EnvironmentVariables.Clear()
+            $windows = [IO.Directory]::GetParent([Environment]::SystemDirectory).FullName
+            $start.EnvironmentVariables['SystemRoot'] = $windows
+            $start.EnvironmentVariables['WINDIR'] = $windows
+            $start.EnvironmentVariables['PATH'] = [Environment]::SystemDirectory
+            $start.EnvironmentVariables['TEMP'] = $directory
+            $start.EnvironmentVariables['TMP'] = $directory
+            $start.EnvironmentVariables['PSModulePath'] = [IO.Path]::Combine(
+                [Environment]::SystemDirectory, 'WindowsPowerShell\v1.0\Modules')
             $process = [Diagnostics.Process]::Start($start)
             if ($null -eq $process) { throw 'The verified update installer did not start.' }
             try { $process.WaitForExit() }
@@ -147,19 +167,15 @@ internal static class UpdateInstallerLauncher
         }
         """;
 
-    private sealed record VerifiedScriptPayload(string ScriptPath,
-        string ExpectedSha256, string[] Arguments, bool CleanupDirectory);
-    private sealed record VerifiedInstallerPayload(string PackagePath,
-        string ExpectedSha256, string ArgumentLine);
-
     internal static void Launch(DownloadedUpdate update)
     {
+        ValidateElevationEnvironment(Environment.GetEnvironmentVariables());
         if (!update.HashVerified)
             throw new InvalidDataException(
-                "The update package was not verified and will not be executed.");
+                LocalizationService.Get("UpdatePackageNotVerified"));
         if (!IsSha256(update.VerifiedSha256))
             throw new InvalidDataException(
-                "The verified update digest is missing or invalid.");
+                LocalizationService.Get("UpdateDigestMissing"));
         DiagnosticLogger.Info("updater", "installer_launch_begin",
             ("release", update.Release.TagName), ("asset", update.Asset.Name),
             ("sha256_verified", update.HashVerified));
@@ -185,20 +201,18 @@ internal static class UpdateInstallerLauncher
         }
 
         if (!update.Asset.Name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("The downloaded update format is unsupported.");
+            throw new InvalidOperationException(LocalizationService.Get("UpdateFormatUnsupported"));
         // Validate the integrity boundary before materializing a helper. A
         // rejected elevated portable update must not leave temporary files.
         if (IsCurrentProcessElevated())
             throw new InvalidOperationException(
-                "Portable updates must be started from a non-administrator " +
-                "iPhoneMirror process. Restart the application normally and try again.");
+                LocalizationService.Get("UpdatePortableElevationUnsupported"));
         var requiresElevation = !CanUpdateDirectoryWithoutElevation(
             AppContext.BaseDirectory);
         if (requiresElevation && !CanSafelyElevateDirectoryTree(
                 AppContext.BaseDirectory))
             throw new InvalidOperationException(
-                "The portable installation contains a writable or reparse-point " +
-                "subdirectory and cannot be updated safely with administrator privileges.");
+                LocalizationService.Get("UpdatePortableDirectoryUnsafe"));
         var helperBytes = ReadZipHelperBytes();
         var helperSha256 = Convert.ToHexString(SHA256.HashData(helperBytes));
         var helperDirectory = Path.Combine(Path.GetTempPath(), "iPhoneMirror",
@@ -256,7 +270,7 @@ internal static class UpdateInstallerLauncher
         {
             var error = Marshal.GetLastWin32Error();
             throw new Win32Exception(error,
-                "Windows could not start the update helper.");
+                LocalizationService.Get("UpdateHelperStartFailed"));
         }
 
         try
@@ -293,13 +307,14 @@ internal static class UpdateInstallerLauncher
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workingDirectory);
         ArgumentException.ThrowIfNullOrWhiteSpace(encodedCommand);
+        ValidateElevationEnvironment(Environment.GetEnvironmentVariables());
         var start = new ProcessStartInfo
         {
             FileName = Path.Combine(Environment.SystemDirectory,
                 "WindowsPowerShell", "v1.0", "powershell.exe"),
             UseShellExecute = true,
             Verb = verb ?? string.Empty,
-            WorkingDirectory = workingDirectory,
+            WorkingDirectory = Environment.SystemDirectory,
             WindowStyle = ProcessWindowStyle.Hidden,
         };
         foreach (var argument in new[]
@@ -309,6 +324,25 @@ internal static class UpdateInstallerLauncher
                  })
             start.ArgumentList.Add(argument);
         return start;
+    }
+
+    internal static void ValidateElevationEnvironment(IDictionary environment)
+    {
+        foreach (DictionaryEntry entry in environment)
+        {
+            var name = (string)entry.Key;
+            if (string.IsNullOrEmpty(entry.Value?.ToString())) continue;
+            if (name.StartsWith("COMPLUS_", StringComparison.OrdinalIgnoreCase) ||
+                name.StartsWith("COR_", StringComparison.OrdinalIgnoreCase) ||
+                name.StartsWith("CORECLR_", StringComparison.OrdinalIgnoreCase) ||
+                name.StartsWith("DOTNET_", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("DEVPATH", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("APPDOMAIN_MANAGER_ASM", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("APPDOMAIN_MANAGER_TYPE", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("CLRConfigFile", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(
+                    $"Update helpers do not accept runtime overrides: {name}");
+        }
     }
 
     internal static bool CanUpdateDirectoryWithoutElevation(string directory)
@@ -436,13 +470,13 @@ internal static class UpdateInstallerLauncher
             StringComparison.OrdinalIgnoreCase);
         if (!isInstaller && !isZip)
             throw new InvalidOperationException(
-                "The downloaded update format is unsupported.");
+                LocalizationService.Get("UpdateFormatUnsupported"));
         if (sharedRuntime && !isInstaller)
             throw new InvalidOperationException(
-                "An installed copy must be updated with the Windows Setup package.");
+                LocalizationService.Get("UpdateSetupRequired"));
         if (!sharedRuntime && !isZip)
             throw new InvalidOperationException(
-                "A portable copy must be updated with the portable ZIP package.");
+                LocalizationService.Get("UpdatePortableRequired"));
     }
 
     internal static string BuildInstallerArguments()
@@ -491,12 +525,15 @@ internal static class UpdateInstallerLauncher
         if (!IsSha256(expectedSha256))
             throw new ArgumentException("A valid helper SHA256 digest is required.",
                 nameof(expectedSha256));
-        var payload = new VerifiedScriptPayload(Path.GetFullPath(scriptPath),
-            expectedSha256, arguments.ToArray(), cleanupDirectory);
-        var payloadBase64 = Convert.ToBase64String(
-            JsonSerializer.SerializeToUtf8Bytes(payload));
-        var command = VerifiedScriptBootstrap.Replace("$PAYLOAD_BASE64$",
-            payloadBase64, StringComparison.Ordinal);
+        var command = VerifiedScriptBootstrap
+            .Replace("$SCRIPT_PATH_BASE64$", Convert.ToBase64String(
+                Encoding.UTF8.GetBytes(Path.GetFullPath(scriptPath))), StringComparison.Ordinal)
+            .Replace("$EXPECTED_SHA256$", expectedSha256, StringComparison.Ordinal)
+            .Replace("$CLEANUP_DIRECTORY$", cleanupDirectory ? "$true" : "$false",
+                StringComparison.Ordinal)
+            .Replace("$ARGUMENTS_BASE64$", string.Join(", ", arguments.Select(argument =>
+                "'" + Convert.ToBase64String(Encoding.UTF8.GetBytes(argument)) + "'")),
+                StringComparison.Ordinal);
         return Convert.ToBase64String(Encoding.Unicode.GetBytes(command));
     }
 
@@ -506,12 +543,12 @@ internal static class UpdateInstallerLauncher
         if (!IsSha256(expectedSha256))
             throw new ArgumentException("A valid installer SHA256 digest is required.",
                 nameof(expectedSha256));
-        var payload = new VerifiedInstallerPayload(Path.GetFullPath(packagePath),
-            expectedSha256, argumentLine);
-        var payloadBase64 = Convert.ToBase64String(
-            JsonSerializer.SerializeToUtf8Bytes(payload));
-        var command = VerifiedInstallerBootstrap.Replace("$PAYLOAD_BASE64$",
-            payloadBase64, StringComparison.Ordinal);
+        var command = VerifiedInstallerBootstrap
+            .Replace("$PACKAGE_PATH_BASE64$", Convert.ToBase64String(
+                Encoding.UTF8.GetBytes(Path.GetFullPath(packagePath))), StringComparison.Ordinal)
+            .Replace("$EXPECTED_SHA256$", expectedSha256, StringComparison.Ordinal)
+            .Replace("$ARGUMENT_LINE_BASE64$", Convert.ToBase64String(
+                Encoding.UTF8.GetBytes(argumentLine)), StringComparison.Ordinal);
         return Convert.ToBase64String(Encoding.Unicode.GetBytes(command));
     }
 
@@ -519,7 +556,7 @@ internal static class UpdateInstallerLauncher
     {
         using var input = typeof(UpdateInstallerLauncher).Assembly
             .GetManifestResourceStream(ZipHelperResourceName) ??
-            throw new FileNotFoundException("The embedded ZIP update helper is missing.");
+            throw new FileNotFoundException(LocalizationService.Get("UpdateHelperMissing"));
         using var output = new MemoryStream();
         input.CopyTo(output);
         return output.ToArray();
@@ -542,7 +579,7 @@ internal static class UpdateInstallerLauncher
         string expectedSha256)
     {
         if (!IsSha256(expectedSha256))
-            throw new InvalidDataException("The verified update digest is invalid.");
+            throw new InvalidDataException(LocalizationService.Get("UpdateDigestInvalid"));
         var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
             FileShare.Read, 128 * 1024, FileOptions.SequentialScan);
         try
@@ -550,7 +587,7 @@ internal static class UpdateInstallerLauncher
             var actual = Convert.ToHexString(SHA256.HashData(stream));
             if (!actual.Equals(expectedSha256, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException(
-                    "The update package changed after verification.");
+                    LocalizationService.Get("UpdatePackageChanged"));
             stream.Position = 0;
             return stream;
         }

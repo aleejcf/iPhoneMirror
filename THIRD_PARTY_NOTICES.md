@@ -1,7 +1,8 @@
 # Third-party notices
 
 This file describes third-party material intentionally included in the source
-tree or release package. Each component remains under its upstream license.
+tree or release package for the current `v1.8.3` baseline. Each component
+remains under its upstream license.
 The root GNU General Public License v3.0 only applies to original iPhoneMirror
 material and does not replace, narrow or relicense any component listed below.
 
@@ -46,9 +47,10 @@ remaining signed runtime and kernel-driver payload under
 
 The driver manager does not copy proprietary Aisi binaries. Apple USB support
 is installed from a signed offline AppleMobileDeviceSupport MSI when available,
-from the Apple Devices Microsoft Store product through Windows Package Manager,
-or from Apple's official HTTPS iTunes installer as a compatibility fallback.
-Apple software is not redistributed in this repository or its release assets.
+from Apple's Software Update catalog as a standalone MSI, or from Apple's
+official HTTPS iTunes installer as a compatibility fallback. Apple Devices
+from Microsoft Store remains a supported manual installation path. Apple
+software is not redistributed in this repository or its release assets.
 
 ## Microsoft Visual C++ runtime
 
@@ -67,7 +69,8 @@ directory after validating their Microsoft Authenticode signatures.
 ## AirPlayServer 1.1.2 wireless receiver
 
 `third_party/airplay-server/` contains a pinned runtime subset of the
-AirPlayServer x64 release with local compatibility patches. The GPL-licensed
+AirPlayServer x64 release with local compatibility patches and selected fixes
+from upstream commits `c788d6fe` and `37d7fd0f`. The GPL-licensed
 `iPhoneMirror.WirelessHost.exe` process loads its protocol/decoder DLL and sends
 decoded I420 video and PCM audio to the GPL-3.0-only application over a named
 pipe. The application and native capture core do not link to the receiver DLL.
@@ -76,31 +79,69 @@ pipe. The application and native capture core do not link to the receiver DLL.
 - Version/commit: v1.1.2 / `34ba6cfd49b2432cf30e89913d66decb775763e4`
 - AirPlayServer wrapper: MIT
 - PlayFair implementation and receiver runtime: GPL version 3
-- FFmpeg 4.4.2 runtime: LGPL version 2.1 or later
+- FFmpeg `63b2b0f47d` H.264/ALAC runtime (avcodec 58.137.100): LGPL version 2.1 or later;
+  compact same-ABI rebuild, with source recipe and MinGW notices in the source record
 - Fraunhofer FDK AAC: Fraunhofer FDK AAC license
 - Exact hashes, source links and license files:
   `third_party/airplay-server/SOURCE.md`
 
+## FDH2/UxPlay wireless fallback
+
+The optional `Wireless/UxPlay` fallback is built on demand from the FDH2/UxPlay
+source tree by `scripts/prepare_uxplay.ps1`. The adapter keeps UxPlay's
+GStreamer-rendered raw I420/PCM output on the existing iPhoneMirror named-pipe
+capture path. UxPlay is GPLv3 software; its pinned source and build details are
+recorded in `third_party/uxplay/SOURCE.md`. The fallback is disabled for the
+application's URL-video/DLNA media-cast path because UxPlay does not implement
+the iPhoneMirror media-control IPC contract.
+
 ## FFmpeg 8.1.2 media-output runtime
 
-The default release uses an FFmpeg essentials build staged at `tools/ffmpeg/`.
-An explicitly requested compact edition may omit this runtime and use a
-user-installed FFmpeg from `PATH`. The bundled runtime is prepared by
-`scripts/prepare_ffmpeg.ps1`, which verifies the published archive SHA-256
-before copying `ffmpeg.exe`, the license, build README and source record into
-the application output. This runtime is independent of the older FFmpeg DLLs
-distributed with AirPlayServer.
+The default release uses a custom compact FFmpeg build staged at `tools/ffmpeg/`.
+It remains bundled and does not require a user-installed FFmpeg. The build pins
+the official source archive, verifies the resulting runtime files, and retains
+H.264 CPU/GPU encoding, AAC/Opus, recording and RTMP/SRT/WHIP output. This runtime
+is independent of the older FFmpeg DLLs distributed with AirPlayServer.
 
-- Binary package: https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-essentials_build.zip
+- Build recipe: `scripts/build_compact_ffmpeg.ps1` and `scripts/ffmpeg-compact-build.sh`
 - Upstream FFmpeg source: https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
-- License for the distributed essentials build: GNU General Public License v3
+- License for the compact build: GNU General Public License v3 or later
 - Included license and build/source metadata: `tools/ffmpeg/LICENSE.txt`,
   `tools/ffmpeg/README.txt` and `tools/ffmpeg/SOURCE.txt`
-- Pinned archive and extracted-file hashes:
-  `scripts/ffmpeg-runtime-manifest.psd1`
+- Source SHA-256: `464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c`
+- The generated runtime manifest pins all distributed files; `SOURCE.txt` records
+  MSYS2 dependency versions and `LICENSE.txt` includes their license texts.
+- Dependencies include x264 (GPL-2.0-or-later), Opus (BSD), SRT (MPL-2.0),
+  OpenSSL/oneVPL (Apache-2.0), AMF/NVIDIA headers (MIT), and MinGW/GCC runtimes
+  under their respective runtime exceptions and permissive notices.
+- Distributors must provide corresponding sources, including matching dependency
+  build recipes and patches, with the binary release. MSYS2 dependency recipes:
+  https://github.com/msys2/MINGW-packages
+- The former Gyan essentials build remains an explicit fallback through
+  `scripts/ffmpeg-runtime-manifest.psd1`, not the default profile.
 - The build enables GPL components such as libx264 and is therefore distributed
   under GPLv3 terms. It encodes projection video and, when available, muxes the
   captured iPhone PCM audio into recordings and live-streaming output.
+
+## iUsbBridge and USBMux coexistence sources
+
+The current build packages the Python bridge source in `tools/usb_touch_bridge.py`
+and `tools/iostouch` using the versioned recipe in `scripts/usb-bridge-recipe`.
+It does not fetch the latest upstream backend. The recipe source commit is recorded
+in [SOURCE.md](scripts/usb-bridge-recipe/SOURCE.md).
+
+Based on [iUsbBridge by RayrenSX](https://github.com/RayrenSX/iUsbBridge).
+The included [iUsbBridge license](scripts/usb-bridge-recipe/LICENSE) restricts use
+to noncommercial purposes without separate permission; it is not an OSI-approved
+open-source license. This notice does not relicense the component under the main
+application's GPL-3.0-only license.
+
+The repository README also attributes `tools/iostouch/qt/usb.py`, `usbmux_usb.py`
+and `usbmuxd_server.py` to
+[iPhoneUsbTouch](https://gitee.com/xiaozai-van-liu/iPhoneUsbTouch) and records
+incomplete license documentation for that source. This documentation review does
+not resolve that permission gap. See the [bridge component inventory](docs/USB_TOUCH_THIRD_PARTY_LICENSES.md)
+for dependency details and the distinction between source, packaging recipe and runtime.
 
 ## Markdig Markdown processor
 

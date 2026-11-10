@@ -1,4 +1,5 @@
 #include "Transport/UsbMuxClient.h"
+#include "Transport/LibUsb0Transport.h"
 
 #include "Logging.h"
 
@@ -43,7 +44,7 @@ std::uint32_t child_u32(const plist::Value& dictionary, std::string_view key) {
 plist::Value UsbMuxClient::base_message(std::string message_type) const {
     return plist::Value::Dict({
         {"BundleID", plist::Value::String("com.iphonemirror.windows")},
-        {"ClientVersionString", plist::Value::String("iPhoneMirror 1.8.1")},
+        {"ClientVersionString", plist::Value::String("iPhoneMirror 1.8.4-test4")},
         {"MessageType", plist::Value::String(std::move(message_type))},
         {"ProgName", plist::Value::String("iPhoneMirror")},
         {"kLibUSBMuxVersion", plist::Value::Integer(3)},
@@ -53,12 +54,14 @@ plist::Value UsbMuxClient::base_message(std::string message_type) const {
 std::pair<Socket, plist::Value> UsbMuxClient::request_with_socket(const plist::Value& body) {
     Socket socket = Socket::connect_loopback(port_);
     const std::string xml = plist::to_xml(body);
+    // Guard against silent uint32_t wraparound when building the length field.
+    if (xml.size() > 0xFFFFFFFFu - 16) throw std::runtime_error("usbmux packet too large");
     std::vector<std::uint8_t> packet;
     packet.reserve(16 + xml.size());
     append_u32le(packet, static_cast<std::uint32_t>(16 + xml.size()));
     append_u32le(packet, ProtocolVersion);
     append_u32le(packet, PlistMessage);
-    append_u32le(packet, next_tag_++);
+    append_u32le(packet, next_tag_.fetch_add(1, std::memory_order_relaxed));
     packet.insert(packet.end(), xml.begin(), xml.end());
     socket.send_all(packet);
 
@@ -95,6 +98,17 @@ std::vector<MuxDevice> UsbMuxClient::list_devices() {
         if (!device.serial.empty()) devices.push_back(std::move(device));
     }
     return devices;
+}
+
+bool UsbMuxClient::contains_usb_device(
+    std::span<const MuxDevice> devices, std::string_view serial) noexcept {
+    for (const auto& device : devices) {
+        // A saved or live Network row cannot confirm that Apple's USB
+        // management interface recovered after the QuickTime configuration.
+        if (device.connection_type == "USB" &&
+            apple_usb_serial_equal(device.serial, serial)) return true;
+    }
+    return false;
 }
 
 bool UsbMuxClient::has_pair_record(const std::string& udid) {

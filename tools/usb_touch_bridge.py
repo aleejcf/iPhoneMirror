@@ -1,0 +1,4917 @@
+#!/usr/bin/env python3
+"""
+USB 直连 iPhone 触控桥接器。
+
+完全独立运行，不需要安装其他控制软件。
+基于开源 pymobiledevice3 + userspace TCP 隧道（无需管理员）。
+
+stdin  : 4 字节 little-endian 长度 + UTF-8 JSON touch_batch
+stdout : JSON-lines 生命周期事件
+
+frame 格式:
+  {"schema":"iphoneMirror.touch.v2","kind":"touch_batch","seq":N,
+   "timestampNs":...,"points":[{"pointerId":1,"action":"down|move|up",
+   "normalizedX":0.5,"normalizedY":0.5}, ...]}
+
+诚实行为:
+   - startmediastream 返回 9021 时，验证 Universal HID 后尝试 direct 路径；
+     没有 mainTouchscreen surface 时绝不伪造触控成功。
+  - 任何会话异常立即发 error 事件并退出，触点强制释放。
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+from concurrent.futures import ThreadPoolExecutor, wait
+from collections import deque
+from dataclasses import dataclass, replace
+import errno
+import hashlib
+import ipaddress
+import json
+import logging
+import os
+from pathlib import Path
+import plistlib
+import queue
+import shutil
+import socket
+import struct
+import sys
+import tempfile
+import threading
+import time
+from typing import Callable, Optional
+from urllib.parse import quote, urlsplit
+from xml.parsers.expat import ExpatError
+
+import requests
+import ifaddr
+from requests import RequestException
+from urllib3.exceptions import HTTPError as Urllib3HTTPError
+from hyperframe.frame import DataFrame, GoAwayFrame, PingFrame, RstStreamFrame
+
+import pymobiledevice3.remote.tunnel_service as _ts
+_ts.USE_USERSPACE_TUNNEL = True
+
+from pymobiledevice3 import lockdown as _lockdown
+from pymobiledevice3.common import get_home_folder
+from pymobiledevice3.exceptions import (
+    AlreadyMountedError,
+    BadDevError,
+    ConnectionFailedError,
+    ConnectionFailedToUsbmuxdError,
+    ConnectionTerminatedError,
+    DeveloperModeIsNotEnabledError,
+    DeviceNotFoundError,
+    GetProhibitedError,
+    InvalidServiceError,
+    MissingValueError,
+    MuxException,
+    NotMountedError,
+    NotPairedError,
+    PasswordRequiredError,
+    RemotePairingCompletedError,
+    StreamClosedError,
+)
+from pymobiledevice3.pair_records import iter_remote_paired_identifiers
+from pymobiledevice3.services.mobile_image_mounter import (
+    LATEST_DDI_BUILD_ID,
+)
+from ddi_support import BridgePrerequisiteError, PersonalizedImageMounter, bounded_mounter, device_failure, prepare_cryptex_ddi
+from pymobiledevice3.remote.common import TunnelProtocol
+from pymobiledevice3.remote.module_imports import start_tunnel
+from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
+from pymobiledevice3.remote.remote_service import RemoteService
+from pymobiledevice3.remote.remotexpc import RemoteXPCConnection
+from pymobiledevice3.remote.tunnel_service import (
+    CoreDeviceTunnelProxy,
+    RemotePairingLockdownService,
+    RemotePairingTunnelService as UpstreamRemotePairingTunnelService,
+)
+from mdns_discovery import MdnsDiscoveryError, browse_remotepairing
+from pymobiledevice3.remote.core_device.display_service import DisplayService
+from pymobiledevice3.remote.core_device.pasteboard_service import PasteboardService
+try:
+    from pymobiledevice3.remote.core_device.pasteboard_service import POLICY_PROMISE_SECONDARY
+except ImportError:  # pragma: no cover - older packaged pymobiledevice3
+    POLICY_PROMISE_SECONDARY = {'promiseSecondary': {}}
+from pymobiledevice3.remote.core_device.hid_service import (
+    UniversalHIDServiceService,
+    IndigoHIDService,
+    TOUCHSCREEN_STATE_CONTACT,
+    TOUCHSCREEN_STATE_RELEASE,
+    DIGITIZER_SURFACE_MAIN_TOUCHSCREEN,
+    KEYBOARD_SURFACE_DEFAULT_SERVICE_ID,
+)
+from pymobiledevice3.remote.xpc_message import XpcUInt64Type
+
+try:
+    from iostouch.qt.usb import (
+        correct_serial as _correct_serial,
+        find_devices as _find_usb_devices,
+        get_backend as _get_usb_backend,
+    )
+    from iostouch.qt.usbmux_usb import UsbMuxTransport as _UsbMuxTransport
+    from iostouch.qt.usbmuxd_server import UsbmuxdThread as _UsbmuxdThread
+except ImportError:  # pragma: no cover - optional in minimal source environments
+    _correct_serial = _find_usb_devices = _get_usb_backend = None  # type: ignore[assignment]
+    _UsbMuxTransport = _UsbmuxdThread = None
+
+log = logging.getLogger('iphoneMirror.usb_touch')
+
+
+class BridgeUserActionRequired(RuntimeError):
+    """A completed preparation step that needs on-device user action."""
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+async def _bounded_remote_exit(service, timeout):
+    # A candidate owns its RemoteXPC channel, not its parent RSD. Keep the
+    # writer before SDK teardown: cancelled wait_closed may retain the channel
+    # while retry opens another one on the same still-live tunnel.
+    connection = None
+    if isinstance(service, RemoteService):
+        connection = service._service
+    elif isinstance(service, RemoteServiceDiscoveryService):
+        connection = service.service
+    elif isinstance(service, RemoteXPCConnection):
+        connection = service
+    writer = getattr(connection, '_writer', None)
+    closed = False
+    try:
+        async with asyncio.timeout(timeout):
+            await service.__aexit__(None, None, None)
+        closed = True
+    finally:
+        if not closed and writer is not None:
+            with contextlib.suppress(Exception):
+                writer.transport.abort()
+            connection._writer = connection._reader = None
+
+
+@contextlib.asynccontextmanager
+async def _cleanup_cancellation_scope():
+    # Cancellation may arrive during any one bounded teardown step. Finish
+    # the other owned resources before delivering it, without shielding or
+    # allowing the interrupted step to continue in a background task.
+    cancelled = None
+    async def finish(operation):
+        nonlocal cancelled
+        try:
+            await operation
+        except asyncio.CancelledError as error:
+            cancelled = error
+    try:
+        yield finish
+    finally:
+        if cancelled is not None:
+            raise cancelled
+
+
+@contextlib.asynccontextmanager
+async def touch_session(rsd):
+    """Own every media/HID resource, including partial startup and cancellation.
+
+    The pinned SDK only closes its receiver after the media stream has started,
+    and its stop/close calls are unbounded. Keep the same authentication order
+    while making all startup and teardown paths bounded.
+    """
+    from pymobiledevice3.remote.core_device.screen_stream import open_media_receiver
+    import uuid
+
+    display = DisplayService(rsd)
+    hid = transport = drain = answer = None
+
+    async def close(service):
+        if service is not None:
+            try:
+                await _bounded_remote_exit(service, 3)
+            except Exception as error:
+                log.warning('Touch session cleanup failed: %s', type(error).__name__)
+
+    try:
+        try:
+            await asyncio.wait_for(display.__aenter__(), 8)
+        except TimeoutError as error:
+            raise RuntimeError('com.apple.coredevice.displayservice open timed out') from error
+        transport, receiver_ip = open_media_receiver(display, (1 * 1024 * 1024,))
+        try:
+            answer = await asyncio.wait_for(display.start_video_stream(
+                receiver_ip=receiver_ip, receiver_port=transport.port,
+                sender_ip=rsd.service.address[0], display_id=1), 10)
+        except TimeoutError as error:
+            raise RuntimeError('Timed out starting the media stream that gates HID auth.') from error
+        await asyncio.sleep(.3)
+
+        async def discard_media():
+            try:
+                while True:
+                    await transport.recv()
+            except (asyncio.CancelledError, OSError):
+                pass
+
+        drain = asyncio.create_task(discard_media())
+        hid = UniversalHIDServiceService(rsd)
+        try:
+            await asyncio.wait_for(hid.__aenter__(), 8)
+        except TimeoutError as error:
+            raise BridgePrerequisiteError('touch_surface_unavailable', 'Opening Universal HID timed out.') from error
+        yield hid
+    finally:
+        async with _cleanup_cancellation_scope() as finish:
+            await finish(close(hid))
+            if drain is not None:
+                drain.cancel()
+                await finish(asyncio.gather(drain, return_exceptions=True))
+            if answer is not None:
+                async def stop_media():
+                    try:
+                        csid = answer['connection']['options']['avcMediaStreamOptionClientSessionID']['uuid']
+                        if not isinstance(csid, uuid.UUID):
+                            csid = uuid.UUID(csid)
+                        async with asyncio.timeout(3):
+                            await display.stop_media_stream(csid)
+                    except Exception as error:
+                        log.warning('Touch media stop failed: %s', type(error).__name__)
+                await finish(stop_media())
+            if transport is not None:
+                with contextlib.suppress(Exception):
+                    transport.close()
+            await finish(close(display))
+
+
+class RemotePairingTunnelService(UpstreamRemotePairingTunnelService):
+    async def close(self):
+        writer = self._writer
+        try:
+            async with asyncio.timeout(2):
+                await super().close()
+        except BaseException as error:
+            log.info('RemotePairing close failed: %s', type(error).__name__)
+            if writer is not None:
+                with contextlib.suppress(Exception):
+                    writer.transport.abort()
+            if not isinstance(error, Exception):
+                raise
+        finally:
+            self._writer = self._reader = None
+
+
+REMOTE_PAIRING_ROUTE_TIMEOUT_SECONDS = 8
+REMOTE_PAIRING_ROUTE_RETRY_DELAY_SECONDS = .3
+
+
+def _remote_pairing_host(host, adapters):
+    if '%' not in host:
+        return host
+    ip, scope = host.rsplit('%', 1)
+    ipaddress.IPv6Address(ip)
+    if scope.isascii() and scope.isdecimal() and int(scope) > 0:
+        index = int(scope)
+    else:
+        try:
+            index = socket.if_nametoindex(scope)
+        except OSError:
+            # Windows Bonjour may supply ifaddr's friendly description rather
+            # than the OS's internal name. Long descriptions make getaddrinfo
+            # treat the scoped literal as a DNS label and fail IDNA encoding.
+            indices = {adapter.index for adapter in adapters
+                       if scope in (adapter.name, adapter.nice_name)
+                       and isinstance(adapter.index, int) and adapter.index > 0}
+            if len(indices) != 1:
+                raise ValueError('Wireless IPv6 interface has no unique active index.') from None
+            index = indices.pop()
+    return f'{ip}%{index}'
+
+
+def _remote_pairing_route_hosts(host, peers, adapters):
+    if '%' not in host:
+        return [host]
+    ip, scope = host.rsplit('%', 1)
+    if not ipaddress.IPv6Address(ip).is_link_local or scope.isdecimal():
+        return [_remote_pairing_host(host, adapters)]
+    try:
+        index = socket.if_nametoindex(scope)
+        return [f'{ip}%{index}']  # scope received as an actual OS interface name
+    except OSError:
+        pass
+    # An AAAA record received over IPv4 contains no incoming IPv6 scope. The
+    # SDK picks the first fe80::/64 adapter, even a disconnected virtual one.
+    # Use the same service's IPv4 subnet when available. For an IPv6-only
+    # advertisement verify eligible interfaces rather than guess one; the
+    # existing selected-device pair verification remains mandatory.
+    peer_v4 = []
+    for peer in peers:
+        try:
+            candidate = ipaddress.ip_address(peer.full_ip)
+        except ValueError:
+            continue
+        if isinstance(candidate, ipaddress.IPv4Address):
+            peer_v4.append(candidate)
+    eligible, same_subnet = set(), set()
+    for adapter in adapters:
+        ips = getattr(adapter, 'ips', [])
+        if not any(isinstance(local.ip, tuple) and ipaddress.IPv6Address(local.ip[0]).is_link_local
+                   for local in ips):
+            continue
+        if not isinstance(adapter.index, int) or adapter.index <= 0:
+            continue
+        eligible.add(adapter.index)
+        for local in ips:
+            if isinstance(local.ip, str):
+                network = ipaddress.ip_network(f'{local.ip}/{local.network_prefix}', strict=False)
+                if any(peer in network for peer in peer_v4):
+                    same_subnet.add(adapter.index)
+    indices = same_subnet or eligible
+    # Friendly descriptions can be shared by several virtual adapters. Resolve
+    # the service's subnet before requiring a unique description match; early
+    # normalization would discard a valid IPv6 fallback on those PCs.
+    return ([f'{ip}%{index}' for index in sorted(indices)] if indices
+            else [_remote_pairing_host(host, adapters)])
+
+
+async def get_remote_pairing_tunnel_services(bonjour_timeout, udid):
+    """Verify discovered routes concurrently and close every unreturned service."""
+    answers = await browse_remotepairing(timeout=bonjour_timeout)
+    try:
+        adapters = ifaddr.get_adapters()
+    except OSError:
+        adapters = []
+    endpoints = {}
+    invalid_scopes = 0
+    for answer in answers:
+        for address in answer.addresses:
+            try:
+                hosts = _remote_pairing_route_hosts(address.full_ip, answer.addresses, adapters)
+            except (OSError, ValueError):
+                invalid_scopes += 1
+                continue
+            for host in hosts:
+                endpoints[(host, answer.port)] = None
+    if invalid_scopes:
+        log.warning('Skipped %s wireless IPv6 routes without a unique local interface index.', invalid_scopes)
+        if not endpoints:
+            raise BridgePrerequisiteError('wireless_remote_pairing_failed',
+                'Wireless services were advertised, but their IPv6 interfaces could not be resolved. '
+                'Check that the Windows network adapter is enabled; reconnect Wi-Fi and retry.')
+    if answers and not endpoints:
+        # PTR/SRV advertisements can arrive without their A/AAAA replies. This
+        # is an unresolved advertised service, rather than no service at all.
+        raise BridgePrerequisiteError('wireless_address_resolution_failed',
+            'Wireless services were advertised, but no usable addresses were resolved from mDNS. '
+            'Check LAN reachability and mDNS address replies, then retry.')
+    connected = []
+
+    async def close(service):
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(service.close(), 2)
+
+    async def connect(host, port):
+        # Reopen once after a transient peer/socket failure, using the original
+        # route budget and existing credentials. A cancelled or trust-rejected
+        # handshake is never a request to start pairing or to retry indefinitely.
+        deadline = asyncio.get_running_loop().time() + REMOTE_PAIRING_ROUTE_TIMEOUT_SECONDS
+        for attempt in range(2):
+            service = RemotePairingTunnelService(udid, host, port)
+            try:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError('Wireless route verification timed out.')
+                await asyncio.wait_for(service.connect(autopair=False), remaining)
+                connected.append(service)
+                return service
+            except BaseException as error:
+                await close(service)
+                if (attempt or not isinstance(error, (ConnectionTerminatedError, OSError, ConnectionError))
+                        or deadline - asyncio.get_running_loop().time() <= REMOTE_PAIRING_ROUTE_RETRY_DELAY_SECONDS):
+                    raise
+                log.info('Wireless route handshake failed (%s); reopening once.', type(error).__name__)
+                await asyncio.sleep(REMOTE_PAIRING_ROUTE_RETRY_DELAY_SECONDS)
+
+    tasks = [asyncio.create_task(connect(host, port)) for host, port in endpoints]
+    results = []
+    try:
+        if tasks:
+            await asyncio.wait(tasks, timeout=REMOTE_PAIRING_ROUTE_TIMEOUT_SECONDS)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*(close(service) for service in connected))
+        raise
+    if tasks and not connected:
+        # Broadcast discovery succeeded. Do not misreport failed pair verification
+        # or unreachable advertised addresses as an absence of mDNS services.
+        # Addresses may belong to another phone, so preserve error types without
+        # claiming this is definitely the selected device or exposing its data.
+        failures = [TimeoutError('Wireless route verification timed out.')
+                    if isinstance(result, asyncio.CancelledError) else result
+                    for result in results if isinstance(result, BaseException)]
+        reasons = ', '.join(sorted({type(error).__name__ for error in failures}))
+        raise BridgePrerequisiteError('wireless_remote_pairing_failed',
+            f'Found {len(tasks)} advertised wireless routes, but none verified for the selected device; '
+            f'handshake failures: {reasons}. Check LAN reachability and refresh pairing over USB.') from failures[0]
+    return connected
+
+APPLE_VENDOR_ID = 0x05AC
+INTERFACE_CLASS_VENDOR = 0xFF
+INTERFACE_SUBCLASS_USBMUX = 0xFE
+INTERFACE_SUBCLASS_QUICKTIME = 0x2A
+
+
+def _udid_matches(serial: str, udid: str) -> bool:
+    """Compare an Apple identifier across hyphenation and letter-case drift."""
+    return serial.replace('-', '').casefold() == udid.replace('-', '').casefold()
+
+
+def _interface_with_subclass(configuration, subclass: int):
+    for interface in configuration:
+        if (interface.bInterfaceClass == INTERFACE_CLASS_VENDOR and
+                interface.bInterfaceSubClass == subclass):
+            return interface
+    return None
+
+PROTOCOL_VERSION = 2
+CAPABILITIES = ['iphoneMirror.usb_touch.v2', 'iphoneMirror.usb_keyboard.v1', 'iphoneMirror.clipboard.rpc.v1']
+MAX_SLOTS = 5
+MAX_FRAME_SIZE = 4 * 1024 * 1024
+MESSAGE_SCHEMA = 'iphoneMirror.touch.v2'
+MESSAGE_KIND = 'touch_batch'
+VALID_ACTIONS = frozenset(('down', 'move', 'up'))
+KEYBOARD_MESSAGE_KIND = 'keyboard_batch'
+PASTE_TEXT_MESSAGE_KIND = 'paste_text'
+READ_CLIPBOARD_MESSAGE_KIND = 'read_clipboard'
+BUTTON_MESSAGE_KIND = 'button_event'
+
+BUTTON_STATES = frozenset(('down', 'up', 'canceled'))
+LEGACY_UNIVERSAL_HID_SERVICE = 'com.apple.coredevice.hid.universalhid'
+LOCKDOWN_CONNECT_ATTEMPTS = 4
+LOCKDOWN_CONNECT_TIMEOUT_SECONDS = 15
+LOCKDOWN_CLEANUP_TIMEOUT_SECONDS = 2
+LOCKDOWN_RETRY_DELAY_SECONDS = 0.35
+CAPTURE_MUX_START_ATTEMPTS = 3
+CAPTURE_MUX_RETRY_DELAY_SECONDS = 0.75
+PASTEBOARD_POLL_INTERVAL_SECONDS = 0.8
+PASTEBOARD_POLL_MAX_BACKOFF_SECONDS = 8.0
+# PasteboardService is a best-effort side channel.  It must never be allowed
+# to stall the HID input reader when iOS or the Windows clipboard companion is
+# busy (for example while Win+Shift+S is committing a screenshot).
+# CoreDevice pasteboard requests are considerably slower than HID requests on
+# real devices, especially when the phone is locked or the pasteboard daemon is
+# waking up.  Two seconds caused every poll and paste to time out in practice,
+# while still being long enough to stall the input loop.  Keep the operation
+# bounded, but give the side channel enough time to complete independently of
+# HID.
+PASTEBOARD_OPERATION_TIMEOUT_SECONDS = 8.0
+PASTEBOARD_RETRY_DELAY_SECONDS = 0.15
+# A foreground write can arrive immediately after a polling PULL has started.
+# That PULL owns the shared connection for its full operation budget and must
+# then dispose a timed-out RemoteXPC request before the SET can safely begin.
+# Five seconds was shorter than the eight-second PULL budget, so a slow poll
+# could make every queued Ctrl+V fail before it acquired the lock.
+PASTEBOARD_WRITE_QUEUE_TIMEOUT_SECONDS = 20.0
+# A CoreDevice HID request can remain pending after iOS has invalidated the
+# direct Universal HID session. Do not leave stdin's reader blocked forever:
+# the session supervisor rebuilds reverse control while retaining usbmux.
+# Touch motion is a high-rate best-effort stream. A multi-second retry here
+# freezes the host-side coalescing loop and is visible as a periodic pointer
+# stall. Lifecycle and keyboard operations retain their longer timeout below.
+HID_OPERATION_TIMEOUT_SECONDS = 3.0
+HID_TOUCH_MOTION_TIMEOUT_SECONDS = 0.35
+HID_CLEANUP_TIMEOUT_SECONDS = 2.0
+# On devices that reject media-stream authentication (9021), iOS can revoke a
+# direct Universal HID session without warning even while the USB mirror is
+# healthy. Refresh only the HID RemoteService on the existing RSD tunnel.
+DIRECT_HID_ROTATION_SECONDS = 180
+# An idle HID can fail without ending the tunnel reader. Two small PINGs per
+# second bound that detection delay without changing the round-trip timeout.
+HID_HEALTH_INTERVAL_SECONDS = 0.5
+# Static touch plus keyboard input can otherwise be lifted by iOS even though
+# the HID socket remains healthy. Repeat only the last confirmed full snapshot.
+HID_TOUCH_KEEPALIVE_SECONDS = 1.0
+TRANSPORT_FAILURE_POLL_SECONDS = 0.1
+HID_RECOVERY_ATTEMPTS = 3
+HID_RECOVERY_READY_TIMEOUT_SECONDS = 45
+LOCKDOWN_RETRYABLE_ERRORS = (
+    BadDevError,
+    ConnectionFailedError,
+    ConnectionResetError,
+    ConnectionTerminatedError,
+    DeviceNotFoundError,
+    MuxException,
+    OSError,
+)
+PERSONALIZED_DDI_FILES = ('Image.dmg', 'BuildManifest.plist', 'Image.trustcache')
+PERSONALIZED_DDI_MOUNT_TIMEOUT_SECONDS = 180
+PERSONALIZED_DDI_PREPARE_TIMEOUT_SECONDS = 300
+PERSONALIZED_DDI_REMOUNT_TIMEOUT_SECONDS = 30
+PERSONALIZED_DDI_INVENTORY_TIMEOUT_SECONDS = 12
+PERSONALIZED_DDI_DOWNLOAD_TIMEOUT_SECONDS = 150
+PERSONALIZED_DDI_DOWNLOAD_CONNECT_TIMEOUT_SECONDS = 8
+PERSONALIZED_DDI_DOWNLOAD_READ_TIMEOUT_SECONDS = 30
+PERSONALIZED_DDI_SOURCE_PING_WINDOW_SECONDS = 5
+PERSONALIZED_DDI_SOURCE_THROUGHPUT_WINDOW_SECONDS = 12
+PERSONALIZED_DDI_SOURCE_CONNECT_TIMEOUT_SECONDS = 3
+PERSONALIZED_DDI_SOURCE_READ_TIMEOUT_SECONDS = 8
+PERSONALIZED_DDI_MIRROR_PROBE_BYTES = 256 * 1024
+PERSONALIZED_DDI_DOWNLOAD_CHUNK_BYTES = 128 * 1024
+PERSONALIZED_DDI_SOURCE_ATTEMPT_SECONDS = 45
+PERSONALIZED_DDI_CACHE_DIRECTORY = 'Xcode_iOS_DDI_Personalized'
+PERSONALIZED_DDI_GITHUB_REPOSITORY = 'doronz88/DeveloperDiskImage'
+PERSONALIZED_DDI_PINNED_REVISION = '6eae353ae694bda1c421d4a3eee5459ae59c99a1'
+PERSONALIZED_DDI_GITHUB_REF = os.environ.get(
+    'IPHONE_MIRROR_DDI_GITHUB_REF', PERSONALIZED_DDI_PINNED_REVISION).strip() or PERSONALIZED_DDI_PINNED_REVISION
+PERSONALIZED_DDI_GITHUB_COMMIT_API_URL = (
+    'https://api.github.com/repos/'
+    f'{PERSONALIZED_DDI_GITHUB_REPOSITORY}/commits/{{ref}}'
+)
+PERSONALIZED_DDI_GITHUB_CONTENTS_API_URL = (
+    'https://api.github.com/repos/'
+    f'{PERSONALIZED_DDI_GITHUB_REPOSITORY}/contents/'
+    'PersonalizedImages/Xcode_iOS_DDI_Personalized?ref={revision}'
+)
+PERSONALIZED_DDI_GITHUB_RAW_URL = (
+    'https://raw.githubusercontent.com/'
+    f'{PERSONALIZED_DDI_GITHUB_REPOSITORY}/{{revision}}/'
+    'PersonalizedImages/Xcode_iOS_DDI_Personalized/{path}'
+)
+PERSONALIZED_DDI_GITHUB_API_URL = (
+    'https://api.github.com/repos/'
+    f'{PERSONALIZED_DDI_GITHUB_REPOSITORY}/git/blobs/{{blob_id}}'
+)
+PERSONALIZED_DDI_METADATA_FILENAME = '.iphoneMirror-ddi.json'
+HID_SERVICE_REGISTRATION_ATTEMPTS = 12
+HID_SERVICE_REGISTRATION_RETRY_SECONDS = 1
+KEYBOARD_SURFACE_CONNECTED = 512
+REMOTE_PAIRING_PROVISION_TIMEOUT_SECONDS = 30
+REMOTE_PAIRING_DISCOVERY_TIMEOUT_SECONDS = 15
+REMOTE_PAIRING_DISCOVERY_GRACE_SECONDS = 12
+
+
+def _pasteboard_snapshot_text(snapshot: dict) -> tuple[Optional[str], bool]:
+    """Read inline text, and distinguish promised text from an empty board."""
+    representations = (
+        ('public.utf8-plain-text', 'utf-8'),
+        ('public.utf16-plain-text', 'utf-16'),
+        ('public.utf16-external-plain-text', 'utf-16'),
+        ('public.plain-text', 'utf-8'),
+        ('public.text', 'utf-8'),
+        ('public.url', 'utf-8'),
+    )
+    board = snapshot.get('pasteboard', snapshot)
+    unresolved = False
+    for item in board.get('items', []) or []:
+        data = item.get('data') or {}
+        types = item.get('types') or []
+        for uti, encoding in representations:
+            datum = data.get(uti)
+            if not isinstance(datum, dict):
+                unresolved |= uti in types
+                continue
+            raw = datum.get('data')
+            if isinstance(raw, str):
+                return raw, False
+            if not isinstance(raw, (bytes, bytearray)):
+                unresolved |= datum.get('isPromised') is True or uti in types
+                continue
+            # iOS UTF-16 without a BOM uses the device's little-endian order;
+            # external representations may explicitly carry either byte order.
+            if encoding == 'utf-16' and not raw.startswith((b'\xff\xfe', b'\xfe\xff')):
+                encoding = 'utf-16-le'
+            try:
+                return raw.decode(encoding), False
+            except UnicodeDecodeError:
+                continue
+    return None, unresolved
+
+
+def local_personalized_ddi_bundle(ddi_dir: Path) -> tuple[Path, Path, Path]:
+    """Return an explicitly supplied local Personalized DDI bundle.
+
+    The bridge never discovers a DDI from its install directory. When this
+    explicit override is absent, the bridge downloads and verifies a compatible
+    Personalized DDI into its cache. Apple personalization and mount verification
+    apply to both downloaded and explicitly supplied local images.
+    """
+    root = Path(ddi_dir).expanduser()
+    if not root.is_dir():
+        raise BridgePrerequisiteError(
+            'developer_image_bundle_invalid',
+            'The supplied Personalized DDI directory does not exist.',
+        )
+    paths = [root / name for name in PERSONALIZED_DDI_FILES]
+    # Apple's repository names this file Image.dmg.trustcache while some
+    # tooling exports the shorter Image.trustcache spelling. Accept both and
+    # pass the actual path through to PersonalizedImageMounter.
+    if not paths[2].is_file() and (root / 'Image.dmg.trustcache').is_file():
+        paths[2] = root / 'Image.dmg.trustcache'
+    invalid = []
+    for path in paths:
+        try:
+            valid = path.is_file() and path.stat().st_size > 0
+        except OSError:
+            valid = False
+        if not valid:
+            invalid.append(path.name)
+    if invalid:
+        raise BridgePrerequisiteError(
+            'developer_image_bundle_invalid',
+            'The supplied Personalized DDI directory is missing non-empty files: '
+            + ', '.join(invalid),
+        )
+    try:
+        manifest = plistlib.loads(paths[1].read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException, ExpatError) as error:
+        raise BridgePrerequisiteError(
+            'developer_image_bundle_invalid',
+            'The supplied Personalized DDI BuildManifest.plist is invalid.',
+        ) from error
+    if not isinstance(manifest, dict) or not isinstance(
+            manifest.get('ProductBuildVersion'), str):
+        raise BridgePrerequisiteError(
+            'developer_image_bundle_invalid',
+            'The supplied Personalized DDI BuildManifest.plist has no build version.',
+        )
+    return tuple(paths)
+
+
+@dataclass(frozen=True)
+class PersonalizedDdiAsset:
+    local_name: str
+    upstream_name: str
+    blob_id: str
+    size: int
+    sha256: Optional[str] = None
+    revision: str = ''
+
+
+@dataclass(frozen=True)
+class PersonalizedDdiDownloadSource:
+    name: str
+    kind: str
+    prefix: str = ''
+    proxy: Optional[str] = None
+
+
+PERSONALIZED_DDI_PINNED_BUILD_ID = '27A5228h'
+PERSONALIZED_DDI_ASSETS = (
+    PersonalizedDdiAsset(
+        'Image.dmg', 'Image.dmg',
+        'a1564ba32725672264dd35733673fbdd0c7943d9',
+        15733248,
+        '05fd807da5e19f030fa4941f24800c965c6c77982ab572dd5d1ef778fb69f9ca',
+        PERSONALIZED_DDI_PINNED_REVISION,
+    ),
+    PersonalizedDdiAsset(
+        'BuildManifest.plist', 'BuildManifest.plist',
+        'e68b3271feea8496f7fab22cae0c8cd2332a3a0a',
+        801505,
+        '8edd4a2f4f4ef1fbd7bfe49785d8badc673d1395d1d94d85b132ca8ab5ecaf54',
+        PERSONALIZED_DDI_PINNED_REVISION,
+    ),
+    PersonalizedDdiAsset(
+        'Image.trustcache', 'Image.dmg.trustcache',
+        'dcec241e1a25ee8b8d25550276dbb6d9c5fb8019',
+        1895,
+        '36af60889ff5a737874a26daeb8e1a0139ebfebec6ec2e4d8f6a3c1bf1dce35c',
+        PERSONALIZED_DDI_PINNED_REVISION,
+    ),
+)
+
+# Same MoreTools snapshot used by the built-in updater. They are only used for
+# transport: every downloaded DDI file has a pinned length and SHA-256 below.
+PERSONALIZED_DDI_MIRROR_PREFIXES = (
+    'https://gh-proxy.net/',
+    'https://github.cnxiaobai.com/',
+    'https://hub.gitmirror.com/',
+    'https://www.5555.cab/',
+    'https://git.tangbai.cc/',
+    'https://gh.ddlc.top/',
+    'https://ghproxy.xiaopa.cc/',
+    'https://ghproxy.cfd/',
+    'https://ghproxy.cc/',
+    'https://ghproxy.monkeyray.net/',
+    'https://cf.ghproxy.cc/',
+    'https://gitproxy.mrhjx.cn/',
+    'https://gh.xxooo.cf/',
+    'https://github.xxlab.tech/',
+    'https://ghproxy.1888866.xyz/',
+    'https://github.mlmle.cn/',
+    'https://fastgit.cc/',
+    'https://gh.1k.ink/',
+    'https://ghproxy.net/',
+    'https://github.boringhex.top/',
+    'https://ghfast.top/',
+    'https://y.whereisdoge.work/',
+    'https://ghproxy.imciel.com/',
+    'https://gh.jdck.fun/',
+    'https://xiaomo-station.top/',
+    'https://gh.monlor.com/',
+    'https://g.blfrp.cn/',
+    'https://gh.con.sh/',
+    'https://gh.b52m.cn/',
+    'https://github.dpik.top/',
+    'https://github.geekery.cn/',
+    'https://gh.halonice.com/',
+    'https://github.limoruirui.com/',
+    'https://git.yylx.win/',
+    'https://github.tbedu.top/',
+    'https://ghproxy.vansour.top/',
+    'https://tvv.tw/',
+    'https://ghproxy.xzhouqd.com/',
+    'https://github-proxy.memory-echoes.cn/',
+    'https://gh.catmak.name/',
+    'https://hub.ddayh.com/',
+    'https://github.ruojian.space/',
+    'https://ghproxy.cxkpro.top/',
+    'https://ghp.keleyaa.com/',
+    'https://ghf.\u65e0\u540d\u6c0f.top/',
+    'https://github-proxy.lixxing.top/',
+    'https://gh.padao.fun/',
+    'https://gp.871201.xyz/',
+    'https://gh.wsmdn.dpdns.org/',
+    'https://ggg.clwap.dpdns.org/',
+    'https://gh-proxy.com/',
+    'https://gh.dpik.top/',
+    'https://gp.zkitefly.eu.org/',
+    'https://gh.bugdey.us.kg/',
+    'https://code-hub-hk.freexy.top/',
+    'https://github.chenc.dev/',
+    'https://ghfile.geekertao.top/',
+    'https://kenyu.ggff.net/',
+    'https://gh.nxnow.top/',
+    'https://github.bullb.net/',
+    'https://gitproxy.197545.xyz/',
+    'https://gitproxy.127731.xyz/',
+    'https://gitproxy1.127731.xyz/',
+    'https://jiashu.1win.eu.org/',
+    'https://ghproxy.mf-dust.dpdns.org/',
+    'https://j.1lin.dpdns.org/',
+    'https://gh.jasonzeng.dev/',
+    'https://proxy.baguoyuyan.com/',
+    'https://github.1ms.xx.kg/',
+    'https://gh.198962.xyz/',
+    'https://github.880824.xyz/',
+    'https://ghps.cc/',
+    'https://30006000.xyz/',
+    'https://github.tianrld.top/',
+    'https://getgit.love8yun.eu.org/',
+    'https://github.788787.xyz/',
+    'https://ghm.078465.xyz/',
+    'https://github-proxy.com/',
+    'https://proxy.yaoyaoling.net/',
+    'https://ghproxy.sakuramoe.dev/',
+    'https://ghproxy.053000.xyz/',
+    'https://gh.chjina.com/',
+    'https://git.zeas.cc/',
+    'https://ghpxy.hwinzniej.top/',
+    'https://gh.echofree.xyz/',
+    'https://github.zzrbk.xyz/',
+    'https://git.669966.xyz/',
+    'https://github.ihnic.com/',
+    'https://gh.996986.xyz/',
+    'https://gh.idayer.com/',
+    'https://github.ednovas.xyz/',
+    'https://gh.chalin.tk/',
+    'https://j.1win.ggff.net/',
+    'https://github.lsdfxdk.nyc.mn/',
+    'https://gh.aaa.team/',
+    'https://github.crdz.eu.org/',
+    'https://gh.shiina-rimo.cafe/',
+    'https://ghproxy.mirror.skybyte.me/',
+    'https://gh.llkk.cc/',
+    'https://git.40609891.xyz/',
+    'https://github.oterea.top/',
+    'https://gh.noki.icu/',
+    'https://gh.39.al/',
+    'https://ghproxy.cn/',
+    'https://down.npee.cn/',
+    'https://github.kkproxy.dpdns.org/',
+    'https://free.cn.eu.org/',
+    'https://git.951959483.xyz/',
+    'https://git.820828.xyz/',
+    'https://ghproxy.fangkuai.fun/',
+    'https://github.cn86.dev/',
+    'https://github.zjzzy.cloudns.org/',
+    'https://ghb.nilive.top/',
+    'https://gitproxy.click/',
+    'https://proxy.atoposs.com/',
+)
+
+
+def _personalized_ddi_cache_directory() -> Path:
+    """Return the cache path shared with pymobiledevice3's DDI tooling."""
+    return get_home_folder() / PERSONALIZED_DDI_CACHE_DIRECTORY
+
+
+DDI_REJECTION_TTL_SECONDS = 300
+
+
+def _ddi_rejection_scope(lockdown):
+    """A device/OS rejection must not blacklist the shared image for other phones."""
+    udid = getattr(lockdown, 'udid', None)
+    if not isinstance(udid, str) or not udid:
+        return None
+    values = getattr(lockdown, 'all_values', {})
+    values = values if isinstance(values, dict) else {}
+    identity = [udid.replace('-', '').casefold(), str(values.get('ProductVersion', '')),
+                str(values.get('BuildVersion', ''))]
+    return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+
+
+def _ddi_rejection_path(root, scope):
+    # Each device/OS owns its own atomic record. A shared record lets another
+    # device overwrite a still-live rejection and repeatedly mount a bad image.
+    key = hashlib.sha256(scope.encode('utf-8')).hexdigest()
+    return root / f'.iphoneMirror-ddi-rejected-{key}.json'
+
+
+def _read_ddi_rejection(root, scope=None):
+    if not scope:
+        return (), None
+    root = _ddi_cache_content_root(root)
+    try:
+        try:
+            payload = _ddi_rejection_path(root, scope).read_text(encoding='utf-8')
+        except FileNotFoundError:
+            # Older versions had one shared record; retain its scoped TTL.
+            payload = (root / '.iphoneMirror-ddi-rejected.json').read_text(encoding='utf-8')
+        record = json.loads(payload)
+        assets = _read_ddi_metadata(root)
+        age = time.time() - float(record.get('created_at', 0))
+        if (assets and record.get('scope') == scope and 0 <= age < DDI_REJECTION_TTL_SECONDS and
+                record.get('blobs') == [asset.blob_id for asset in assets] and
+                record.get('code') in {'developer_image_tss_rejected', 'developer_image_download_incompatible',
+                                       'developer_image_bundle_invalid'}):
+            return tuple(record['blobs']), record['code']
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return (), None
+
+
+def _record_ddi_rejection(bundle, code, scope=None):
+    if not scope or code not in {'developer_image_tss_rejected', 'developer_image_download_incompatible',
+                    'developer_image_bundle_invalid'}:
+        return
+    cache = _personalized_ddi_cache_directory()
+    root = Path(bundle[0]).parent
+    if root != cache and root.parent != cache / 'bundles':
+        return
+    if tuple(map(str, bundle)) != tuple(str(root / name) for name in PERSONALIZED_DDI_FILES):
+        return
+    assets = _read_ddi_metadata(root)
+    if assets is None:
+        return
+    try:
+        target = _ddi_rejection_path(root, scope)
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=root,
+                                         prefix='.ddi-rejected-', suffix='.tmp', delete=False) as output:
+            temporary = Path(output.name)
+            json.dump({'blobs': [asset.blob_id for asset in assets], 'code': code,
+                       'scope': scope, 'created_at': time.time()}, output)
+        os.replace(temporary, target)
+    except OSError:
+        log.warning('Unable to record the rejected cached DDI.')
+    finally:
+        if 'temporary' in locals():
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
+
+
+def _ddi_bundle_blobs(bundle):
+    return tuple(_git_blob_sha1_file(path, path.stat().st_size) for path in bundle)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        while chunk := stream.read(PERSONALIZED_DDI_DOWNLOAD_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _request_proxy_kwargs(proxy: Optional[str]) -> dict[str, object]:
+    if not proxy:
+        # Empty values override requests' environment/system proxy discovery.
+        return {'proxies': {'http': '', 'https': '', 'all': ''}}
+    return {'proxies': {'http': proxy, 'https': proxy}}
+
+
+def _local_proxy_candidates() -> tuple[str, ...]:
+    candidates = []
+    for name in ('IPHONE_MIRROR_GITHUB_PROXY', 'HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY'):
+        value = os.environ.get(name, '').strip()
+        if not value or value.upper() == 'DIRECT':
+            continue
+        parsed = urlsplit(value)
+        if parsed.scheme.casefold() not in ('http', 'https', 'socks5', 'socks5h') or not parsed.hostname:
+            continue
+        if value not in candidates:
+            candidates.append(value)
+    return tuple(candidates)
+
+
+def _response_chunks(response, chunk_size, check_progress):
+    """Yield socket progress without waiting for a full application chunk."""
+    read1 = getattr(getattr(response, 'raw', None), 'read1', None)
+    if not callable(read1):
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            check_progress()
+            yield chunk
+        return
+    while True:
+        check_progress()
+        chunk = read1(chunk_size, decode_content=True)
+        check_progress()
+        if not chunk:
+            return
+        yield chunk
+
+
+def _github_request_json(url: str, proxy: Optional[str] = None, *, deadline=None, check_cancelled=None) -> object:
+    def check_progress():
+        if check_cancelled is not None:
+            check_cancelled()
+        if deadline is not None and time.monotonic() >= deadline:
+            raise BridgePrerequisiteError('developer_image_download_timeout', 'DDI metadata time budget expired.')
+    try:
+        check_progress()
+        remaining = max(.1, deadline - time.monotonic()) if deadline is not None else 30
+        response = requests.get(
+            url,
+            headers=_ddi_source_headers(PersonalizedDdiDownloadSource('github-api', 'api')),
+            **_request_proxy_kwargs(proxy),
+            timeout=(min(PERSONALIZED_DDI_DOWNLOAD_CONNECT_TIMEOUT_SECONDS, remaining),
+                     min(8, remaining)), stream=True,
+        )
+        with response:
+            if response.status_code in (403, 429) and \
+                    response.headers.get('X-RateLimit-Remaining') == '0':
+                raise BridgePrerequisiteError(
+                    'developer_image_download_rate_limited',
+                    'GitHub API rate limit exhausted while resolving the Personalized DDI.',
+                )
+            if response.status_code != 200:
+                raise BridgePrerequisiteError(
+                    'developer_image_download_failed',
+                    f'GitHub API returned HTTP {response.status_code}.',
+                )
+            payload = bytearray()
+            for chunk in _response_chunks(response, 64 * 1024, check_progress):
+                check_progress()
+                payload.extend(chunk)
+                if len(payload) > 4 * 1024 * 1024:
+                    raise ValueError('DDI metadata exceeds size limit')
+            return json.loads(payload)
+    except BridgePrerequisiteError:
+        raise
+    except (RequestException, Urllib3HTTPError, OSError, ValueError) as error:
+        raise BridgePrerequisiteError(
+            'developer_image_download_failed',
+            f'Unable to resolve Personalized DDI metadata from GitHub: {type(error).__name__}.',
+        ) from error
+
+
+def _resolve_github_personalized_ddi_assets(ref: Optional[str] = None, **request_options) -> tuple[PersonalizedDdiAsset, ...]:
+    """Resolve the current GitHub DDI directory and bind it to this runtime build.
+
+    GitHub's directory API supplies the expected Git blob ID for each asset.
+    """
+    ref_url = PERSONALIZED_DDI_GITHUB_COMMIT_API_URL.format(
+        ref=quote(ref or PERSONALIZED_DDI_GITHUB_REF, safe=''))
+    commit_payload = _github_request_with_proxy_fallback(ref_url, **request_options)
+    revision = commit_payload.get('sha') if isinstance(commit_payload, dict) else None
+    if not isinstance(revision, str) or len(revision) != 40 or any(c not in '0123456789abcdef' for c in revision):
+        raise BridgePrerequisiteError(
+            'developer_image_download_failed',
+            'GitHub did not return a valid DDI commit revision.',
+        )
+    contents_url = PERSONALIZED_DDI_GITHUB_CONTENTS_API_URL.format(revision=revision)
+    contents_payload = _github_request_with_proxy_fallback(contents_url, **request_options)
+    if not isinstance(contents_payload, list):
+        raise BridgePrerequisiteError(
+            'developer_image_download_incompatible',
+            'GitHub DDI directory response is not a file list.',
+        )
+    by_name = {
+        item.get('name'): item for item in contents_payload
+        if isinstance(item, dict) and isinstance(item.get('name'), str)
+    }
+    upstream_names = {
+        'Image.dmg': 'Image.dmg',
+        'BuildManifest.plist': 'BuildManifest.plist',
+        'Image.trustcache': 'Image.dmg.trustcache',
+    }
+    assets = []
+    for local_name in PERSONALIZED_DDI_FILES:
+        upstream_name = upstream_names[local_name]
+        item = by_name.get(upstream_name)
+        size = item.get('size') if isinstance(item, dict) else None
+        blob_id = item.get('sha') if isinstance(item, dict) else None
+        if not isinstance(size, int) or size <= 0 or not isinstance(blob_id, str) or \
+                len(blob_id) != 40 or any(c not in '0123456789abcdef' for c in blob_id):
+            raise BridgePrerequisiteError(
+                'developer_image_download_incompatible',
+                f'GitHub DDI metadata is missing {upstream_name}.',
+            )
+        assets.append(PersonalizedDdiAsset(
+            local_name, upstream_name, blob_id, size, None, revision))
+    return tuple(assets)
+
+
+def _github_request_with_proxy_fallback(url: str, **request_options) -> object:
+    try:
+        return _github_request_json(url, **request_options)
+    except BridgePrerequisiteError as direct_error:
+        proxies = _local_proxy_candidates()
+        if not proxies:
+            raise
+        for proxy in proxies:
+            if request_options.get('check_cancelled'):
+                request_options['check_cancelled']()
+            if request_options.get('deadline') is not None and time.monotonic() >= request_options['deadline']:
+                raise direct_error
+            try:
+                result = _github_request_json(url, proxy, **request_options)
+                log.info('GitHub DDI metadata request succeeded through configured proxy')
+                return result
+            except BridgePrerequisiteError:
+                continue
+        raise direct_error
+
+
+def _ddi_metadata_path(root: Path) -> Path:
+    return root / PERSONALIZED_DDI_METADATA_FILENAME
+
+
+def _write_ddi_metadata(root: Path, assets: tuple[PersonalizedDdiAsset, ...],
+                        build_id: str) -> None:
+    payload = {
+        'schema': 1,
+        'build_id': build_id,
+        'revision': assets[0].revision if assets else '',
+        'assets': [
+            {'local_name': asset.local_name, 'upstream_name': asset.upstream_name,
+             'blob_id': asset.blob_id, 'size': asset.size, 'sha256': asset.sha256}
+            for asset in assets
+        ],
+    }
+    temporary = _ddi_metadata_path(root).with_suffix('.tmp')
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding='utf-8')
+    os.replace(temporary, _ddi_metadata_path(root))
+
+
+def _read_ddi_metadata(root: Path) -> Optional[tuple[PersonalizedDdiAsset, ...]]:
+    try:
+        payload = json.loads(_ddi_metadata_path(root).read_text(encoding='utf-8'))
+        if not isinstance(payload, dict):
+            return None
+        if payload.get('schema') != 1 or payload.get('build_id') != LATEST_DDI_BUILD_ID:
+            return None
+        assets = []
+        for item in payload.get('assets', []):
+            if not isinstance(item, dict) or not all(
+                    isinstance(item.get(key), expected) for key, expected in (
+                        ('local_name', str), ('upstream_name', str), ('blob_id', str),
+                        ('size', int), ('sha256', str))):
+                return None
+            assets.append(PersonalizedDdiAsset(
+                item['local_name'], item['upstream_name'], item['blob_id'],
+                item['size'], item['sha256'], str(payload.get('revision', ''))))
+        if len(assets) != len(PERSONALIZED_DDI_FILES) or \
+                {asset.local_name for asset in assets} != set(PERSONALIZED_DDI_FILES):
+            return None
+        by_name = {asset.local_name: asset for asset in assets}
+        return tuple(by_name[name] for name in PERSONALIZED_DDI_FILES)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _ddi_cache_content_root(root: Path) -> Path:
+    # Legacy caches remain readable. New publications switch one small pointer,
+    # never the files a different session may already be signing or uploading.
+    try:
+        pointer = json.loads((root / '.iphoneMirror-ddi-current.json').read_text(encoding='utf-8'))
+        name = pointer['directory']
+        if isinstance(name, str) and len(name) in (64, 97) and all(c in '0123456789abcdef-' for c in name):
+            return root / 'bundles' / name
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return root
+
+
+def _valid_personalized_ddi_bundle(root: Path) -> Optional[tuple[Path, Path, Path]]:
+    """Return a cache only when its GitHub-bound metadata and SHA-256 match."""
+    root = _ddi_cache_content_root(root)
+    assets = _read_ddi_metadata(root)
+    if assets is None:
+        return None
+    try:
+        for asset in assets:
+            path = root / asset.local_name
+            if not path.is_file() or path.stat().st_size != asset.size:
+                return None
+            if not asset.sha256 or _sha256_file(path) != asset.sha256 or \
+                    _git_blob_sha1_file(path, asset.size) != asset.blob_id:
+                return None
+        build_manifest = plistlib.loads((root / 'BuildManifest.plist').read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException, ExpatError):
+        return None
+    if not isinstance(build_manifest, dict) or \
+            build_manifest.get('ProductBuildVersion') != LATEST_DDI_BUILD_ID:
+        return None
+    return tuple(root / name for name in PERSONALIZED_DDI_FILES)
+
+
+def _git_blob_sha1_file(path: Path, size: int) -> str:
+    digest = hashlib.sha1(f'blob {size}\0'.encode('ascii'))
+    with path.open('rb') as source:
+        for chunk in iter(lambda: source.read(PERSONALIZED_DDI_DOWNLOAD_CHUNK_BYTES), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _ddi_source_headers(source: PersonalizedDdiDownloadSource) -> dict[str, str]:
+    headers = {
+        'User-Agent': 'iUsbBridge/1.0',
+        'Accept-Encoding': 'identity',
+    }
+    if source.kind == 'api':
+        headers['Accept'] = 'application/vnd.github.raw+json'
+        # Never send an optional GitHub credential through a public mirror.
+        token = os.environ.get('IPHONE_MIRROR_GITHUB_TOKEN', '').strip()
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+    return headers
+
+
+def _ddi_asset_url(source: PersonalizedDdiDownloadSource,
+                   asset: PersonalizedDdiAsset) -> str:
+    if source.kind == 'api':
+        return PERSONALIZED_DDI_GITHUB_API_URL.format(blob_id=asset.blob_id)
+    upstream = PERSONALIZED_DDI_GITHUB_RAW_URL.format(
+        revision=asset.revision or PERSONALIZED_DDI_GITHUB_REF,
+        path=quote(asset.upstream_name, safe='/'))
+    return upstream if source.kind == 'raw' else source.prefix + upstream
+
+
+def _normalized_url_host(url: str) -> str:
+    host = urlsplit(url).hostname
+    if not host:
+        raise ValueError('The download URL has no host.')
+    return host.encode('idna').decode('ascii').casefold()
+
+
+def _validate_ddi_source_response(source: PersonalizedDdiDownloadSource,
+                                  requested_url: str, response) -> None:
+    """Keep a mirror on its declared HTTPS host after redirects."""
+    final_url = getattr(response, 'url', '')
+    try:
+        final_scheme = urlsplit(final_url).scheme.casefold()
+        if final_scheme != 'https' or \
+                _normalized_url_host(final_url) != _normalized_url_host(requested_url):
+            raise ValueError('redirected to a different host')
+    except ValueError as error:
+        raise BridgePrerequisiteError(
+            'developer_image_download_failed',
+            f'{source.name} did not retain its trusted HTTPS endpoint: {error}.',
+        ) from error
+
+
+def _ddi_source_root(source: PersonalizedDdiDownloadSource,
+                     probe_asset: PersonalizedDdiAsset) -> str:
+    parts = urlsplit(_ddi_asset_url(source, probe_asset))
+    return f'{parts.scheme}://{parts.netloc}/'
+
+
+def _personalized_ddi_download_sources() -> tuple[PersonalizedDdiDownloadSource, ...]:
+    direct = (
+        PersonalizedDdiDownloadSource('github-raw', 'raw'),
+        PersonalizedDdiDownloadSource('github-api', 'api'),
+    )
+    proxies = _local_proxy_candidates()
+    configured = direct + tuple(
+        replace(source, name=f'{source.name}-proxy', proxy=proxy)
+        for proxy in proxies for source in direct)
+    mirrors = tuple(
+        PersonalizedDdiDownloadSource(f'github-raw-mirror-{index}', 'mirror', prefix)
+        for index, prefix in enumerate(PERSONALIZED_DDI_MIRROR_PREFIXES, 1))
+    return configured + mirrors
+
+
+def _source_phase(source: PersonalizedDdiDownloadSource) -> str:
+    if source.proxy:
+        return 'proxy'
+    if source.kind == 'mirror':
+        return 'mirror'
+    return 'direct'
+
+
+def _parse_content_length(response) -> Optional[int]:
+    raw_value = response.headers.get('Content-Length')
+    if raw_value is None:
+        return None
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError('invalid Content-Length') from error
+    if value < 0:
+        raise ValueError('negative Content-Length')
+    return value
+
+
+def _read_probe_payload(response, expected_bytes: int, deadline=None) -> int:
+    received = 0
+    def check_progress():
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError('DDI source probe time budget expired')
+    for chunk in _response_chunks(response, 64 * 1024, check_progress):
+        if not chunk:
+            continue
+        remaining = expected_bytes - received
+        if remaining <= 0:
+            break
+        received += min(len(chunk), remaining)
+        if received == expected_bytes:
+            break
+    if received != expected_bytes:
+        raise ValueError(
+            f'probe ended at {received} bytes, expected {expected_bytes}')
+    return received
+
+
+def _ping_personalized_ddi_source(source: PersonalizedDdiDownloadSource,
+                                  probe_asset: PersonalizedDdiAsset) -> Optional[float]:
+    """Mirror connectivity stage equivalent to the updater's HEAD sweep."""
+    requested_url = _ddi_source_root(source, probe_asset)
+    try:
+        started = time.perf_counter()
+        response = requests.head(
+            requested_url,
+            headers=_ddi_source_headers(source),
+            timeout=(PERSONALIZED_DDI_SOURCE_CONNECT_TIMEOUT_SECONDS,
+                     PERSONALIZED_DDI_SOURCE_CONNECT_TIMEOUT_SECONDS),
+            allow_redirects=True,
+            **_request_proxy_kwargs(source.proxy),
+        )
+        try:
+            _validate_ddi_source_response(source, requested_url, response)
+            return time.perf_counter() - started
+        finally:
+            response.close()
+    except (BridgePrerequisiteError, RequestException, OSError, ValueError):
+        return None
+
+
+def _probe_personalized_ddi_source(source: PersonalizedDdiDownloadSource,
+                                   asset: PersonalizedDdiAsset) -> Optional[float]:
+    """Measure an actual ranged payload before selecting a mirror."""
+    requested_url = _ddi_asset_url(source, asset)
+    deadline = time.monotonic() + PERSONALIZED_DDI_SOURCE_THROUGHPUT_WINDOW_SECONDS
+    sample_bytes = min(asset.size, PERSONALIZED_DDI_MIRROR_PROBE_BYTES)
+    probe_end = sample_bytes - 1
+    headers = _ddi_source_headers(source)
+    headers['Range'] = f'bytes=0-{probe_end}'
+    try:
+        started = time.perf_counter()
+        with requests.get(
+                requested_url,
+                headers=headers,
+                timeout=(PERSONALIZED_DDI_SOURCE_CONNECT_TIMEOUT_SECONDS,
+                         PERSONALIZED_DDI_SOURCE_READ_TIMEOUT_SECONDS),
+                stream=True,
+                allow_redirects=True,
+                **_request_proxy_kwargs(source.proxy)) as response:
+            _validate_ddi_source_response(source, requested_url, response)
+            content_length = _parse_content_length(response)
+            if response.status_code == 200:
+                if content_length is not None and content_length != asset.size:
+                    raise ValueError('full probe size does not match the pinned asset')
+            elif response.status_code == 206:
+                expected_range = f'bytes 0-{probe_end}/{asset.size}'
+                if response.headers.get('Content-Range', '').casefold() != expected_range:
+                    raise ValueError('partial probe returned an invalid content range')
+                if content_length is not None and content_length != sample_bytes:
+                    raise ValueError('partial probe returned an invalid content length')
+            else:
+                raise ValueError(f'probe returned HTTP {response.status_code}')
+            received = _read_probe_payload(response, sample_bytes, deadline)
+        return received / max(time.perf_counter() - started, 0.001)
+    except (BridgePrerequisiteError, RequestException, Urllib3HTTPError, OSError, ValueError):
+        return None
+
+
+def _measure_ddi_sources(sources: tuple[PersonalizedDdiDownloadSource, ...],
+                         operation: Callable[[PersonalizedDdiDownloadSource], Optional[float]],
+                         timeout_seconds: int) -> list[tuple[PersonalizedDdiDownloadSource, float]]:
+    """Run the updater-style sweep concurrently without blocking the bridge loop."""
+    if not sources:
+        return []
+    executor = ThreadPoolExecutor(
+        max_workers=len(sources), thread_name_prefix='iphoneMirror-ddi-probe')
+    futures = {executor.submit(operation, source): source for source in sources}
+    try:
+        completed, _ = wait(futures, timeout=timeout_seconds)
+        measurements = []
+        for future in completed:
+            try:
+                measurement = future.result()
+            except (RequestException, OSError, ValueError):
+                measurement = None
+            if measurement is not None:
+                measurements.append((futures[future], measurement))
+        return measurements
+    finally:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _deduplicate_ddi_sources(sources: list[PersonalizedDdiDownloadSource]) -> \
+        tuple[PersonalizedDdiDownloadSource, ...]:
+    selected = []
+    seen: set[PersonalizedDdiDownloadSource] = set()
+    for source in sources:
+        if source not in seen:
+            seen.add(source)
+            selected.append(source)
+    return tuple(selected)
+
+
+def rank_personalized_ddi_download_sources(
+        assets: Optional[tuple[PersonalizedDdiAsset, ...]] = None
+        ) -> tuple[PersonalizedDdiDownloadSource, ...]:
+    """Prefer direct/proxy GitHub, then rank mirrors by measured throughput."""
+    sources = _personalized_ddi_download_sources()
+    direct = sources[:2]
+    proxy_sources = tuple(source for source in sources[2:] if source.proxy)
+    mirrors = tuple(source for source in sources if source.kind == 'mirror')
+    ranked_mirrors = []
+    if mirrors:
+        probe_candidates = assets or PERSONALIZED_DDI_ASSETS
+        probe_asset = next(asset for asset in probe_candidates
+                           if asset.local_name == 'Image.trustcache')
+        measurements = _measure_ddi_sources(
+            mirrors, lambda source: _probe_personalized_ddi_source(source, probe_asset),
+            PERSONALIZED_DDI_SOURCE_THROUGHPUT_WINDOW_SECONDS)
+        ranked_mirrors = [source for source, _ in sorted(
+            measurements, key=lambda item: item[1], reverse=True)]
+    log.info('Personalized DDI download order: direct=%d proxy=%d mirrors_tested=%d/%d',
+             len(direct), len(proxy_sources), len(ranked_mirrors), len(mirrors))
+    return direct + proxy_sources + tuple(ranked_mirrors)
+
+
+def _download_personalized_ddi_asset(
+        source: PersonalizedDdiDownloadSource, asset: PersonalizedDdiAsset,
+        destination: Path, *, deadline=None, check_cancelled=None) -> None:
+    requested_url = _ddi_asset_url(source, asset)
+    started = time.monotonic()
+    received = 0
+    def check_progress():
+        if check_cancelled is not None:
+            check_cancelled()
+        if deadline is not None and time.monotonic() >= deadline:
+            raise BridgePrerequisiteError('developer_image_download_timeout', 'DDI source time budget expired.')
+    try:
+        check_progress()
+        remaining = max(.1, deadline - time.monotonic()) if deadline is not None else 30
+        with requests.get(
+                requested_url,
+                headers=_ddi_source_headers(source),
+                timeout=(min(PERSONALIZED_DDI_DOWNLOAD_CONNECT_TIMEOUT_SECONDS, remaining),
+                         min(PERSONALIZED_DDI_DOWNLOAD_READ_TIMEOUT_SECONDS,
+                             remaining, 8 if deadline is not None else 30)),
+                stream=True,
+                allow_redirects=True,
+                **_request_proxy_kwargs(source.proxy)) as response:
+            _validate_ddi_source_response(source, requested_url, response)
+            if response.status_code in (403, 429) and \
+                    response.headers.get('X-RateLimit-Remaining') == '0':
+                raise BridgePrerequisiteError(
+                    'developer_image_download_rate_limited',
+                    f'{source.name} rate-limited the Personalized DDI download.',
+                )
+            if response.status_code != 200:
+                raise BridgePrerequisiteError(
+                    'developer_image_download_failed',
+                    f'{source.name} returned HTTP {response.status_code} for {asset.local_name}.',
+                )
+            content_length = _parse_content_length(response)
+            if content_length is not None and content_length != asset.size:
+                raise BridgePrerequisiteError(
+                    'developer_image_download_integrity_failed',
+                    f'{source.name} returned an unexpected size for {asset.local_name}.',
+                )
+            digest = hashlib.sha256()
+            blob_digest = hashlib.sha1(f'blob {asset.size}\0'.encode('ascii'))
+            with destination.open('xb') as output:
+                # iter_content(size) can wait for the ENTIRE chunk while a peer
+                # trickles bytes below the socket read timeout. read1 returns
+                # available bytes so cancellation/deadlines are checked promptly.
+                for chunk in _response_chunks(response, PERSONALIZED_DDI_DOWNLOAD_CHUNK_BYTES, check_progress):
+                    check_progress()
+                    if not chunk:
+                        continue
+                    received += len(chunk)
+                    if received > asset.size:
+                        raise BridgePrerequisiteError(
+                            'developer_image_download_integrity_failed',
+                            f'{source.name} exceeded the pinned size for {asset.local_name}.',
+                        )
+                    digest.update(chunk)
+                    blob_digest.update(chunk)
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+            actual_sha256 = digest.hexdigest()
+            if received != asset.size or blob_digest.hexdigest() != asset.blob_id or \
+                    (asset.sha256 and actual_sha256 != asset.sha256):
+                raise BridgePrerequisiteError(
+                    'developer_image_download_integrity_failed',
+                    f'{source.name} failed Git blob/SHA-256 verification for {asset.local_name} '
+                    f'(sha256={actual_sha256}).',
+                )
+    except BridgePrerequisiteError:
+        raise
+    except (RequestException, Urllib3HTTPError, OSError, ValueError) as error:
+        if isinstance(error, OSError) and not isinstance(error, (RequestException, Urllib3HTTPError)) and (
+                error.errno in (errno.EACCES, errno.EPERM, errno.ENOSPC, errno.EROFS, errno.EDQUOT) or
+                getattr(error, 'winerror', None) in (5, 32, 33, 112)):
+            raise BridgePrerequisiteError('developer_image_cache_failed',
+                                          'Unable to write the DDI cache; check disk space and write access.') from error
+        raise BridgePrerequisiteError(
+            'developer_image_download_failed',
+            f'{source.name} could not download {asset.local_name}: {type(error).__name__}.',
+        ) from error
+    finally:
+        log.info('DDI source transfer asset=%s source=%s bytes=%d elapsed_ms=%d',
+                 asset.local_name, source.name, received, (time.monotonic() - started) * 1000)
+
+
+def _raise_ddi_download_failure(asset: PersonalizedDdiAsset,
+                                failures: list[BridgePrerequisiteError]) -> None:
+    codes = [failure.code for failure in failures]
+    if codes and all(code == 'developer_image_download_rate_limited' for code in codes):
+        raise BridgePrerequisiteError(
+            'developer_image_download_rate_limited',
+            'All Personalized DDI download sources are rate-limited. Configure '
+            'IPHONE_MIRROR_GITHUB_TOKEN or retry later.',
+        )
+    code = ('developer_image_download_integrity_failed'
+            if 'developer_image_download_integrity_failed' in codes
+            else 'developer_image_download_failed')
+    details = '; '.join(str(error)[:150] for error in failures[-4:])
+    raise BridgePrerequisiteError(
+        code,
+        f'No verified source could provide {asset.local_name}. {details}',
+    )
+
+
+def fetch_automatic_personalized_ddi_bundle(
+        on_download_started: Optional[Callable[[], None]] = None,
+        cancelled: Optional[threading.Event] = None, *,
+        force_refresh: bool = False,
+        rejected_blobs: tuple[str, ...] = (),
+        rejection_scope: Optional[str] = None) -> tuple[Path, Path, Path]:
+    """Resolve and download a GitHub DDI, then atomically commit its hashes."""
+    def check_cancelled():
+        if cancelled is not None and cancelled.is_set():
+            raise BridgePrerequisiteError('developer_image_download_cancelled',
+                                          'DDI download was cancelled before cache publication.')
+
+    check_cancelled()
+    download_deadline = time.monotonic() + PERSONALIZED_DDI_DOWNLOAD_TIMEOUT_SECONDS
+    cache = _personalized_ddi_cache_directory()
+    cached = _valid_personalized_ddi_bundle(cache)
+    rejected_code = None
+    if cached is not None and not force_refresh:
+        rejected_blobs, rejected_code = _read_ddi_rejection(cache, rejection_scope)
+        force_refresh = bool(rejected_blobs)
+    if cached is not None and not force_refresh:
+        return cached
+
+    pinned = PERSONALIZED_DDI_ASSETS if PERSONALIZED_DDI_PINNED_BUILD_ID == LATEST_DDI_BUILD_ID else None
+    if not force_refresh and PERSONALIZED_DDI_GITHUB_REF == PERSONALIZED_DDI_PINNED_REVISION and pinned:
+        assets = pinned
+    else:
+        try:
+            assets = _resolve_github_personalized_ddi_assets('main' if force_refresh and
+                PERSONALIZED_DDI_GITHUB_REF == PERSONALIZED_DDI_PINNED_REVISION else PERSONALIZED_DDI_GITHUB_REF,
+                deadline=min(download_deadline, time.monotonic() + 25), check_cancelled=check_cancelled)
+        except BridgePrerequisiteError:
+            if pinned is None:
+                raise
+            log.warning('DDI metadata unavailable; using the pinned compatible revision.')
+            assets = pinned
+    check_cancelled()
+    try:
+        return _download_ddi_bundle(cache, assets, on_download_started, check_cancelled, rejected_blobs, download_deadline)
+    except BridgePrerequisiteError as error:
+        if error.code == 'developer_image_no_new_candidate' and rejected_code:
+            raise BridgePrerequisiteError(rejected_code, str(error)) from error
+        if error.code != 'developer_image_download_incompatible' or pinned is None or assets == pinned:
+            raise
+        log.warning('Remote DDI build is incompatible; falling back to the pinned compatible revision.')
+        try:
+            return _download_ddi_bundle(cache, pinned, on_download_started, check_cancelled, rejected_blobs, download_deadline)
+        except BridgePrerequisiteError as fallback_error:
+            if fallback_error.code == 'developer_image_no_new_candidate' and rejected_code:
+                raise BridgePrerequisiteError(rejected_code, str(fallback_error)) from fallback_error
+            raise
+
+
+def _download_ddi_bundle(cache, assets, on_download_started, check_cancelled, rejected_blobs=(), deadline=None):
+    download_deadline = deadline if deadline is not None else time.monotonic() + PERSONALIZED_DDI_DOWNLOAD_TIMEOUT_SECONDS
+
+    def check_download():
+        check_cancelled()
+        if time.monotonic() >= download_deadline:
+            raise BridgePrerequisiteError('developer_image_download_timeout', 'DDI download time budget expired.')
+
+    check_download()
+    if rejected_blobs and tuple(asset.blob_id for asset in assets) == rejected_blobs:
+        raise BridgePrerequisiteError('developer_image_no_new_candidate',
+                                      'No different compatible DDI is available; the rejected image was not retried.')
+    log.info('Resolved Personalized DDI from GitHub ref=%s revision=%s build=%s',
+             PERSONALIZED_DDI_GITHUB_REF, assets[0].revision, LATEST_DDI_BUILD_ID)
+
+    staging = None
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix='iphoneMirror-ddi-', dir=cache.parent))
+        sources_by_phase = {
+            phase: tuple(source for source in _personalized_ddi_download_sources()
+                         if _source_phase(source) == phase)
+            for phase in ('direct', 'proxy', 'mirror')
+        }
+        if not any(sources_by_phase.values()):
+            raise BridgePrerequisiteError(
+                'developer_image_download_failed',
+                'No Personalized DDI download sources are available.',
+            )
+        if on_download_started is not None:
+            try:
+                on_download_started()
+            except Exception as error:
+                log.info('Unable to report Personalized DDI download status: %s', error)
+
+        mirrors_ranked = False
+        # Across all files, reserve time for mirror fallback instead of letting
+        # repeated dead direct/proxy endpoints consume the entire 150s budget.
+        phase_remaining = {'direct': 20., 'proxy': 20.}
+        # Check compatibility before spending time on the large image.
+        ordered_assets = sorted(assets, key=lambda asset: asset.local_name != 'BuildManifest.plist')
+        for asset in ordered_assets:
+            check_download()
+            partial = staging / f'{asset.local_name}.download'
+            target = staging / asset.local_name
+            failures: list[BridgePrerequisiteError] = []
+            completed = False
+            for phase in ('direct', 'proxy', 'mirror'):
+                check_download()
+                phase_sources = sources_by_phase[phase]
+                if phase == 'mirror' and not mirrors_ranked:
+                    ranked = tuple(source for source, _ in sorted(
+                        _measure_ddi_sources(
+                            phase_sources,
+                            lambda source: _probe_personalized_ddi_source(source, asset),
+                            min(PERSONALIZED_DDI_SOURCE_THROUGHPUT_WINDOW_SECONDS,
+                                max(0, download_deadline - time.monotonic()))),
+                        key=lambda item: item[1], reverse=True))
+                    # Range requests may be blocked or slow while a full GET
+                    # still works. Measurements prioritize, never authorize,
+                    # sources; every full response is independently verified.
+                    phase_sources = ranked + tuple(source for source in phase_sources if source not in ranked)
+                    mirrors_ranked = True
+                    log.info('Personalized DDI mirrors tested and ranked by throughput: %d/%d',
+                             len(ranked), len(sources_by_phase['mirror']))
+                    sources_by_phase['mirror'] = phase_sources
+                for source in phase_sources:
+                    check_download()
+                    if phase in phase_remaining and phase_remaining[phase] <= 0:
+                        break
+                    with contextlib.suppress(OSError):
+                        partial.unlink()
+                    source_started = time.monotonic()
+                    try:
+                        log.info('DDI source attempt asset=%s phase=%s source=%s',
+                                 asset.local_name, phase, source.name)
+                        _download_personalized_ddi_asset(source, asset, partial,
+                            deadline=min(download_deadline, source_started + PERSONALIZED_DDI_SOURCE_ATTEMPT_SECONDS),
+                            check_cancelled=check_download)
+                        check_download()
+                        os.replace(partial, target)
+                        log.info('Downloaded verified Personalized DDI asset %s from %s',
+                                 asset.local_name, source.name)
+                        # Prefer actual verified transfers over probe estimates
+                        # for the remaining files in this same bundle.
+                        sources_by_phase[phase] = (source,) + tuple(candidate for candidate in phase_sources if candidate != source)
+                        completed = True
+                        break
+                    except BridgePrerequisiteError as error:
+                        check_download()
+                        if error.code == 'developer_image_cache_failed':
+                            raise
+                        failures.append(error)
+                        log.info('Personalized DDI source failed: asset=%s phase=%s source=%s code=%s',
+                                 asset.local_name, phase, source.name, error.code)
+                    finally:
+                        if phase in phase_remaining:
+                            phase_remaining[phase] -= time.monotonic() - source_started
+                if completed:
+                    break
+            if not completed:
+                _raise_ddi_download_failure(asset, failures)
+            if asset.local_name == 'BuildManifest.plist':
+                try:
+                    manifest = plistlib.loads(target.read_bytes())
+                except (OSError, ValueError, plistlib.InvalidFileException, ExpatError) as error:
+                    raise BridgePrerequisiteError('developer_image_download_incompatible',
+                                                  'Downloaded DDI manifest is invalid.') from error
+                if not isinstance(manifest, dict) or manifest.get('ProductBuildVersion') != LATEST_DDI_BUILD_ID:
+                    raise BridgePrerequisiteError('developer_image_download_incompatible',
+                                                  'Downloaded DDI manifest does not match this runtime.')
+
+        resolved_assets = tuple(replace(asset, sha256=_sha256_file(staging / asset.local_name))
+                                for asset in assets)
+        try:
+            manifest = plistlib.loads((staging / 'BuildManifest.plist').read_bytes())
+        except (OSError, ValueError, plistlib.InvalidFileException, ExpatError) as error:
+            raise BridgePrerequisiteError(
+                'developer_image_download_incompatible',
+                'Downloaded Personalized DDI BuildManifest.plist is invalid.',
+            ) from error
+        if not isinstance(manifest, dict) or \
+                manifest.get('ProductBuildVersion') != LATEST_DDI_BUILD_ID:
+            raise BridgePrerequisiteError(
+                'developer_image_download_incompatible',
+                'Downloaded Personalized DDI BuildManifest does not match '
+                f'pymobiledevice3 build {LATEST_DDI_BUILD_ID}.',
+            )
+        _write_ddi_metadata(staging, resolved_assets, LATEST_DDI_BUILD_ID)
+        check_download()
+        cached = _valid_personalized_ddi_bundle(staging)
+        if cached is None:
+            raise BridgePrerequisiteError(
+                'developer_image_download_failed',
+                'The downloaded Personalized DDI failed final cache verification.',
+            )
+        return _publish_ddi_bundle(staging, cache, check_download)
+    except OSError as error:
+        raise BridgePrerequisiteError('developer_image_cache_failed',
+                                      'Unable to prepare the DDI cache; check disk space and write access.') from error
+    finally:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _publish_ddi_bundle(staging, cache, check_cancelled):
+    """Publish a complete immutable snapshot, then atomically select it."""
+    pointer = None
+    try:
+        check_cancelled()
+        snapshots = cache / 'bundles'
+        snapshots.mkdir(parents=True, exist_ok=True)
+        name = _sha256_file(_ddi_metadata_path(staging))
+        snapshot = snapshots / name
+        if snapshot.exists() and _valid_personalized_ddi_bundle(snapshot) is None:
+            # Never replace files an existing mount might still have open.
+            snapshot = snapshots / (name + '-' + os.urandom(16).hex())
+        if not snapshot.exists():
+            try:
+                os.replace(staging, snapshot)
+            except OSError:
+                # Another process may have published exactly this snapshot.
+                if _valid_personalized_ddi_bundle(snapshot) is None:
+                    raise
+        cached = _valid_personalized_ddi_bundle(snapshot)
+        if cached is None:
+            raise OSError('DDI snapshot is not valid')
+        check_cancelled()
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=cache,
+                                         prefix='.ddi-current-', suffix='.tmp', delete=False) as output:
+            pointer = Path(output.name)
+            json.dump({'directory': snapshot.name}, output)
+            output.flush()
+            os.fsync(output.fileno())
+        check_cancelled()
+        # Windows readers/other publishers can briefly deny DELETE sharing.
+        # Keep the old selection intact and retry only these transient errors;
+        # persistent access failures remain actionable and cancellation wins.
+        for attempt in range(6):
+            check_cancelled()
+            try:
+                os.replace(pointer, cache / '.iphoneMirror-ddi-current.json')
+                break
+            except OSError as error:
+                if getattr(error, 'winerror', None) not in (5, 32, 33) or attempt == 5:
+                    raise
+                check_cancelled()
+                time.sleep(.05 * (attempt + 1))
+        # Return our verified snapshot, even if another publisher subsequently
+        # selects a different one. Existing snapshots deliberately stay intact.
+        return cached
+    except OSError as error:
+        raise BridgePrerequisiteError('developer_image_cache_failed',
+                                      'Unable to publish the verified DDI cache; check disk space and write access.') from error
+    finally:
+        if pointer is not None:
+            with contextlib.suppress(OSError):
+                pointer.unlink(missing_ok=True)
+
+
+def bridge_error_code(error: Exception) -> str:
+    """Map expected Apple transport failures to stable IPC error codes.
+
+    The bridge is self-contained, but Apple's signed USB driver/service remains
+    the OS-owned transport. A Python exception class is not a useful support
+    contract for the WPF host, especially on a clean customer machine.
+    """
+    if isinstance(error, BridgePrerequisiteError):
+        return error.code
+    if isinstance(error, ConnectionFailedToUsbmuxdError):
+        return 'apple_usbmux_unavailable'
+    if isinstance(error, NotPairedError):
+        return 'apple_device_not_trusted'
+    if isinstance(error, PasswordRequiredError):
+        # lockdownd answers PasswordProtected while the iPhone is locked or
+        # waiting for its passcode; discovery is fine, sensitive queries are not.
+        return 'apple_device_locked'
+    if isinstance(error, DeviceNotFoundError):
+        return 'apple_device_not_found'
+    if isinstance(error, InvalidServiceError):
+        # Only the DDI operation wrappers know this is the image service.
+        # A missing tunnel/HID service must not be reported as a mount failure.
+        return 'remote_control_service_unavailable'
+    if (known := device_failure(error)) is not None:
+        return known.code
+    return type(error).__name__.lower()
+
+
+async def _close_owned_lockdown_service(service):
+    writer, sock = service.writer, service.socket
+    try:
+        async with asyncio.timeout(LOCKDOWN_CLEANUP_TIMEOUT_SECONDS):
+            await service.close()
+    except Exception as error:
+        log.warning('Lockdown service cleanup failed: %s', type(error).__name__)
+    finally:
+        if writer is not None:
+            with contextlib.suppress(Exception): writer.transport.abort()
+        if sock is not None:
+            with contextlib.suppress(Exception): sock.close()
+
+
+class _OwnedLockdownServices:
+    async def close(self):
+        await _close_owned_lockdown_service(self.service)
+
+    async def start_lockdown_service(self, name, include_escrow_bag=False):
+        # Match the SDK's public service/TLS protocol, but own the new connection
+        # until TLS is complete. The mounter cannot clean up an unreturned socket.
+        attributes = await self.get_service_connection_attributes(
+            name, include_escrow_bag=include_escrow_bag)
+        connection = await self.create_service_connection(attributes['Port'])
+        adopted = False
+        try:
+            if attributes.get('EnableServiceSSL', False):
+                with self.ssl_file() as certificate:
+                    await connection.ssl_start(certificate)
+            adopted = True
+            return connection
+        finally:
+            if not adopted:
+                await _close_owned_lockdown_service(connection)
+
+
+class BridgeUsbmuxLockdownClient(_OwnedLockdownServices, _lockdown.UsbmuxLockdownClient):
+    pass
+
+
+class BridgePlistUsbmuxLockdownClient(_OwnedLockdownServices, _lockdown.PlistUsbmuxLockdownClient):
+    pass
+
+
+async def create_using_usbmux(*, serial=None, connection_type=None, autopair=False):
+    """Own the opened device socket until the pinned SDK client is initialized.
+
+    The SDK convenience factory catches Exception, which excludes task
+    cancellation. Use its public client factory with the same mux/BUID choice,
+    retaining ownership across cancellation and partial initialization.
+    """
+    service = await _lockdown.ServiceConnection.create_using_usbmux(
+        serial, _lockdown.SERVICE_PORT, connection_type=connection_type)
+    adopted = False
+    try:
+        client_type = BridgeUsbmuxLockdownClient
+        system_buid = _lockdown.SYSTEM_BUID
+        async with await _lockdown.usbmux.create_mux() as mux:
+            if isinstance(mux, _lockdown.PlistMuxConnection):
+                system_buid = await mux.get_buid()
+                client_type = BridgePlistUsbmuxLockdownClient
+        identifier = service.mux_device.serial if service.mux_device is not None else serial
+        client = await client_type.create(service, identifier=identifier,
+                                          system_buid=system_buid, autopair=autopair)
+        adopted = True
+        return client
+    finally:
+        if not adopted:
+            # Keep handles: SDK close clears attributes even if cancelled
+            # while awaiting a TLS close, before closing the underlying socket.
+            await _close_owned_lockdown_service(service)
+
+
+async def create_lockdown_with_retry(ipc, udid: Optional[str],
+                                     connection_type: str):
+    """Share one handshake/retry budget, allowing bounded failed-open cleanup."""
+    try:
+        async with asyncio.timeout(LOCKDOWN_CONNECT_TIMEOUT_SECONDS):
+            for attempt in range(1, LOCKDOWN_CONNECT_ATTEMPTS + 1):
+                try:
+                    # Reverse control must not initiate or replace device trust.
+                    return await create_using_usbmux(
+                        serial=udid, connection_type=connection_type, autopair=False)
+                except LOCKDOWN_RETRYABLE_ERRORS as error:
+                    if attempt == LOCKDOWN_CONNECT_ATTEMPTS:
+                        raise
+                    await ipc.emit({
+                        'event': 'warning', 'code': 'lockdown_retry',
+                        'message': (f'{type(error).__name__}: {str(error)[:180]}; '
+                                    f'retrying Lockdown {attempt}/{LOCKDOWN_CONNECT_ATTEMPTS - 1}'),
+                    })
+                    await asyncio.sleep(LOCKDOWN_RETRY_DELAY_SECONDS * attempt)
+    except TimeoutError as error:
+        raise BridgePrerequisiteError('apple_device_connection_timeout',
+                                      'Connecting to the selected Apple device timed out.') from error
+LEGACY_UNIVERSAL_HID_FEATURE = 'com.apple.coredevice.feature.remote.universalhid'
+
+
+class LegacyUniversalHIDServiceService(UniversalHIDServiceService):
+    SERVICE_NAME = LEGACY_UNIVERSAL_HID_SERVICE
+
+    async def list_connected_services(self) -> dict:
+        return await self.service.send_receive_request({
+            'featureIdentifier': LEGACY_UNIVERSAL_HID_FEATURE,
+            'messageType': 'Request',
+            'payload': {'connectedServices': {}},
+        })
+
+    async def send_report(self, service_id: int, report: bytes) -> None:
+        await self.service.send_request({
+            'featureIdentifier': LEGACY_UNIVERSAL_HID_FEATURE,
+            'messageType': 'Request',
+            'payload': {'send': {'_0': report, '_1': XpcUInt64Type(service_id)}},
+        })
+
+
+def decode_touch_batch(message: dict) -> tuple[int, Optional[int], list[dict]]:
+    """Validate and normalize one application-layer touch message."""
+    if not isinstance(message, dict) or message.get('schema') != MESSAGE_SCHEMA:
+        raise ValueError('unsupported touch message schema')
+    if message.get('kind') != MESSAGE_KIND:
+        raise ValueError('unsupported touch message kind')
+    sequence = message.get('seq')
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+        raise ValueError('sequence must be a non-negative integer')
+    timestamp = message.get('timestampNs')
+    if timestamp is not None and (not isinstance(timestamp, int) or isinstance(timestamp, bool)):
+        raise ValueError('timestampNs must be an integer')
+    points = message.get('points')
+    if not isinstance(points, list) or not 1 <= len(points) <= MAX_SLOTS:
+        raise ValueError('points must contain 1..5 items')
+    seen: set[int] = set()
+    for point in points:
+        if not isinstance(point, dict):
+            raise ValueError('each point must be an object')
+        pointer_id = point.get('pointerId')
+        action = point.get('action')
+        x = point.get('normalizedX')
+        y = point.get('normalizedY')
+        if not isinstance(pointer_id, int) or isinstance(pointer_id, bool) or pointer_id < 0:
+            raise ValueError('pointerId must be a non-negative integer')
+        if pointer_id in seen:
+            raise ValueError('pointerId must be unique within a batch')
+        if action not in VALID_ACTIONS:
+            raise ValueError('action must be down, move, or up')
+        if not isinstance(x, (int, float)) or isinstance(x, bool) or not 0.0 <= float(x) <= 1.0:
+            raise ValueError('normalizedX must be between 0 and 1')
+        if not isinstance(y, (int, float)) or isinstance(y, bool) or not 0.0 <= float(y) <= 1.0:
+            raise ValueError('normalizedY must be between 0 and 1')
+        if not (float(x) == float(x) and float(y) == float(y)):
+            raise ValueError('coordinates must be finite')
+        seen.add(pointer_id)
+    return sequence, timestamp, points
+
+
+def decode_keyboard_batch(message: dict) -> tuple[int, Optional[int], list[int]]:
+    if not isinstance(message, dict) or message.get('schema') != MESSAGE_SCHEMA:
+        raise ValueError('unsupported keyboard message schema')
+    if message.get('kind') != KEYBOARD_MESSAGE_KIND:
+        raise ValueError('unsupported keyboard message kind')
+    sequence = message.get('seq')
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+        raise ValueError('sequence must be a non-negative integer')
+    timestamp = message.get('timestampNs')
+    if timestamp is not None and (not isinstance(timestamp, int) or isinstance(timestamp, bool)):
+        raise ValueError('timestampNs must be an integer')
+    usages = message.get('usages')
+    if not isinstance(usages, list) or len(usages) > 30:
+        raise ValueError('usages must contain 0..30 items')
+    normalized = []
+    seen = set()
+    for usage in usages:
+        if not isinstance(usage, int) or isinstance(usage, bool) or not 0 <= usage < 240:
+            raise ValueError('keyboard usage must be between 0 and 239')
+        if usage not in seen:
+            normalized.append(usage)
+            seen.add(usage)
+    return sequence, timestamp, normalized
+
+
+def decode_button_event(message: dict) -> tuple[int, int, int, str]:
+    if not isinstance(message, dict) or message.get('schema') != MESSAGE_SCHEMA:
+        raise ValueError('unsupported button message schema')
+    if message.get('kind') != BUTTON_MESSAGE_KIND:
+        raise ValueError('unsupported button message kind')
+    sequence = message.get('seq')
+    page = message.get('usagePage')
+    code = message.get('usageCode')
+    state = message.get('state')
+    if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+               for value in (sequence, page, code)):
+        raise ValueError('button sequence and usages must be non-negative integers')
+    if page > 0xFFFF or code > 0xFFFF or state not in BUTTON_STATES:
+        raise ValueError('invalid button usage or state')
+    return sequence, page, code, state
+
+
+
+class FiveSlotStateMachine:
+    """逻辑触点 ID → 固定 slot 0..4，最多 5 点同触。
+
+    每帧携带全部活动触点；省略活动触点会被设备解释为释放。
+    """
+
+    def __init__(self) -> None:
+        self._id_to_slot: dict[int, int] = {}
+        self._free_slots = list(range(MAX_SLOTS))
+        self._positions: dict[int, tuple[int, int]] = {}
+
+    def assign(self, touch_id: int) -> Optional[int]:
+        if touch_id in self._id_to_slot:
+            return self._id_to_slot[touch_id]
+        if not self._free_slots:
+            return None
+        slot = self._free_slots.pop(0)
+        self._id_to_slot[touch_id] = slot
+        self._positions[touch_id] = (0, 0)
+        return slot
+
+    def release(self, touch_id: int) -> Optional[int]:
+        slot = self._id_to_slot.pop(touch_id, None)
+        if slot is None:
+            return None
+        self._positions.pop(touch_id, None)
+        self._free_slots.append(slot)
+        self._free_slots.sort()
+        return slot
+
+    def slot_for(self, touch_id: int) -> Optional[int]:
+        return self._id_to_slot.get(touch_id)
+
+    def update_position(self, touch_id: int, x: int, y: int) -> None:
+        if touch_id in self._id_to_slot:
+            self._positions[touch_id] = (x, y)
+
+    def contacts(self, released: set[int]) -> list[tuple[int, int, int, int]]:
+        return sorted((slot, TOUCHSCREEN_STATE_RELEASE if touch_id in released
+                       else TOUCHSCREEN_STATE_CONTACT, *self._positions[touch_id])
+                      for touch_id, slot in self._id_to_slot.items())
+
+    def clear(self) -> list[int]:
+        ids = list(self._id_to_slot.keys())
+        for i in ids:
+            self.release(i)
+        return ids
+
+
+def build_touchscreen_report(slot: int, state: int, x: int, y: int, timestamp: Optional[int] = None) -> bytes:
+    """Single-contact convenience wrapper; live gestures use full snapshots."""
+    return build_touchscreen_frame([(slot, state, x, y)], timestamp)
+
+
+def build_touchscreen_frame(contacts: list[tuple[int, int, int, int]],
+                            timestamp: Optional[int] = None) -> bytes:
+    """58-byte DigitizerReport: five 5-byte contacts and a slot-indexed identity table.
+
+    DigitizerContact.index occupies bits 0..4, touch bit 6, range bit 7.
+    See docs/FIVE_POINT_TOUCH.md for the checked CoreDevice layout.
+    """
+    if not 1 <= len(contacts) <= MAX_SLOTS:
+        raise ValueError('touch report must contain one to five contacts')
+    slots = [contact[0] for contact in contacts]
+    if len(set(slots)) != len(slots) or any(slot not in range(MAX_SLOTS) for slot in slots):
+        raise ValueError('touch report slots must be unique and in range 0..4')
+    if timestamp is None:
+        timestamp = time.monotonic_ns() & ((1 << 48) - 1)
+    report = bytearray(58)
+    report[:3] = bytes([0x09, len(contacts), MAX_SLOTS])
+    for index, (slot, state, x, y) in enumerate(contacts):
+        flags = 0xC0 if state == TOUCHSCREEN_STATE_CONTACT else 0
+        struct.pack_into('<BHH', report, 3 + index * 5, flags | slot, x & 0xFFFF, y & 0xFFFF)
+        report[40 + slot] = slot + 1
+    report[45:51] = timestamp.to_bytes(6, 'little')
+    return bytes(report)
+
+
+class BridgeChannel:
+    """Length-prefixed input and JSON-lines lifecycle output."""
+
+    def __init__(self) -> None:
+        self._write_lock = asyncio.Lock()
+        # A daemon must not hold BufferedReader's lock at interpreter shutdown.
+        # Read the unbuffered pipe; _read_exactly already handles short reads.
+        self._stdin = getattr(sys.stdin.buffer, 'raw', sys.stdin.buffer)
+        self._stdout = sys.stdout.buffer
+        self._messages = deque()
+        self._queued_bytes = 0
+        self._frame_bytes = 0
+        self._message_available = asyncio.Event()
+        self._disconnected = asyncio.Event()
+        self._input_error = None
+        self._reader_task = None
+        self._read_requests = queue.SimpleQueue()
+        self._read_thread = None
+
+    async def emit(self, event: dict) -> None:
+        line = json.dumps(event, ensure_ascii=False) + '\n'
+        async with self._write_lock:
+            self._stdout.write(line.encode('utf-8'))
+            self._stdout.flush()
+
+    async def _read_exactly(self, length: int) -> Optional[bytes]:
+        loop = asyncio.get_running_loop()
+        if self._read_thread is None:
+            # Windows anonymous-pipe reads cannot be cancelled. A dedicated
+            # daemon owns stdin so asyncio shutdown never joins a blocked read.
+            # There is exactly one reader for the entire process lifetime.
+            def reader():
+                while (request := self._read_requests.get()) is not None:
+                    future, count = request
+                    try:
+                        value, error = self._stdin.read(count), None
+                    except Exception as failure:
+                        value, error = None, failure
+                    def complete(future=future, value=value, error=error):
+                        if not future.done():
+                            if error is None:
+                                future.set_result(value)
+                            else:
+                                future.set_exception(error)
+                    try:
+                        loop.call_soon_threadsafe(complete)
+                    except RuntimeError:
+                        return  # event loop already closed after teardown
+            self._read_thread = threading.Thread(target=reader, daemon=True,
+                                                 name='iphoneMirror-stdin')
+            self._read_thread.start()
+        chunks = bytearray()
+        while len(chunks) < length:
+            future = loop.create_future()
+            self._read_requests.put((future, length - len(chunks)))
+            chunk = await future
+            if not chunk:
+                return None
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+    async def _read_message(self):
+        while True:
+            header = await self._read_exactly(4)
+            if header is None:
+                return
+            (length,) = struct.unpack('<I', header)
+            if length == 0 or length > MAX_FRAME_SIZE:
+                raise BridgePrerequisiteError('bad_frame', 'Invalid input frame length.')
+            payload = await self._read_exactly(length)
+            if payload is None:
+                return
+            try:
+                frame = json.loads(payload.decode('utf-8'))
+                if not isinstance(frame, dict):
+                    raise ValueError('Input frame must be an object.')
+                self._frame_bytes = length
+                return frame
+            except (UnicodeDecodeError, ValueError) as error:
+                raise BridgePrerequisiteError('bad_frame', 'Invalid input JSON frame.') from error
+
+    def _start_reader(self):
+        if self._reader_task is None:
+            self._reader_task = asyncio.create_task(self._pump_messages())
+
+    async def _pump_messages(self):
+        try:
+            while (frame := await self._read_message()) is not None:
+                # Keep reading during DDI/recovery so queued input cannot hide
+                # host EOF. Bound both memory and the number of stale commands.
+                if len(self._messages) >= 1024 or self._queued_bytes + self._frame_bytes > 8 * 1024 * 1024:
+                    raise BridgePrerequisiteError('bridge_input_overflow', 'Input backlog exceeded its limit.')
+                self._messages.append((frame, self._frame_bytes))
+                self._queued_bytes += self._frame_bytes
+                self._message_available.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self._input_error = error
+        finally:
+            self._disconnected.set()
+            self._message_available.set()
+
+    async def wait_for_disconnect(self):
+        self._start_reader()
+        await self._disconnected.wait()
+        if self._input_error is not None:
+            raise self._input_error
+
+    async def read_messages(self):
+        self._start_reader()
+        while True:
+            await self._message_available.wait()
+            if self._input_error is not None:
+                raise self._input_error
+            if self._messages:
+                frame, size = self._messages.popleft()
+                self._queued_bytes -= size
+                yield frame
+            elif self._disconnected.is_set():
+                return
+            else:
+                self._message_available.clear()
+
+    async def close(self):
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            await asyncio.gather(self._reader_task, return_exceptions=True)
+        self._read_requests.put(None)
+
+
+class TouchSession:
+    """USB → CoreDevice 隧道 → RSD → Universal HID 会话。"""
+
+    def __init__(self, ipc: BridgeChannel, rate_hz: int, udid: Optional[str] = None,
+                 transport: str = 'usb', ddi_dir: Optional[Path] = None) -> None:
+        self.ipc = ipc
+        self.rate_hz = rate_hz
+        self.udid = udid
+        self.transport_mode = transport
+        self.ddi_dir = ddi_dir
+        self._mux_checkpoint = None
+        self._startup_mux_checkpoint = os.environ.pop('IPHONE_MIRROR_USB_MUX_RESUME', None)
+        self.rsd: Optional[RemoteServiceDiscoveryService] = None
+        self.hid: Optional[UniversalHIDServiceService] = None
+        self.indigo: Optional[IndigoHIDService] = None
+        self._held_buttons: set[tuple[int, int]] = set()
+        self._active_touch_ids: set[int] = set()
+        self._touch_keepalive_contacts: tuple[tuple[int, int, int, int], ...] = ()
+        self._touch_report_sent_at = 0.0
+        self._held_keyboard_usages: frozenset[int] = frozenset()
+        self.keyboard_service_id: Optional[int] = None
+
+        self.display: Optional[DisplayService] = None
+        self.dial_plane = None
+        self.stream_answer = None
+        self.drain_task = None
+        self.transport = None
+        self.auth_mode: Optional[str] = None
+        self.gate_open = False
+        self._owns_hid = False
+        self._ddi_was_mounted = False
+        self._ddi_uses_cryptex = False
+        self._ddi_refresh_attempted = False
+        self._ddi_deadline = None
+        self._ddi_rejection_scope = None
+        self._remote_pairing_provision_attempted = False
+        self._usb_mux_transport = None
+        self._usb_mux_server = None
+        self._usb_mux_previous_env: Optional[str] = None
+        self._usb_mux_resume = None
+        self._pasteboard_lock = asyncio.Lock()
+        self._pasteboard_service = None
+        self._pasteboard_refresh_required = False
+        self._pasteboard_rsd = None
+        self._pasteboard_last_text = object()
+        self._pasteboard_unconfirmed_writes: set[str] = set()
+        self._pasteboard_write_generation = 0
+        self._pasteboard_writers_waiting = 0
+        self._pasteboard_writes_idle = asyncio.Event()
+        self._pasteboard_writes_idle.set()
+        self._pasteboard_operation_id = 0
+        self._pasteboard_read_id = 0
+        self._pasteboard_publish_lock = asyncio.Lock()
+        self._paste_sequence_lock = asyncio.Lock()
+        self._keyboard_lock = asyncio.Lock()
+        self._hid_operation_lock = asyncio.Lock()
+        # HID refresh must wait for an individual report, but must not share
+        # the keyboard/touch synchronization locks.
+        self._hid_lifecycle_lock = asyncio.Lock()
+        self._hid_recovery_lock = asyncio.Lock()
+        # Set when the input loop loses the HID transport.  The enclosing
+        # tunnel scope can then rebuild only CoreDevice/RSD/HID while keeping
+        # the existing lockdown and capture-mux ownership intact.
+        self._hid_transport_failed = False
+        self._serve_task: Optional[asyncio.Task] = None
+        self._recovering = False
+        self._recovery_attempt = 0
+        self._recovery_started = 0.0
+        self._session_ready = asyncio.Event()
+        self._generation = 0
+        self._input_verified = False
+        self._diagnostic_disconnect_count = 0
+
+    async def _start_capture_mux(self, *, attempts: int = CAPTURE_MUX_START_ATTEMPTS) -> None:
+        """Prefer the active QuickTime configuration without making it fatal.
+
+        A wired mirror temporarily exposes a second usbmux interface.  Some
+        devices need a short re-enumeration window before that interface will
+        answer its VERSION packet.  Releasing and rediscovering it preserves
+        the mirror, while a final fallback lets the normal Apple usbmuxd path
+        handle devices that still expose it.
+        """
+        if self.transport_mode != 'usb':
+            return
+        if _UsbMuxTransport is None or _UsbmuxdThread is None:
+            # Never lose the userspace transport silently: without it a mirror
+            # session cannot share the USB link with reverse control.
+            await self.ipc.emit({
+                'event': 'warning', 'code': 'capture_mux_unavailable',
+                'message': 'The userspace usbmux transport is unavailable in this build.',
+            })
+            return
+        try:
+            backend = _get_usb_backend('auto')
+            devices = _find_usb_devices(backend, self.udid)
+            device = next((item for item in devices if item.activated and
+                           (not self.udid or _udid_matches(item.serial, self.udid))), None)
+            if device is None:
+                # The discovery filter may differ in case/hyphen normalization.
+                # Uniqueness is not proof of identity: never adopt another phone
+                # (or an unreadable serial) just because it is the only one present.
+                devices = _find_usb_devices(backend, None)
+                device = next((item for item in devices if item.activated and
+                               _udid_matches(item.serial, self.udid or '')), None)
+        except Exception as error:
+            await self._report_capture_discovery_fallback(error)
+            return
+        if device is None:
+            # No active QuickTime configuration means standalone wired control;
+            # Apple's normal usbmuxd remains the correct transport in that case.
+            self._usb_mux_resume = None
+            overview = '; '.join(
+                f'serial={item.serial!r} activated={item.activated}'
+                for item in devices) or 'none'
+            log.info('no activated QuickTime configuration for %s; using Apple '
+                     'usbmuxd (enumeration: %s)', self.udid or 'any device', overview)
+            await self.ipc.emit({
+                'event': 'warning', 'code': 'capture_mux_device_absent',
+                'message': (f'No device with an active QuickTime configuration is '
+                            f'enumerable over USB (enumeration: {overview}); '
+                            'continuing with the Apple usbmuxd path.'),
+            })
+            return
+        for attempt in range(1, attempts + 1):
+            mux = None
+            server = None
+            try:
+                mux = _UsbMuxTransport(device.dev, device.serial)
+                previous, self._usb_mux_resume = self._usb_mux_resume, None
+                if previous is not None and _udid_matches(previous.serial, device.serial):
+                    mux.resume_from(previous)
+                elif self._startup_mux_checkpoint is not None:
+                    checkpoint, self._startup_mux_checkpoint = self._startup_mux_checkpoint, None
+                    with contextlib.suppress(ValueError, TypeError):
+                        if mux.import_checkpoint(json.loads(checkpoint)):
+                            log.info('resuming capture usbmux from the parent capture lifetime')
+                mux.start()
+                # Advertise the requested UDID verbatim: pymobiledevice3
+                # matches the usbmux serial case-sensitively, and the USB
+                # string descriptor need not equal the binding profile's
+                # spelling.
+                server = _UsbmuxdThread(mux.mux, self.udid or device.serial, port=0)
+                address = server.start()
+            except Exception as error:  # The fallback below owns this failure.
+                with contextlib.suppress(Exception):
+                    if server is not None:
+                        server.stop()
+                with contextlib.suppress(Exception):
+                    if mux is not None:
+                        mux.close()
+                if attempt == attempts:
+                    message = f'{type(error).__name__}: {str(error)[:180]}'
+                    log.warning('capture usbmux handshake unavailable after %d attempts: %s',
+                                attempt, message)
+                    await self.ipc.emit({
+                        'event': 'warning',
+                        'code': 'capture_mux_fallback',
+                        'message': (
+                            'The active wired-mirroring usbmux interface did not respond; '
+                            f'using the Apple usbmuxd path instead ({message}).'
+                        ),
+                    })
+                    return
+                await self.ipc.emit({
+                    'event': 'warning',
+                    'code': 'capture_mux_retry',
+                    'message': (
+                        f'{type(error).__name__}: {str(error)[:180]}; '
+                        f'retrying active wired-mirroring usbmux {attempt}/'
+                        f'{attempts - 1}'
+                    ),
+                })
+                await asyncio.sleep(CAPTURE_MUX_RETRY_DELAY_SECONDS * attempt)
+                try:
+                    devices = _find_usb_devices(backend, self.udid)
+                except Exception as discovery_error:
+                    await self._report_capture_discovery_fallback(discovery_error)
+                    return
+                device = next((item for item in devices if item.activated and
+                               _udid_matches(item.serial, self.udid or '')), None)
+                if device is None:
+                    log.info('active wired-mirroring usbmux disappeared during retry; using Apple usbmuxd')
+                    return
+                continue
+            self._usb_mux_previous_env = os.environ.get('USBMUXD_SOCKET_ADDRESS')
+            self._usb_mux_transport = mux
+            self._usb_mux_server = server
+            os.environ['USBMUXD_SOCKET_ADDRESS'] = address
+            log.info('capture usbmux bridge active at %s (attempt %d)', address, attempt)
+            await self._emit_status('capture_mux_ready')
+            return
+
+    async def _report_capture_discovery_fallback(self, error) -> None:
+        # libusb is needed for capture coexistence, not Apple's standard USB
+        # route. Descriptor/backend failures must not block the latter.
+        log.warning('Capture USB discovery unavailable: %s', type(error).__name__)
+        await self.ipc.emit({'event': 'warning', 'code': 'capture_mux_fallback',
+            'message': f'Capture USB discovery failed ({type(error).__name__}); trying Apple usbmuxd.'})
+
+    def _close_capture_mux(self) -> None:
+        # Release only this bridge's userspace interface/listener. Never change
+        # USB configuration, reset the device, or touch the capture interface.
+        if self._usb_mux_transport is None and self._usb_mux_server is None:
+            return
+        server, mux = self._usb_mux_server, self._usb_mux_transport
+        self._usb_mux_server = self._usb_mux_transport = None
+        if self._usb_mux_previous_env is None:
+            os.environ.pop('USBMUXD_SOCKET_ADDRESS', None)
+        else:
+            os.environ['USBMUXD_SOCKET_ADDRESS'] = self._usb_mux_previous_env
+        self._usb_mux_previous_env = None
+        if server is not None:
+            with contextlib.suppress(Exception):
+                server.stop()
+        if mux is not None:
+            with contextlib.suppress(Exception):
+                mux.close()
+                self._mux_checkpoint = mux
+
+    async def _reconnect_lockdown(self):
+        mux = self._usb_mux_transport
+        reason = getattr(mux, 'failure_reason', None) if mux is not None else None
+        if reason:
+            await self._recovery_event('capture_mux_retired', ConnectionError(reason))
+            self._usb_mux_resume = mux
+            self._close_capture_mux()
+        if self._usb_mux_transport is None:
+            # Re-enumerate on every bounded attempt: the device may now expose
+            # either the active capture interface or the normal Apple route.
+            await self._start_capture_mux(attempts=1)
+        connected = False
+        try:
+            # Preserve the owner's normal reconnect budget: an unanswered
+            # short SYN does not prove saved USB protocol state is invalid.
+            # Some live capture configurations refuse a second VERSION.
+            lockdown = await self._create_lockdown_with_retry('USB')
+            if getattr(self._usb_mux_transport, 'resumed', False) is True:
+                self._usb_mux_transport.resumed = False
+                await self._recovery_event('capture_mux_resume_verified')
+            connected = True
+            return lockdown
+        except DeviceNotFoundError as error:
+            lockdown = await self._recover_lockdown_via_capture_mux(error)
+            connected = True
+            return lockdown
+        finally:
+            if not connected and getattr(self._usb_mux_transport, 'resumed', False) is True:
+                # A changed device configuration can invalidate saved protocol
+                # state. Do not reuse an unverified resumed candidate forever.
+                await self._recovery_event('capture_mux_resume_rejected')
+                self._close_capture_mux()
+
+    async def _recover_lockdown_via_capture_mux(self,
+                                                discovery_error: DeviceNotFoundError):
+        """Rebuild Lockdown over a userspace usbmux when usbmuxd lost the device.
+
+        A wired QuickTime mirror switches the iPhone into a USB configuration
+        that Apple's usbmuxd stops listing, and ``_start_capture_mux`` can come
+        up empty when full configuration discovery fails under that driver
+        state even though the device itself is still enumerable. When the
+        usbmuxd handshake reports the device missing, attach the userspace
+        transport to the claimable usbmux interface of the ACTIVE mirroring
+        configuration and retry the handshake before surfacing the failure.
+        """
+        if (not self.udid or _UsbMuxTransport is None or _UsbmuxdThread is None or
+                self._usb_mux_server is not None):
+            raise discovery_error
+        strict_candidates: list = []
+        enumeration_notes: list[str] = []
+        try:
+            import usb.core
+            import usb.util
+            backend = _get_usb_backend('auto')
+            for device in usb.core.find(find_all=True, idVendor=APPLE_VENDOR_ID,
+                                        backend=backend):
+                try:
+                    serial = _correct_serial(
+                        (usb.util.get_string(device, device.iSerialNumber) or '')
+                        .rstrip('\x00').strip())
+                except Exception as error:  # noqa: BLE001  descriptor reads fail per device
+                    serial = ''
+                    enumeration_notes.append(f'serial unreadable ({error})')
+                try:
+                    configuration = device.get_active_configuration()
+                except Exception as error:  # noqa: BLE001
+                    enumeration_notes.append(
+                        f'serial={serial!r} active-config error {error}')
+                    continue
+                # Only take over the interface from a live mirroring
+                # configuration. In the normal configuration Apple's usbmuxd
+                # owns the interface and the discovery error has another cause.
+                if (_interface_with_subclass(configuration, INTERFACE_SUBCLASS_QUICKTIME)
+                        is None or
+                        _interface_with_subclass(configuration, INTERFACE_SUBCLASS_USBMUX)
+                        is None):
+                    enumeration_notes.append(
+                        f'serial={serial!r} active config has no mirroring '
+                        'interface pair')
+                    continue
+                if _udid_matches(serial, self.udid):
+                    strict_candidates.append(device)
+                else:
+                    enumeration_notes.append(f'serial={serial!r} does not identify the requested device')
+        except Exception as error:  # noqa: BLE001
+            await self.ipc.emit({
+                'event': 'warning', 'code': 'capture_mux_recovery_failed',
+                'message': (f'{type(error).__name__}: {str(error)[:180]}; '
+                            'keeping the Apple usbmuxd failure.'),
+            })
+            raise discovery_error from error
+        if strict_candidates:
+            candidate = strict_candidates[0]
+        else:
+            candidate = None
+        if candidate is None:
+            detail = '; '.join(enumeration_notes) or 'no matching Apple USB device was enumerable'
+            await self.ipc.emit({
+                'event': 'warning', 'code': 'capture_mux_recovery_unavailable',
+                'message': (
+                    'Apple usbmuxd cannot see the mirrored iPhone and no claimable '
+                    f'usbmux interface was found in the active USB configuration '
+                    f'({detail}); stop the wired mirror or replug the cable and retry.'
+                ),
+            })
+            raise discovery_error
+        mux = None
+        server = None
+        try:
+            mux = _UsbMuxTransport(candidate, self.udid)
+            mux.start()
+            server = _UsbmuxdThread(mux.mux, self.udid, port=0)
+            address = server.start()
+        except Exception as error:  # noqa: BLE001
+            with contextlib.suppress(Exception):
+                if server is not None:
+                    server.stop()
+            with contextlib.suppress(Exception):
+                if mux is not None:
+                    mux.close()
+            await self.ipc.emit({
+                'event': 'warning', 'code': 'capture_mux_recovery_failed',
+                'message': (f'{type(error).__name__}: {str(error)[:180]}; '
+                            'keeping the Apple usbmuxd failure.'),
+            })
+            raise discovery_error from error
+        self._usb_mux_previous_env = os.environ.get('USBMUXD_SOCKET_ADDRESS')
+        self._usb_mux_transport = mux
+        self._usb_mux_server = server
+        os.environ['USBMUXD_SOCKET_ADDRESS'] = address
+        log.info('capture usbmux recovery active at %s', address)
+        await self._emit_status('capture_mux_ready')
+        return await self._create_lockdown_with_retry('USB')
+
+    async def _emit_status(self, code: str) -> None:
+        await self.ipc.emit({'event': 'status', 'code': code, 'message': {
+            'connecting_device': f'正在建立{self.transport_mode_name}设备会话',
+            'checking_developer_environment': '正在检查开发者模式和开发者镜像',
+            'mounting_developer_image': '正在准备开发者镜像',
+            'testing_developer_image_sources': '正在检查 GitHub 开发者镜像下载',
+            'downloading_developer_image': '正在下载并校验开发者镜像',
+            'remounting_developer_image': '正在刷新不兼容的开发者镜像',
+            'checking_developer_image_ticket': '正在检查设备上的开发者镜像签名',
+            'personalizing_developer_image': '正在向 Apple 请求开发者镜像签名',
+            'uploading_developer_image': '正在向设备传输开发者镜像',
+            'activating_developer_image': '正在设备上挂载开发者镜像',
+            'verifying_developer_image': '正在验证开发者镜像挂载结果',
+            'switching_developer_image': '当前镜像不可用，正在尝试其他兼容镜像',
+            'discovering_wireless_device': '正在通过 RemotePairing 发现无线设备',
+            'capture_mux_ready': '正在通过镜像共存 USB 通道连接设备',
+            'initializing_touch': '正在初始化触控通道',
+            'terminated': 'USB 触控会话已结束',
+        }.get(code, code)})
+
+    @property
+    def transport_mode_name(self) -> str:
+        return '无线' if self.transport_mode == 'wireless' else 'USB'
+
+    async def connect(self) -> None:
+        await self._emit_status('connecting_device')
+        connection_type = 'Network' if self.transport_mode == 'wireless' else 'USB'
+        await self._start_capture_mux()
+        # Never fall back to a cable here.  The caller selected wireless
+        # control explicitly, and reporting a ready session over USB would
+        # make the UI claim that a network control path is working.
+        try:
+            lockdown = await asyncio.wait_for(self._create_initial_lockdown(connection_type), 15)
+        except BridgePrerequisiteError as error:
+            if self.transport_mode != 'wireless' or error.code != 'apple_device_connection_timeout':
+                raise
+            await self._connect_via_remote_pairing()
+            return
+        except (ConnectionFailedToUsbmuxdError, ConnectionFailedError,
+                ConnectionTerminatedError, MuxException, OSError) as error:
+            if self.transport_mode != 'wireless':
+                if isinstance(error, TimeoutError):
+                    raise BridgePrerequisiteError('apple_device_connection_timeout',
+                                                  'Connecting to the selected Apple device timed out.') from error
+                raise
+            # RemotePairing has its own saved credentials and mDNS discovery;
+            # it does not require Apple's Network usbmux service to be running.
+            await self._connect_via_remote_pairing()
+            return
+        except DeviceNotFoundError as discovery_error:
+            if self.transport_mode == 'wireless':
+                # Wi-Fi Sync only gives us a legacy Network usbmux record. On
+                # current iOS releases the supported wireless CoreDevice route is
+                # RemotePairing over mDNS, so try it when that legacy record is
+                # absent instead of silently changing to the USB path.
+                await self._connect_via_remote_pairing()
+                return
+            # Apple usbmuxd lost the device while the wired mirror holds the
+            # QuickTime configuration. Attach our own usbmux to the active
+            # mirroring configuration before declaring the device missing.
+            lockdown = await self._recover_lockdown_via_capture_mux(discovery_error)
+        try:
+            await self._connect_with_ddi_recovery(lockdown)
+        finally:
+            # The tunnel/RSD scopes do not own the usbmux Lockdown client.
+            # Always close it, including failures before start_tunnel enters.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(lockdown.close(), 2)
+
+    async def _create_initial_lockdown(self, connection_type: str):
+        try:
+            return await self._create_lockdown_with_retry(connection_type)
+        except Exception:
+            mux = self._usb_mux_transport
+            if connection_type != 'USB' or getattr(mux, 'resumed', False) is not True:
+                raise
+            # A phone may reset its mux internally without changing its USB
+            # address/configuration. A checkpoint is a candidate, never proof
+            # of readiness. Discard it and allow one fresh VERSION handshake.
+            self._close_capture_mux()
+            self._mux_checkpoint = None
+            await self.ipc.emit({'event': 'warning', 'code': 'capture_mux_checkpoint_rejected',
+                                 'message': 'Saved USB protocol state did not answer Lockdown; renegotiating once.'})
+            await self._start_capture_mux(attempts=1)
+            return await self._create_lockdown_with_retry(connection_type)
+
+    async def _provision_remote_pairing(self, lockdown) -> bool:
+        try:
+            async with asyncio.timeout(REMOTE_PAIRING_PROVISION_TIMEOUT_SECONDS):
+                return await self._provision_remote_pairing_impl(lockdown)
+        except TimeoutError:
+            await self.ipc.emit({'event': 'warning', 'code': 'wireless_remote_pairing_provision_failed',
+                'message': 'Optional wireless provisioning exceeded its total time budget; continuing wired startup.'})
+            return False
+
+    async def _provision_remote_pairing_impl(self, lockdown) -> bool:
+        """Create the one-time RemotePairing record over the trusted USB link.
+
+        Apple Wi-Fi Sync and RemotePairing are independent credentials. The
+        latter is provisioned through a lockdownd service without displaying a
+        second Trust prompt. A completed pair deliberately closes its control
+        socket, so reconnect once to make sure the record is usable.
+        """
+        try:
+            service = await asyncio.wait_for(
+                RemotePairingLockdownService.create(lockdown),
+                timeout=REMOTE_PAIRING_PROVISION_TIMEOUT_SECONDS,
+            )
+            try:
+                try:
+                    await asyncio.wait_for(
+                        service.connect(autopair=True),
+                        timeout=REMOTE_PAIRING_PROVISION_TIMEOUT_SECONDS,
+                    )
+                except RemotePairingCompletedError:
+                    await asyncio.wait_for(service.close(), 2)
+                    service = await asyncio.wait_for(
+                        RemotePairingLockdownService.create(lockdown),
+                        timeout=REMOTE_PAIRING_PROVISION_TIMEOUT_SECONDS,
+                    )
+                    await asyncio.wait_for(
+                        service.connect(autopair=False),
+                        timeout=REMOTE_PAIRING_PROVISION_TIMEOUT_SECONDS,
+                    )
+                return True
+            finally:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(service.close(), 2)
+        except Exception as error:
+            await self.ipc.emit({
+                'event': 'warning', 'code': 'wireless_remote_pairing_provision_failed',
+                'message': f'RemotePairing provisioning did not complete: {type(error).__name__}: {str(error)[:180]}',
+            })
+            return False
+
+    async def _connect_with_ddi_recovery(self, lockdown) -> None:
+        """Reconnect after a DDI service-registration failure exactly once.
+
+        A mounted Personalized DDI is not sufficient evidence that dtuhidd has
+        published its CoreDevice services. This is observable after Xcode or a
+        previous tool leaves an outdated image mounted: RSD itself connects but
+        ``Services`` is empty. Rebuilding the RSD tunnel is necessary because
+        its service inventory is a handshake snapshot, not a live list.
+        """
+        try:
+            await self._connect_with_lockdown(lockdown)
+            return
+        except BridgePrerequisiteError as error:
+            if error.code != 'touch_surface_unavailable':
+                raise
+
+        if self._ddi_uses_cryptex and self.transport_mode == 'wireless':
+            # A Network Lockdown session may already have a prepared DDI. If
+            # its actual HID probe fails, prepare over the exact USB device
+            # once, then build a new wireless RSD service snapshot.
+            await self._prepare_ddi_for_remote_pairing()
+        elif self._ddi_was_mounted and not self._ddi_refresh_attempted:
+            self._ddi_refresh_attempted = True
+            await self._refresh_personalized_ddi(lockdown)
+
+        last_error: Optional[BridgePrerequisiteError] = None
+        for attempt in range(HID_SERVICE_REGISTRATION_ATTEMPTS):
+            try:
+                await self._connect_with_lockdown(lockdown)
+                return
+            except BridgePrerequisiteError as error:
+                if error.code != 'touch_surface_unavailable':
+                    raise
+                last_error = error
+                if attempt + 1 == HID_SERVICE_REGISTRATION_ATTEMPTS:
+                    raise
+                await self.ipc.emit({
+                    'event': 'status', 'code': 'waiting_for_hid_service',
+                    'message': (
+                        'Waiting for the Personalized DDI to publish Universal HID; '
+                        f'retry {attempt + 1}/{HID_SERVICE_REGISTRATION_ATTEMPTS - 1}'
+                    ),
+                })
+                await asyncio.sleep(HID_SERVICE_REGISTRATION_RETRY_SECONDS)
+
+        if last_error is not None:
+            raise last_error
+
+    async def _connect_via_remote_pairing(self, allow_ddi_recovery: bool = True) -> None:
+        """Use RemotePairing when usbmux cannot provide a CoreDevice tunnel."""
+        if not self.udid:
+            raise BridgePrerequisiteError(
+                'wireless_remote_pairing_required',
+                'Wireless CoreDevice control requires a known Apple UDID and a USB provisioning pass.',
+            )
+        try:
+            # The public discovery helper compares the requested identifier
+            # byte-for-byte with the pair-record filename.  Keep the exact
+            # stored spelling for that call while accepting the casing used by
+            # Apple device discovery and the WPF host.
+            remote_records = {
+                identifier.replace('-', '').casefold(): identifier
+                for identifier in iter_remote_paired_identifiers()
+            }
+        except Exception as error:
+            raise BridgePrerequisiteError(
+                'wireless_remote_pairing_failed',
+                f'Unable to inspect local RemotePairing records: {type(error).__name__}: {str(error)[:180]}',
+            ) from error
+        paired_identifier = remote_records.get(self.udid.replace('-', '').casefold())
+        if paired_identifier is None:
+            raise BridgePrerequisiteError(
+                'wireless_remote_pairing_required',
+                'This PC has no RemotePairing record for the device. Connect it by USB once, unlock it, '
+                'and let the bridge finish wireless provisioning before using wireless control.',
+            )
+
+        await self._emit_status('discovering_wireless_device')
+        try:
+            pairing_services = await asyncio.wait_for(
+                get_remote_pairing_tunnel_services(
+                    bonjour_timeout=REMOTE_PAIRING_DISCOVERY_TIMEOUT_SECONDS,
+                    udid=paired_identifier,
+                ),
+                timeout=(REMOTE_PAIRING_DISCOVERY_TIMEOUT_SECONDS +
+                         REMOTE_PAIRING_DISCOVERY_GRACE_SECONDS),
+            )
+        except asyncio.TimeoutError as error:
+            raise BridgePrerequisiteError(
+                'wireless_device_not_discoverable',
+                'RemotePairing discovery timed out. Keep the iPhone unlocked on the same LAN and allow mDNS '
+                'through the Windows firewall.',
+            ) from error
+        except BridgePrerequisiteError:
+            raise  # keep verified discovery/handshake diagnostics and their cause
+        except MdnsDiscoveryError as error:
+            raise BridgePrerequisiteError('wireless_discovery_unavailable', str(error)) from error
+        except Exception as error:
+            raise BridgePrerequisiteError(
+                'wireless_remote_pairing_failed',
+                f'RemotePairing discovery failed: {type(error).__name__}: {str(error)[:180]}',
+            ) from error
+        if not pairing_services:
+            raise BridgePrerequisiteError(
+                'wireless_device_not_discoverable',
+                'No RemotePairing service was discovered. Keep the iPhone unlocked on the same LAN and allow '
+                'mDNS through the Windows firewall.',
+            )
+
+        needs_ddi_recovery = False
+        try:
+            last_error = None
+            for index, selected in enumerate(pairing_services):
+                self._session_ready.clear()
+                self._hid_transport_failed = False
+                generation = self._generation
+                async def connect_remote():
+                    async with self._bounded_tunnel(selected) as tunnel_result:
+                        await self._run_observed_tunnel(tunnel_result)
+                        if self._hid_transport_failed:
+                            raise BridgePrerequisiteError('apple_connection_lost',
+                                                          'The RemotePairing control transport disconnected.')
+                try:
+                    await self._run_until_ready(connect_remote())
+                    return
+                except Exception as error:
+                    # After readiness, the host owns rediscovery and generation
+                    # changes. Only startup failures may try another LAN route.
+                    if self._generation != generation or self._recovering:
+                        raise
+                    if isinstance(error, BridgePrerequisiteError) and error.code not in {
+                            'touch_surface_unavailable', 'control_service_start_timeout',
+                            'apple_connection_lost', 'wireless_remote_pairing_failed'}:
+                        raise
+                    needs_ddi_recovery |= isinstance(error, BridgePrerequisiteError) and error.code == 'touch_surface_unavailable'
+                    last_error = error
+                    if index + 1 < len(pairing_services):
+                        await self.ipc.emit({'event': 'warning', 'code': 'wireless_route_retry',
+                            'message': f'Wireless route {index + 1} failed; trying the next discovered address.'})
+            if not needs_ddi_recovery or not allow_ddi_recovery:
+                if isinstance(last_error, BridgePrerequisiteError):
+                    raise last_error
+                raise BridgePrerequisiteError('wireless_remote_pairing_failed',
+                                              'All discovered wireless control routes failed.') from last_error
+        finally:
+            for service in pairing_services:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(service.close(), 2)
+        if needs_ddi_recovery:
+            await self._prepare_ddi_for_remote_pairing()
+            # RSD's service inventory is a snapshot. Rediscover and rebuild
+            # the wireless tunnel after changing the device image.
+            await self._connect_via_remote_pairing(allow_ddi_recovery=False)
+
+    async def _prepare_ddi_for_remote_pairing(self) -> None:
+        try:
+            lockdown = await self._create_lockdown_with_retry('USB')
+        except TimeoutError as error:
+            raise BridgePrerequisiteError('apple_device_connection_timeout',
+                'Connecting by USB to prepare the wireless developer image timed out.') from error
+        except DeviceNotFoundError as error:
+            raise BridgePrerequisiteError(
+                'developer_image_required',
+                'Wireless HID is unavailable. Connect and unlock this iPhone by USB '
+                'once to prepare its Personalized DDI, then retry wireless control.',
+            ) from error
+        try:
+            if not lockdown.udid or not _udid_matches(lockdown.udid, self.udid or ''):
+                raise BridgePrerequisiteError(
+                    'device_identity_mismatch',
+                    'USB DDI preparation found a different iPhone; refusing to use it.',
+                )
+            # This Lockdown client is explicitly USB, even though the control
+            # session remains wireless. Prepare the correct DDI over it.
+            await self._preflight_developer_environment(lockdown, usb_preparation=True)
+            if self._ddi_was_mounted and not self._ddi_refresh_attempted:
+                self._ddi_refresh_attempted = True
+                await self._refresh_personalized_ddi(lockdown)
+        finally:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(lockdown.close(), 2)
+
+    async def _create_lockdown_with_retry(self, connection_type: str):
+        return await create_lockdown_with_retry(
+            self.ipc, self.udid, connection_type)
+
+    async def _preflight_developer_environment(self, lockdown, *, usb_preparation=False) -> None:
+        if self._ddi_deadline is None or self._recovering:
+            self._ddi_deadline = asyncio.get_running_loop().time() + PERSONALIZED_DDI_PREPARE_TIMEOUT_SECONDS
+        try:
+            async with asyncio.timeout_at(self._ddi_deadline):
+                if usb_preparation:
+                    await self._prepare_developer_environment(lockdown, usb_preparation=True)
+                else:
+                    await self._prepare_developer_environment(lockdown)
+        except TimeoutError as error:
+            raise BridgePrerequisiteError('developer_image_prepare_timeout',
+                                          'DDI preparation exceeded its total time budget.') from error
+
+    async def _prepare_developer_environment(self, lockdown, *, usb_preparation=False) -> None:
+        """Require Developer Mode and prepare the system's DDI before HID.
+
+        iOS 27 uses the Cryptex USB/RSD route. Older systems try the explicitly
+        supplied bundle, environment bundle, then verified download/cache.
+        """
+        await self._emit_status('checking_developer_environment')
+        try:
+            async with asyncio.timeout(PERSONALIZED_DDI_INVENTORY_TIMEOUT_SECONDS):
+                developer_mode_enabled = await lockdown.get_developer_mode_status()
+        except (GetProhibitedError, NotPairedError) as error:
+            # Lockdown reports GetProhibited when the host has not completed
+            # the device trust handshake. Do not mislabel that as Developer
+            # Mode being disabled; the WPF host already has a precise trust
+            # recovery message for this stable error code.
+            raise BridgePrerequisiteError(
+                'apple_device_not_trusted',
+                'The iPhone has not trusted this Windows host. Unlock the device '
+                'and tap Trust, then reconnect the USB cable.',
+            ) from error
+        except asyncio.TimeoutError as error:
+            raise BridgePrerequisiteError('developer_mode_check_timeout',
+                                          'The device did not answer the Developer Mode query in time.') from error
+        except Exception as error:
+            if (known := device_failure(error)) is not None:
+                raise known from error
+            raise BridgePrerequisiteError(
+                'developer_mode_check_failed',
+                f'Unable to query Developer Mode status: {type(error).__name__}: {str(error)[:180]}',
+            ) from error
+        if not developer_mode_enabled:
+            if self.transport_mode == 'usb':
+                await self._reveal_developer_mode(lockdown)
+                raise BridgeUserActionRequired(
+                    'developer_mode_revealed',
+                    'The device accepted the request to show Developer Mode in Settings. '
+                    'Enable it under Privacy & Security, restart and confirm on the device, then retry.',
+                )
+            raise BridgePrerequisiteError(
+                'developer_mode_required',
+                'Developer Mode must be enabled on the device before USB control can start.',
+            )
+
+        try:
+            ios_major = int(str(getattr(lockdown, 'product_version', '')).split('.')[0])
+        except ValueError:
+            ios_major = 0
+        self._ddi_uses_cryptex = ios_major == 27
+        if self._ddi_uses_cryptex:
+            # Cryptex's generic identity supports new hardware without a
+            # board-specific PersonalizedDMG manifest entry. Do not run the
+            # legacy image-mounter's unmount/remount recovery on this image.
+            self._ddi_was_mounted = False
+            if self.transport_mode == 'usb' or usb_preparation:
+                await self._prepare_cryptex_developer_image(lockdown)
+            # Wireless readiness still requires the real HID probe. A missing
+            # service triggers explicit USB preparation in its recovery path.
+            return
+
+        try:
+            self._ddi_was_mounted = await self._is_personalized_ddi_mounted(lockdown)
+        except DeveloperModeIsNotEnabledError as error:
+            raise BridgePrerequisiteError(
+                'developer_mode_required',
+                'Developer Mode must be enabled on the device before USB control can start.',
+            ) from error
+        if self._ddi_was_mounted:
+            return
+        await self._mount_personalized_ddi(lockdown)
+
+    async def _prepare_cryptex_developer_image(self, lockdown) -> None:
+        from pymobiledevice3.remote.userspace_tunnel import UserspaceDialPlane
+
+        if not lockdown.udid or (self.udid and not _udid_matches(lockdown.udid, self.udid)):
+            raise BridgePrerequisiteError('device_identity_mismatch',
+                                          'USB DDI preparation found a different iPhone.')
+        service = None
+        try:
+            service = await CoreDeviceTunnelProxy.create(lockdown)
+            async with self._bounded_tunnel(service) as result:
+                tun = result.client.tun
+                if not hasattr(tun, 'set_peer'):
+                    raise BridgePrerequisiteError('userspace_tunnel_unavailable',
+                                                  'The USB DDI tunnel has no userspace network stack.')
+                tun.set_peer(result.address)
+                async with UserspaceDialPlane(tun, result.address) as dial:
+                    rsd = RemoteServiceDiscoveryService((result.address, result.port), open_connection=dial.dial)
+                    try:
+                        await rsd.__aenter__()
+                        if not rsd.udid or not _udid_matches(rsd.udid, lockdown.udid):
+                            raise BridgePrerequisiteError('device_identity_mismatch',
+                                                          'DDI RSD identity does not match the selected device.')
+                        await prepare_cryptex_ddi(rsd, self._emit_status)
+                    finally:
+                        await self._close_remote_service(rsd, 'cryptex_preparation_rsd')
+            # RSD advertises a handshake snapshot. The subsequent control
+            # tunnel is opened only after this preparation tunnel is closed.
+        except BridgePrerequisiteError:
+            raise
+        except Exception as error:
+            raise device_failure(error) or BridgePrerequisiteError(
+                'developer_image_service_unavailable',
+                f'Opening the Cryptex DDI tunnel failed ({type(error).__name__}).') from error
+        finally:
+            if service is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(service.close(), 3)
+
+    async def _reveal_developer_mode(self, lockdown) -> None:
+        # AMFI action 0 only reveals the Settings toggle. Never request enable
+        # (1) or post-restart acceptance (2); those remain on-device actions.
+        # Own the service explicitly: the upstream reveal helper does not close it.
+        service = None
+        try:
+            async with asyncio.timeout(PERSONALIZED_DDI_INVENTORY_TIMEOUT_SECONDS):
+                service = await lockdown.start_lockdown_service('com.apple.amfi.lockdown')
+                response = await service.send_recv_plist({'action': 0})
+                if not isinstance(response, dict) or response.get('success') is not True:
+                    raise BridgePrerequisiteError('developer_mode_reveal_failed',
+                                                  'The device rejected the Developer Mode reveal request.')
+        except TimeoutError as error:
+            raise BridgePrerequisiteError('developer_mode_reveal_timeout',
+                                          'The Developer Mode reveal request timed out.') from error
+        except BridgePrerequisiteError:
+            raise
+        except Exception as error:
+            # An unavailable AMFI service is not a missing developer image.
+            if not isinstance(error, InvalidServiceError) and (known := device_failure(error)) is not None:
+                raise known from error
+            raise BridgePrerequisiteError('developer_mode_reveal_failed',
+                                          'Unable to reveal the Developer Mode toggle.') from error
+        finally:
+            if service is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(service.close(), 2)
+
+    def _local_ddi_candidates(self) -> list[tuple[tuple[Path, Path, Path], str]]:
+        candidates: list[tuple[tuple[Path, Path, Path], str]] = []
+        seen: set[str] = set()
+        configured = []
+        if self.ddi_dir is not None:
+            configured.append((self.ddi_dir, 'bundled'))
+        env_dir = os.environ.get('IPHONE_MIRROR_DDI_DIR')
+        if env_dir:
+            configured.append((Path(env_dir), 'environment'))
+        for directory, source in configured:
+            key = str(Path(directory).expanduser()).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                candidates.append((local_personalized_ddi_bundle(Path(directory)), source))
+            except BridgePrerequisiteError as error:
+                log.warning('Personalized DDI %s candidate unavailable: %s', source, error)
+        return candidates
+
+    async def _resolve_personalized_ddi_bundle(self, allow_local: bool = True, *,
+                                              force_refresh=False, rejected_blobs=()):
+        local_candidates = self._local_ddi_candidates() if allow_local else []
+        if local_candidates:
+            return local_candidates[0]
+        await self._emit_status('testing_developer_image_sources')
+        loop = asyncio.get_running_loop()
+        cancelled = threading.Event()
+
+        def report_download_started() -> None:
+            if cancelled.is_set():
+                return
+            status = asyncio.run_coroutine_threadsafe(
+                self._emit_status('downloading_developer_image'), loop)
+            status.result(timeout=5)
+
+        try:
+            options = {'force_refresh': True, 'rejected_blobs': rejected_blobs} if force_refresh else {}
+            if self._ddi_rejection_scope:
+                options['rejection_scope'] = self._ddi_rejection_scope
+            bundle = await asyncio.wait_for(
+                asyncio.to_thread(fetch_automatic_personalized_ddi_bundle,
+                                  report_download_started, cancelled, **options),
+                timeout=PERSONALIZED_DDI_DOWNLOAD_TIMEOUT_SECONDS,
+            )
+        except BridgePrerequisiteError:
+            raise
+        except asyncio.TimeoutError as error:
+            raise BridgePrerequisiteError(
+                'developer_image_download_timeout',
+                'Testing and downloading the Personalized DDI timed out after '
+                f'{PERSONALIZED_DDI_DOWNLOAD_TIMEOUT_SECONDS} seconds.',
+            ) from error
+        except Exception as error:
+            raise BridgePrerequisiteError(
+                'developer_image_download_failed',
+                'Unable to prepare the Personalized DDI download: '
+                f'{type(error).__name__}: {str(error)[:180]}',
+            ) from error
+        finally:
+            # asyncio cannot stop a requests worker. Prevent a timed-out worker
+            # from trying more sources or publishing files during a later retry.
+            cancelled.set()
+        return bundle, 'github'
+
+    async def _mount_ddi_candidate(self, lockdown, candidate) -> None:
+        bundle, source = candidate
+        try:
+            async with bounded_mounter(PersonalizedImageMounter(lockdown=lockdown)) as mounter:
+                mounter.report_status = self._emit_status
+                await asyncio.wait_for(mounter.mount(*bundle),
+                                       timeout=PERSONALIZED_DDI_MOUNT_TIMEOUT_SECONDS)
+        except AlreadyMountedError:
+            # A competing mount is only successful if a fresh inventory confirms it.
+            pass
+        except BridgePrerequisiteError:
+            raise
+        except asyncio.TimeoutError as error:
+            raise BridgePrerequisiteError('developer_image_mount_timeout',
+                                          f'DDI mount timed out (source={source}).') from error
+        except Exception as error:
+            if (known := device_failure(error)) is not None:
+                raise known from error
+            code = 'developer_image_bundle_invalid' if isinstance(error, (OSError, ValueError)) else 'developer_image_mount_failed'
+            raise BridgePrerequisiteError(code, f'DDI candidate {source} failed ({type(error).__name__}).') from error
+
+        await self._emit_status('verifying_developer_image')
+        for attempt in range(3):
+            if await self._is_personalized_ddi_mounted(lockdown):
+                return
+            if attempt < 2:
+                await asyncio.sleep(0.3)
+        raise BridgePrerequisiteError('developer_image_verification_failed',
+                                      f'DDI candidate {source} was not present after mounting.')
+
+    async def _mount_personalized_ddi(self, lockdown, prepared=None) -> None:
+        self._ddi_rejection_scope = _ddi_rejection_scope(lockdown)
+        await self._emit_status('mounting_developer_image')
+        candidates = self._local_ddi_candidates()
+        if prepared is not None:
+            candidates = [prepared] + [item for item in candidates if item[0] != prepared[0]]
+        # A prepared GitHub image is already the last candidate. Do not repeat
+        # the same cached image or report its failure as a download failure.
+        if prepared is None or prepared[1] != 'github':
+            candidates.append(None)
+        for index, candidate in enumerate(candidates):
+            if index:
+                await self._emit_status('switching_developer_image')
+            if candidate is None:
+                candidate = await self._resolve_personalized_ddi_bundle(allow_local=False)
+                if candidate[1] != 'github':
+                    raise BridgePrerequisiteError('developer_image_download_failed',
+                                                  'DDI fallback did not produce a verified downloaded image.')
+            try:
+                await self._mount_ddi_candidate(lockdown, candidate)
+                return
+            except BridgePrerequisiteError as error:
+                # Only an image-specific failure justifies another candidate.
+                # Device/connection/TSS-network failures require reconnection or
+                # retry, not a new download on the same broken transport.
+                if error.code not in {'developer_image_bundle_invalid',
+                                      'developer_image_download_incompatible',
+                                      'developer_image_mount_failed',
+                                      'developer_image_tss_rejected'}:
+                    raise
+                if candidate[1] == 'github':
+                    # Persist rejection only for this exact cache content. A
+                    # later click must not silently mount the same rejected DDI.
+                    await asyncio.to_thread(_record_ddi_rejection, candidate[0], error.code, self._ddi_rejection_scope)
+                    try:
+                        rejected = await asyncio.to_thread(_ddi_bundle_blobs, candidate[0])
+                    except OSError:
+                        rejected = ()  # files vanished; a fresh download can repair them
+                    try:
+                        replacement = await self._resolve_personalized_ddi_bundle(
+                            allow_local=False, force_refresh=True, rejected_blobs=rejected)
+                    except BridgePrerequisiteError as refresh_error:
+                        if refresh_error.code == 'developer_image_no_new_candidate':
+                            raise error
+                        raise
+                    try:
+                        await self._mount_ddi_candidate(lockdown, replacement)
+                    except BridgePrerequisiteError as replacement_error:
+                        await asyncio.to_thread(_record_ddi_rejection, replacement[0], replacement_error.code,
+                                                self._ddi_rejection_scope)
+                        raise
+                    return
+                if index == len(candidates) - 1:
+                    raise
+                log.warning('DDI candidate failed: source=%s code=%s; trying next candidate',
+                            candidate[1], error.code)
+
+    async def _refresh_personalized_ddi(self, lockdown) -> None:
+        if self._ddi_deadline is None:
+            self._ddi_deadline = asyncio.get_running_loop().time() + PERSONALIZED_DDI_PREPARE_TIMEOUT_SECONDS
+        try:
+            async with asyncio.timeout_at(self._ddi_deadline):
+                await self._refresh_personalized_ddi_impl(lockdown)
+        except TimeoutError as error:
+            raise BridgePrerequisiteError('developer_image_prepare_timeout',
+                                          'DDI refresh exceeded the preparation budget.') from error
+
+    async def _refresh_personalized_ddi_impl(self, lockdown) -> None:
+        self._ddi_rejection_scope = _ddi_rejection_scope(lockdown)
+        await self._emit_status('remounting_developer_image')
+        # A failed download must not remove an image already mounted by Xcode
+        # or another client. Prepare the replacement before touching the device.
+        prepared = await self._resolve_personalized_ddi_bundle()
+        try:
+            async with bounded_mounter(PersonalizedImageMounter(lockdown=lockdown)) as mounter:
+                await asyncio.wait_for(
+                    mounter.umount(), timeout=PERSONALIZED_DDI_REMOUNT_TIMEOUT_SECONDS)
+        except NotMountedError:
+            # Another client may have removed the image while the failed tunnel
+            # was closing. The normal mount path below can safely continue.
+            pass
+        except asyncio.TimeoutError as error:
+            raise BridgePrerequisiteError(
+                'developer_image_remount_failed',
+                'Unmounting the stale Personalized DDI timed out after 30 seconds.',
+            ) from error
+        except BridgePrerequisiteError:
+            raise
+        except Exception as error:
+            if (known := device_failure(error)) is not None:
+                raise known from error
+            raise BridgePrerequisiteError(
+                'developer_image_remount_failed',
+                f'Unable to remove the stale Personalized DDI: {type(error).__name__}: {str(error)[:180]}',
+            ) from error
+        await self._mount_personalized_ddi(lockdown, prepared)
+
+    @staticmethod
+    async def _is_personalized_ddi_mounted(lockdown) -> bool:
+        """Cross-check LookupImage with CopyDevices when the device supports it.
+
+        iOS can report a Personalized image from LookupImage while its mounted
+        image inventory is empty. Preserve the positive result so the recovery
+        path can unmount it after a failed HID probe, but record the mismatch
+        instead of treating it as a proof that the DDI is usable.
+        """
+        try:
+            async with asyncio.timeout(PERSONALIZED_DDI_INVENTORY_TIMEOUT_SECONDS):
+                return await TouchSession._query_personalized_ddi_inventory(lockdown)
+        except TimeoutError as error:
+            raise BridgePrerequisiteError('developer_image_service_timeout',
+                                          'Querying the mounted DDI inventory timed out.') from error
+
+    @staticmethod
+    async def _query_personalized_ddi_inventory(lockdown) -> bool:
+        async with bounded_mounter(PersonalizedImageMounter(lockdown=lockdown)) as mounter:
+            mounted = await mounter.is_image_mounted(PersonalizedImageMounter.IMAGE_TYPE)
+            copy_devices = getattr(mounter, 'copy_devices', None)
+            if not callable(copy_devices):
+                return mounted
+            try:
+                devices = await asyncio.wait_for(
+                    copy_devices(), timeout=PERSONALIZED_DDI_INVENTORY_TIMEOUT_SECONDS)
+            except Exception as error:
+                if (known := device_failure(error)) is not None:
+                    raise known from error
+                log.info('Unable to inspect Personalized DDI inventory: %s: %s',
+                         type(error).__name__, str(error)[:180])
+                return mounted
+            personalized = [device for device in devices if isinstance(device, dict) and
+                            device.get('DiskImageType') == PersonalizedImageMounter.IMAGE_TYPE]
+            if mounted and not personalized:
+                log.warning('Personalized DDI LookupImage is mounted but CopyDevices is empty')
+            elif personalized and not mounted:
+                log.warning('CopyDevices reports a Personalized DDI that LookupImage did not confirm')
+            return mounted or bool(personalized)
+
+    @staticmethod
+    def _connected_service_ids(surfaces: object) -> set[int]:
+        """Extract advertised _ServiceID values from an RSD HID response."""
+        ids: set[int] = set()
+
+        def visit(value: object) -> None:
+            if isinstance(value, dict):
+                service_id = value.get('_ServiceID')
+                if isinstance(service_id, int) and not isinstance(service_id, bool):
+                    ids.add(service_id)
+                elif isinstance(service_id, dict):
+                    raw = service_id.get('uint')
+                    if isinstance(raw, int) and not isinstance(raw, bool):
+                        ids.add(raw)
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    visit(child)
+
+        visit(surfaces)
+        return ids
+
+    async def _verify_touch_surface(self, hid) -> None:
+        """Require the real mainTouchscreen surface before reporting ready."""
+        surfaces = await asyncio.wait_for(hid.list_connected_services(), 8)
+        ids = self._connected_service_ids(surfaces)
+        log.info('service=%s surfaces=%s', hid.SERVICE_NAME, sorted(ids))
+        # iOS publishes a keyboard surface on some DDIs (service 512). In
+        # direct-HID mode registering a second virtual service can be rejected
+        # even though the published surface accepts the standard keyboard
+        # report. Prefer the device-owned surface when it is available.
+        if KEYBOARD_SURFACE_CONNECTED in ids:
+            self.keyboard_service_id = KEYBOARD_SURFACE_CONNECTED
+        if DIGITIZER_SURFACE_MAIN_TOUCHSCREEN in ids:
+            return
+        advertised = ', '.join(str(service_id) for service_id in sorted(ids)) or 'none'
+        raise BridgePrerequisiteError(
+            'touch_surface_unavailable',
+            'Universal HID did not advertise the mainTouchscreen surface '
+            f'{DIGITIZER_SURFACE_MAIN_TOUCHSCREEN}; advertised surfaces: {advertised}.',
+        )
+
+    async def _connect_with_lockdown(self, lockdown) -> None:
+        if not lockdown.udid or (self.udid and not _udid_matches(lockdown.udid, self.udid)):
+            raise BridgePrerequisiteError(
+                'device_identity_mismatch',
+                'The connected iPhone does not match the selected device; refusing control.',
+            )
+        if self.udid is None:
+            self.udid = lockdown.udid
+        if self.transport_mode == 'usb' and not self._remote_pairing_provision_attempted:
+            # Best-effort only: wired control must never fail because optional
+            # future wireless provisioning is unavailable on this device.
+            self._remote_pairing_provision_attempted = True
+            await self._provision_remote_pairing(lockdown)
+        await self._preflight_developer_environment(lockdown)
+        # This owner survives sender/health-task cancellation. The raw usbmux
+        # reader and sequence numbers belong to the whole wired session.
+        while True:
+            attempt_lockdown = lockdown
+            owns_lockdown = False
+            self._hid_transport_failed = False
+            self._session_ready.clear()
+            try:
+                if self._recovering:
+                    await self._recovery_event('transport_reconnect_started')
+                    attempt_lockdown = await asyncio.wait_for(
+                        self._reconnect_lockdown(), 15)
+                    owns_lockdown = True
+                    # Check actual device services; only mount if missing.
+                    await self._recovery_event('developer_image_check_started')
+                    try:
+                        await asyncio.wait_for(
+                            self._preflight_developer_environment(attempt_lockdown),
+                            HID_RECOVERY_READY_TIMEOUT_SECONDS)
+                    except Exception as error:
+                        await self._recovery_event('developer_image_check_failed', error)
+                        raise
+                await self._run_tunnel_attempt(attempt_lockdown)
+                if not self._hid_transport_failed:
+                    return  # stdin EOF / requested stop
+                if self.transport_mode == 'wireless':
+                    raise BridgePrerequisiteError('apple_connection_lost',
+                                                  'Wireless control disconnected; rediscovery is required.')
+            except asyncio.CancelledError:
+                raise  # shutdown, never reinterpret it as a recovery request
+            except Exception as error:
+                if self.transport_mode == 'wireless':
+                    # The host rediscovers the wireless route. USB reconstruction
+                    # here would silently switch a wireless session to a cable.
+                    raise
+                if not self._session_ready.is_set() and not self._recovering:
+                    raise  # initial prerequisite/DDI failure belongs to caller
+                await self._mark_recovering(error)
+                await self._recovery_event('transport_reconnect_failed', error)
+            finally:
+                if owns_lockdown:
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(attempt_lockdown.close(), 2)
+            self._recovery_attempt += 1
+            if self._recovery_attempt > HID_RECOVERY_ATTEMPTS:
+                await self._recovery_event('recovery_failed')
+                raise BridgePrerequisiteError(
+                    'direct_hid_recovery_exhausted',
+                    'Reverse-control transport recovery failed after three attempts.')
+            await self._recovery_event('recovery_started')
+            # The first repair follows an established session: start now.
+            # Back off only after a reconstruction actually failed.
+            if self._recovery_attempt > 1:
+                await asyncio.sleep(self._recovery_attempt - 1)
+
+    async def _run_tunnel_attempt(self, lockdown) -> None:
+        fallback_remote = False
+        async def run():
+            nonlocal fallback_remote
+            try:
+                service = await CoreDeviceTunnelProxy.create(lockdown)
+            except InvalidServiceError:
+                if self.transport_mode == 'usb':
+                    raise BridgePrerequisiteError('wired_control_service_unavailable',
+                        'The device does not provide the USB CoreDevice tunnel service. '
+                        'Unlock/reconnect the device or explicitly select wireless control.')
+                await self.ipc.emit({'event': 'warning', 'code': 'coredevice_proxy_unavailable',
+                                     'message': 'CoreDeviceProxy unavailable; trying RemotePairing.'})
+                fallback_remote = True
+                return
+            result = None
+            diagnostic_task = None
+            try:
+                async with self._bounded_tunnel(service) as result:
+                    # Explicit opt-in for real-device recovery validation.
+                    # Close the actual CoreDevice socket once; do not fabricate
+                    # an exception/ready event or disturb the capture interface.
+                    delay = os.environ.get('IPHONE_MIRROR_TEST_DISCONNECT_AFTER_SECONDS', '')
+                    modes = os.environ.get('IPHONE_MIRROR_TEST_DISCONNECT_MODES', 'transport').split(',')
+                    valid_modes = 1 <= len(modes) <= 5 and all(mode in ('hid', 'transport', 'mux') for mode in modes)
+                    if (delay.isdecimal() and 1 <= int(delay) <= 3600 and valid_modes and
+                            self._diagnostic_disconnect_count < len(modes)):
+                        async def disconnect():
+                            while self._diagnostic_disconnect_count < len(modes):
+                                await self._session_ready.wait()
+                                await asyncio.sleep(int(delay))
+                                mode = modes[self._diagnostic_disconnect_count]
+                                self._diagnostic_disconnect_count += 1
+                                generation = self._generation
+                                await self.ipc.emit({'event': 'warning', 'code': f'diagnostic_{mode}_disconnect',
+                                    'message': f'Closing the real {mode} socket for requested test {self._diagnostic_disconnect_count}/{len(modes)}.'})
+                                if mode == 'transport':
+                                    await service.close()
+                                    return
+                                if mode == 'mux':
+                                    if self._usb_mux_transport is None:
+                                        raise RuntimeError('No capture mux available for requested fault')
+                                    self._usb_mux_transport.close()
+                                    return
+                                async with self._hid_lifecycle_lock:
+                                    await self._close_remote_service(self.hid, 'diagnostic_hid')
+                                # Wait for genuine recovery before scheduling
+                                # the next fault in the same transport session.
+                                while self._generation == generation:
+                                    await asyncio.sleep(0.1)
+                        diagnostic_task = asyncio.create_task(disconnect())
+                    await self._run_observed_tunnel(result)
+            finally:
+                if diagnostic_task is not None:
+                    diagnostic_task.cancel()
+                    await asyncio.gather(diagnostic_task, return_exceptions=True)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(service.close(), 2)
+
+        generation = self._generation
+        try:
+            await self._run_until_ready(run())
+        except Exception as error:
+            retryable = isinstance(error, (ConnectionError, TimeoutError, OSError,
+                ConnectionFailedError, ConnectionTerminatedError, MuxException)) or (
+                isinstance(error, BridgePrerequisiteError) and error.code in {
+                    'control_service_start_timeout', 'apple_connection_lost',
+                    'remote_control_service_unavailable'})
+            if (self.transport_mode != 'wireless' or self._generation != generation or
+                    self._recovering or not retryable):
+                raise
+            await self.ipc.emit({'event': 'warning', 'code': 'coredevice_proxy_unavailable',
+                'message': 'Network CoreDevice tunnel failed before readiness; trying RemotePairing.'})
+            fallback_remote = True
+        if fallback_remote:
+            # RemotePairing owns its own readiness deadline. Its discovery and
+            # optional DDI refresh must not consume the previous tunnel's 45s.
+            await self._connect_via_remote_pairing()
+
+    @contextlib.asynccontextmanager
+    async def _bounded_tunnel(self, service):
+        manager = start_tunnel(service, protocol=TunnelProtocol.TCP)
+        result = None
+        try:
+            result = await manager.__aenter__()
+            yield result
+        finally:
+            try:
+                async with asyncio.timeout(3):
+                    await manager.__aexit__(*sys.exc_info())
+            except Exception as error:
+                log.warning('Tunnel cleanup failed: %s', type(error).__name__)
+            finally:
+                # SDK stop_tunnel can raise on a failed reader before closing
+                # the userspace stack. Release it on both transport paths.
+                client = getattr(result, 'client', None)
+                tun = getattr(client, 'tun', None)
+                if tun is not None:
+                    try:
+                        async with asyncio.timeout(3):
+                            reader = getattr(client, '_tun_read_task', None)
+                            if reader is not None:
+                                reader.cancel()
+                                await asyncio.gather(reader, return_exceptions=True)
+                            await tun.close()
+                    except Exception as error:
+                        log.warning('Tunnel stack cleanup failed: %s', type(error).__name__)
+
+    async def _run_until_ready(self, operation):
+        task = asyncio.create_task(operation, name='hid-transport-session')
+        ready = asyncio.create_task(self._session_ready.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (task, ready), timeout=HID_RECOVERY_READY_TIMEOUT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                raise BridgePrerequisiteError('control_service_start_timeout',
+                                              'CoreDevice/RSD/HID did not become ready in time.')
+            await task  # the session may run indefinitely AFTER real readiness
+        finally:
+            ready.cancel()
+            task.cancel()
+            await asyncio.gather(ready, task, return_exceptions=True)
+
+    def _transport_failure_reason(self, client=None) -> Optional[str]:
+        mux = self._usb_mux_transport
+        reason = getattr(mux, 'failure_reason', None) if mux is not None else None
+        if reason:
+            return f'capture mux: {reason}'
+        client = client if client is not None else getattr(self, '_active_tunnel_client', None)
+        for name in ('_sock_read_task', '_tun_read_task'):
+            task = getattr(client, name, None)
+            if isinstance(task, asyncio.Future) and task.done():
+                return f'CoreDevice {name} ended'
+        return None
+
+    async def _wait_transport_failure(self, client) -> str:
+        # SDK readers can return normally on EOF/OSError. Their completion is
+        # still a terminal transport event, even while HID and stdin are idle.
+        # asyncio.wait observes them without taking cancellation ownership.
+        readers = [task for name in ('_sock_read_task', '_tun_read_task')
+                   if isinstance(task := getattr(client, name, None), asyncio.Future)]
+        while True:
+            reason = self._transport_failure_reason(client)
+            if reason:
+                return reason
+            if readers:
+                await asyncio.wait(readers, timeout=TRANSPORT_FAILURE_POLL_SECONDS,
+                                   return_when=asyncio.FIRST_COMPLETED)
+            else:
+                await asyncio.sleep(TRANSPORT_FAILURE_POLL_SECONDS)
+
+    async def _run_observed_tunnel(self, result) -> None:
+        self._active_tunnel_client = result.client
+        session = asyncio.create_task(self._connect_with_tunnel_result(
+            result, preserve_capture_mux=True), name='hid-observed-session')
+        failure = asyncio.create_task(self._wait_transport_failure(result.client),
+                                      name='hid-transport-monitor')
+        try:
+            done, _ = await asyncio.wait((session, failure), return_when=asyncio.FIRST_COMPLETED)
+            if session in done:
+                await session  # requested EOF/stop or an existing HID recovery
+                return
+            error = ConnectionError(await failure)
+            if not self._session_ready.is_set() and not self._recovering:
+                raise error  # preserve initial-start failure semantics
+            session.cancel()
+            await self._mark_recovering(error)
+            await self._recovery_event('transport_failure_detected', error)
+            # No HID request can repair a dead tunnel. Cancel its consumers,
+            # finish cleanup, then let the independent owner reconstruct it.
+        finally:
+            failure.cancel()
+            session.cancel()
+            await asyncio.gather(failure, session, return_exceptions=True)
+            self._active_tunnel_client = None
+
+    async def _recovery_event(self, code: str, error: Optional[Exception] = None) -> None:
+        message = (f'attempt={self._recovery_attempt}/{HID_RECOVERY_ATTEMPTS} '
+                   f'generation={self._generation} '
+                   f'elapsed_ms={int((time.monotonic() - self._recovery_started) * 1000)} '
+                   f'capture_mux_preserved={self._usb_mux_transport is not None}')
+        if error is not None:
+            message += f' error={type(error).__name__}: {str(error)[:160]}'
+        await self.ipc.emit({'event': 'status', 'code': code, 'message': message})
+
+    async def _mark_recovering(self, error: Exception) -> None:
+        self._hid_transport_failed = True
+        self._session_ready.clear()
+        if not self._recovering:
+            self._recovering = True
+            self._recovery_started = time.monotonic()
+            await self._recovery_event('recovery_triggered', error)
+
+    async def _run_serve(self) -> None:
+        # Rotation may interrupt a blocked sender, never its supervisor.
+        task = asyncio.create_task(self._serve(), name='hid-input-sender')
+        try:
+            await task
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling() or not self._hid_transport_failed:
+                raise
+
+    async def _connect_with_tunnel_result(self, tunnel_result,
+                                          *, preserve_capture_mux: bool = False) -> None:
+        """Open RSD and HID using either a USB or RemotePairing TCP tunnel."""
+        from pymobiledevice3.remote.userspace_tunnel import UserspaceDialPlane
+
+        tun = tunnel_result.client.tun
+        if not hasattr(tun, 'set_peer'):
+            raise BridgePrerequisiteError(
+                'userspace_tunnel_unavailable',
+                'The selected CoreDevice tunnel did not provide the required userspace network stack.',
+            )
+        tun.set_peer(tunnel_result.address)
+        self.dial_plane = UserspaceDialPlane(tun, tunnel_result.address)
+        try:
+            await self.dial_plane.__aenter__()
+            self.rsd = RemoteServiceDiscoveryService(
+                (tunnel_result.address, tunnel_result.port),
+                open_connection=self.dial_plane.dial,
+            )
+            if self._recovering:
+                await self._recovery_event('rsd_reconnect_started')
+            try:
+                await self.rsd.__aenter__()
+                actual_udid = self.rsd.udid
+                if not actual_udid or (self.udid and not _udid_matches(actual_udid, self.udid)):
+                    raise BridgePrerequisiteError('device_identity_mismatch',
+                                                  'RSD identity does not match the selected device.')
+            except Exception as error:
+                if self._recovering:
+                    await self._recovery_event('rsd_reconnect_failed', error)
+                raise
+            if self._recovering:
+                await self._recovery_event('hid_reinit_started')
+            # HID reports are accepted only while the media-stream auth gate
+            # is held. Some recent systems instead expose a verified direct
+            # Universal HID service, handled below.
+            established = False
+            try:
+                async with touch_session(self.rsd) as hid:
+                    self.hid = hid
+                    try:
+                        await self._verify_touch_surface(hid)
+                        await self.ipc.emit({'event': 'status', 'code': 'hid_service_selected',
+                                             'message': hid.SERVICE_NAME})
+                        self.auth_mode = 'mediastream'
+                        self.gate_open = True
+                        await self._emit_ready()
+                        established = True
+                        await self._run_serve()
+                    finally:
+                        # Release while the SDK-owned HID and media gate are
+                        # still open. Outer cleanup runs after this context.
+                        await self._release_hid_state()
+                        self.hid = None
+            except Exception as error:
+                if established:
+                    raise  # established-session failures belong to its supervisor
+                self.hid = None  # touch_session has already closed its HID
+                self.gate_open = False
+                self.auth_mode = None
+                if self._transport_failure_reason():
+                    raise  # a different HID endpoint cannot repair a dead tunnel
+                if self._can_fallback_to_direct_hid(error):
+                    await self._enable_direct_hid_fallback(error)
+                    await self._emit_ready()
+                    await self._run_serve()
+                    return
+                # Some supported iOS builds do not publish DisplayService at
+                # first, and touch_session can also report a late HID service
+                # registration as InvalidServiceError. Retry only these
+                # service-registration cases through explicit HID.
+                if not self._is_optional_session_failure(error):
+                    raise
+                await self.ipc.emit({'event': 'warning', 'code': 'gate_unavailable',
+                                     'message': f'touch authentication gate unavailable; continuing HID: {str(error)[:180]}'})
+                await self._initialize_touch_with_retry()
+                await self._emit_ready()
+                await self._run_serve()
+        finally:
+            await self._cleanup(preserve_capture_mux=preserve_capture_mux)
+
+    async def _init_touch(self) -> None:
+        await self._emit_status('initializing_touch')
+        services = (self.rsd.peer_info or {}).get('Services', {})
+        modern_name = UniversalHIDServiceService.SERVICE_NAME
+        hid_types = [UniversalHIDServiceService, LegacyUniversalHIDServiceService]
+        if modern_name not in services and LEGACY_UNIVERSAL_HID_SERVICE in services:
+            hid_types.reverse()
+
+        last_unavailable = None
+        for hid_type in hid_types:
+            hid = hid_type(self.rsd)
+            previous_keyboard = self.keyboard_service_id
+            self.keyboard_service_id = None
+            try:
+                await asyncio.wait_for(hid.__aenter__(), 8)
+                await self._verify_touch_surface(hid)
+                # A returned inventory can race a stream reset. Verify this
+                # candidate before committing so Legacy remains available.
+                await self._ping_hid(hid)
+            except BaseException as error:
+                self.keyboard_service_id = previous_keyboard
+                await self._close_remote_service(hid, 'rejected_hid_source')
+                if self._transport_failure_reason() or not self._is_hid_candidate_failure(error):
+                    raise
+                last_unavailable = error
+                await self.ipc.emit({'event': 'warning', 'code': 'hid_source_rejected',
+                    'message': f'service={hid.SERVICE_NAME} reason={getattr(error, "code", type(error).__name__)}'})
+                continue
+
+            self.hid = hid
+            self._owns_hid = True
+            await self.ipc.emit({'event': 'status', 'code': 'hid_service_selected',
+                                 'message': hid.SERVICE_NAME})
+            return
+
+        if last_unavailable is not None:
+            raise last_unavailable
+        raise RuntimeError('No compatible Universal HID service was available')
+
+    @staticmethod
+    def _is_hid_service_unavailable(error: Exception) -> bool:
+        detail = str(error).casefold()
+        return 'no such service' in detail or 'no_such_service' in detail
+
+    @staticmethod
+    def _is_hid_candidate_failure(error) -> bool:
+        return (TouchSession._is_hid_service_unavailable(error) or
+                isinstance(error, (TimeoutError, InvalidServiceError, StreamClosedError,
+                                   ConnectionTerminatedError, ConnectionError)) or
+                isinstance(error, BridgePrerequisiteError) and error.code == 'touch_surface_unavailable')
+
+    @staticmethod
+    def _is_remote_control_unsupported_ios(error: Exception) -> bool:
+        return '9021' in str(error)
+
+    @staticmethod
+    def _can_fallback_to_direct_hid(error: Exception) -> bool:
+        """Whether a media-session failure still permits a direct HID path.
+
+        Recent Personalized DDIs reject startmediastream with 9021 on older
+        iOS versions, while still publishing Universal HID.  A missing display
+        service behaves the same way.  The direct path below still verifies
+        the actual HID service before declaring readiness.
+        """
+        detail = str(error).casefold()
+        return TouchSession._is_remote_control_unsupported_ios(error) or (
+            'com.apple.coredevice.displayservice' in detail or
+            'timed out starting the media stream that gates hid auth' in detail or
+            ('invalidserviceerror' in detail and 'display' in detail)
+        )
+
+    @staticmethod
+    def _is_optional_session_failure(error: Exception) -> bool:
+        """Return true when touch_session failed in an optional gate step.
+
+        The bundled pymobiledevice3 touch_session opens DisplayService before
+        Universal HID. On devices without that service, the exception occurs
+        before our own fallback code can run. Keep the fallback narrow enough
+        to avoid hiding tunnel or protocol failures.
+        """
+        detail = str(error).casefold()
+        return isinstance(error, (StreamClosedError, ConnectionTerminatedError, ConnectionError)) or (
+            isinstance(error, BridgePrerequisiteError) and error.code == 'touch_surface_unavailable') or (
+            not TouchSession._is_remote_control_unsupported_ios(error) and (
+            'startmediastream' in detail
+            or 'com.apple.coredevice.displayservice' in detail
+            or ('invalidserviceerror' in detail and
+                ('display' in detail or 'hid' in detail or 'universal' in detail))
+            or 'com.apple.coredevice.hid.universalhidservice' in detail
+        ))
+
+    async def _enable_direct_hid_fallback(self, error: Exception) -> None:
+        await self.ipc.emit({
+            'event': 'warning',
+            'code': 'direct_hid_fallback',
+            'message': (
+                'Media-stream authentication is unavailable; verifying direct '
+                f'Universal HID instead: {str(error)[:180]}'
+            ),
+        })
+        await self._initialize_touch_with_retry(open_media_gate=False)
+        self.auth_mode = 'direct'
+        # In direct mode the DDI-published HID service is the authenticated
+        # path. Keep the existing gateOpen field true so older hosts accept a
+        # verified direct session, and advertise authMode for newer callers.
+        self.gate_open = True
+
+    async def _initialize_touch_with_retry(self, open_media_gate: bool = True) -> None:
+        gate_attempted = False
+        for attempt in range(3):
+            try:
+                await self._init_touch()
+                break
+            except Exception as error:
+                # Missing endpoints in this immutable RSD snapshot cannot
+                # appear by reopening the same service. Ask the outer owner
+                # to rebuild RSD instead of spending three identical retries.
+                advertised = (self.rsd.peer_info or {}).get('Services', {})
+                missing_snapshot = self._is_hid_service_unavailable(error) and not any(
+                    name in advertised for name in (UniversalHIDServiceService.SERVICE_NAME, LEGACY_UNIVERSAL_HID_SERVICE))
+                if self._transport_failure_reason():
+                    raise
+                if not self._is_hid_candidate_failure(error) or attempt == 2 or missing_snapshot:
+                    services = self._advertised_hid_services()
+                    await self._emit_hid_service_inventory(services)
+                    if self._is_hid_candidate_failure(error):
+                        advertised = ', '.join(services) or 'none'
+                        raise BridgePrerequisiteError(
+                            'touch_surface_unavailable',
+                            'RSD did not advertise a usable Universal HID service; '
+                            f'advertised HID services: {advertised}.',
+                        ) from error
+                    raise
+                if open_media_gate and not gate_attempted:
+                    await self._open_gate()
+                    gate_attempted = True
+                await self.ipc.emit({
+                    'event': 'status', 'code': 'waiting_for_hid_service',
+                    'message': f'Universal HID service is still registering; retry {attempt + 1}/2',
+                })
+                await asyncio.sleep(1)
+        if open_media_gate and not gate_attempted:
+            await self._open_gate()
+        # Universal HID is independently authenticated by _init_touch.  The
+        # optional media-stream gate can be unavailable on some iOS builds;
+        # do not reject an otherwise verified direct HID session.
+        if self.hid is not None and not self.gate_open:
+            self.auth_mode = 'direct'
+            self.gate_open = True
+            await self.ipc.emit({
+                'event': 'warning',
+                'code': 'direct_hid_fallback',
+                'message': 'Media-stream authentication unavailable; continuing with verified Universal HID.',
+            })
+
+    def _advertised_hid_services(self) -> list[str]:
+        services = (self.rsd.peer_info or {}).get('Services', {}) if self.rsd is not None else {}
+        if not isinstance(services, dict):
+            return []
+        return sorted(name for name in services if isinstance(name, str) and 'hid' in name.casefold())
+
+    async def _emit_hid_service_inventory(self, services: Optional[list[str]] = None) -> None:
+        if services is None:
+            services = self._advertised_hid_services()
+        await self.ipc.emit({
+            'event': 'warning', 'code': 'hid_service_inventory',
+            'message': f'product={getattr(self.rsd, "product_type", "unknown")}; '
+                       f'ios={getattr(self.rsd, "product_version", "unknown")}; '
+                       f'services={services}',
+        })
+
+    async def _open_gate(self) -> None:
+        """尝试 startmediastream 持有 backboardd auth gate。
+
+        iOS < 27.0 may return 9021.  The caller can fall back to a direct
+        Universal HID session when that service is actually available.
+        """
+        display = DisplayService(self.rsd)
+        try:
+            await asyncio.wait_for(display.__aenter__(), 8)
+        except BaseException as error:
+            # DisplayService is only an optional authentication-gate probe;
+            # Universal HID was already initialized and remains usable.
+            self.display = None
+            await self._close_remote_service(display, 'unavailable_display')
+            if isinstance(error, (asyncio.CancelledError, ConnectionError, ConnectionTerminatedError, MuxException)):
+                raise
+            await self.ipc.emit({'event': 'warning', 'code': 'gate_unavailable',
+                                 'message': f'display service unavailable; continuing HID control: {type(error).__name__}'})
+            if self.hid is not None:
+                self.auth_mode = 'direct'
+                self.gate_open = True
+            return
+        self.display = display
+        try:
+            from pymobiledevice3.remote.core_device.screen_stream import open_media_receiver
+            self.transport, receiver_ip = open_media_receiver(self.display, (1 * 1024 * 1024,))
+            sender_ip = self.rsd.service.address[0]
+            self.stream_answer = await asyncio.wait_for(
+                self.display.start_video_stream(
+                    receiver_ip=receiver_ip,
+                    receiver_port=self.transport.port,
+                    sender_ip=sender_ip,
+                    display_id=1,
+                ),
+                timeout=10.0,
+            )
+            self.gate_open = True
+            self.auth_mode = 'mediastream'
+            self.drain_task = asyncio.create_task(self._drain())
+            await asyncio.sleep(0.3)
+        except asyncio.TimeoutError:
+            await self.ipc.emit({'event': 'warning', 'code': 'gate_timeout',
+                                 'message': 'startmediastream timed out; reports may be dropped'})
+        except Exception as error:
+            if self._is_remote_control_unsupported_ios(error) and self.hid is None:
+                raise BridgePrerequisiteError(
+                    'remote_control_unsupported_ios',
+                    'The device rejected media-stream authentication (9021) and '
+                    'did not provide a usable direct Universal HID touch surface.',
+                ) from error
+            msg = str(error)
+            await self.ipc.emit({'event': 'warning', 'code': 'gate_failed',
+                                 'message': f'startmediastream failed: {type(error).__name__}: {msg[:200]}'})
+        if self.hid is not None and not self.gate_open:
+            if self.transport is not None:
+                with contextlib.suppress(Exception):
+                    self.transport.close()
+                self.transport = None
+            await self._close_remote_service(display, 'failed_media_gate')
+            self.display = None
+            self.auth_mode = 'direct'
+            self.gate_open = True
+
+    async def _emit_ready(self, *, probe_sender: bool = True) -> None:
+        if not self.gate_open and self.hid is None:
+            raise BridgePrerequisiteError(
+                'remote_control_gate_closed',
+                'The media-stream authentication gate is closed; the bridge will not claim ready.',
+            )
+        # A service inventory alone does not prove that its sender works.
+        # Send a harmless release and fence it with a response on the SAME HID.
+        if probe_sender:
+            await self._probe_hid_sender()
+        self._generation += 1
+        self._input_verified = False
+        recovered = self._recovering
+        if recovered:
+            await self._recovery_event('hid_ready')
+            await self._recovery_event('sender_restored')
+        await self.ipc.emit({
+            'event': 'ready', 'protocol': PROTOCOL_VERSION,
+            'capabilities': CAPABILITIES, 'udid': self.udid, 'rateHz': self.rate_hz,
+            'gateOpen': self.gate_open, 'authMode': self.auth_mode,
+            'transport': self.transport_mode,
+            'generation': self._generation,
+        })
+        self._session_ready.set()
+        self._ddi_deadline = None
+        self._hid_transport_failed = False
+        self._recovering = False
+        self._recovery_attempt = 0
+        if recovered:
+            await self._recovery_event('recovery_completed')
+
+    async def _probe_hid_sender(self) -> None:
+        if self.hid is None:
+            raise RuntimeError('HID sender is unavailable')
+        async with self._hid_lifecycle_lock:
+            for slot in range(MAX_SLOTS):
+                report = build_touchscreen_report(slot, TOUCHSCREEN_STATE_RELEASE, 0, 0)
+                await asyncio.wait_for(self.hid.send_report(
+                    DIGITIZER_SURFACE_MAIN_TOUCHSCREEN, report), HID_OPERATION_TIMEOUT_SECONDS)
+            if self.keyboard_service_id is not None:
+                await asyncio.wait_for(self.hid.send_keyboard(self.keyboard_service_id, []),
+                                       HID_OPERATION_TIMEOUT_SECONDS)
+            await self._ping_hid()
+
+    async def _ping_hid(self, hid=None) -> None:
+        """Fence HID writes without repeating the one-shot service inventory.
+
+        This device closes Universal HID on a second connectedServices request.
+        HTTP/2 PING is acknowledged on the same live socket, does not alter HID
+        state, and leaves XPC responses available for their original caller.
+        The caller holds _hid_lifecycle_lock throughout.
+        """
+        service = (hid if hid is not None else self.hid).service
+        async with service._request_lock:
+            ping = PingFrame(0, opaque_data=os.urandom(8))
+            service.writer.write(ping.serialize())
+            await asyncio.wait_for(service.writer.drain(), HID_OPERATION_TIMEOUT_SECONDS)
+            async def receive_ack():
+                while True:
+                    frame = await service._receive_frame()
+                    service._apply_flow_control_frame(frame)
+                    if isinstance(frame, (GoAwayFrame, RstStreamFrame)):
+                        raise ConnectionError(f'HID transport closed: {frame}')
+                    if isinstance(frame, DataFrame):
+                        service._buffered_data_frames.append(frame)
+                    elif isinstance(frame, PingFrame):
+                        if 'ACK' in frame.flags and frame.opaque_data == ping.opaque_data:
+                            return
+                        if 'ACK' not in frame.flags:
+                            service.writer.write(PingFrame(0, flags=['ACK'],
+                                opaque_data=frame.opaque_data).serialize())
+                            await service.writer.drain()
+            await asyncio.wait_for(receive_ack(), HID_OPERATION_TIMEOUT_SECONDS)
+
+    async def _drain(self) -> None:
+        try:
+            while True:
+                await self.transport.recv()
+        except (asyncio.CancelledError, OSError):
+            pass
+
+    async def _serve(self) -> None:
+        self._serve_task = asyncio.current_task()
+        sm = FiveSlotStateMachine()
+        sm_generation = self._generation
+        last_stale_generation = None
+        # Monitor both transports. Pasteboard operations are serialized, and
+        # each PULL/SET owns a fresh side-channel connection because
+        # dtpasteboardd rejects a second reply-bearing request on one socket.
+        pasteboard_task = asyncio.create_task(self._poll_device_pasteboard())
+        rotation_task = asyncio.create_task(self._request_direct_hid_rotation())
+        paste_tasks: set[asyncio.Task[None]] = set()
+        keyboard_paste_tasks: set[asyncio.Task[None]] = set()
+        automation_tasks: dict[str, asyncio.Task[None]] = {}
+
+        async def automation_clipboard(frame: dict) -> None:
+            request_id = frame['requestId']
+            generation = self._generation
+            result = {'event': 'clipboard_result', 'requestId': request_id,
+                      'generation': generation, 'success': False}
+            try:
+                kind = frame['kind']
+                text = frame.get('text')
+                if kind != READ_CLIPBOARD_MESSAGE_KIND and (
+                        not isinstance(text, str) or len(text.encode('utf-8')) > 65536):
+                    raise ValueError('invalid automation text')
+                if kind == READ_CLIPBOARD_MESSAGE_KIND:
+                    # Dedicated response: do not publish this read into the
+                    # Windows clipboard synchronization event stream.
+                    async with self._pasteboard_publish_lock:
+                        await self._pasteboard_writes_idle.wait()
+                        value = await self._read_device_pasteboard()
+                    result['text'] = value if isinstance(value, str) else ''
+                elif kind == 'write_clipboard':
+                    await self._write_device_pasteboard(text)
+                else:
+                    async with self._paste_sequence_lock:
+                        await self._apply_paste_text(text)
+                result['success'] = generation == self._generation and not self._recovering
+                if not result['success']:
+                    result['code'] = 'DEVICE_NOT_CONNECTED'
+            except asyncio.CancelledError:
+                result['code'] = 'INPUT_CANCELLED'
+                raise
+            except Exception:
+                # Never send exception text containing pasteboard data.
+                result['code'] = 'CLIPBOARD_UNAVAILABLE'
+            finally:
+                automation_tasks.pop(request_id, None)
+                await self.ipc.emit(result)
+
+
+        def track_paste_task(task: asyncio.Task[None]) -> None:
+            paste_tasks.discard(task)
+            keyboard_paste_tasks.discard(task)
+
+        async def run_paste(text: str) -> None:
+            try:
+                async with self._paste_sequence_lock:
+                    await self._apply_paste_text(text)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                # A transient pasteboard failure must not terminate the HID
+                # reader. Touch and keyboard reports remain usable, and the
+                # host can retry Ctrl+V after iOS finishes its clipboard work.
+                await self.ipc.emit({
+                    'event': 'warning',
+                    'code': 'paste_failed',
+                    'message': f'{type(error).__name__}: {str(error)[:200]}',
+                })
+        async def run_clipboard_read() -> None:
+            try:
+                await self._publish_device_pasteboard(force=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                await self.ipc.emit({'event': 'warning', 'code': 'clipboard_read_failed',
+                                     'message': f'{type(error).__name__}: {str(error)[:200]}'})
+        try:
+            async for frame in self.ipc.read_messages():
+                try:
+                    # A background health repair owns recovery until it emits
+                    # verified ready. Do not drain queued input into that repair.
+                    if self._recovering:
+                        await self._session_ready.wait()
+                    if sm_generation != self._generation:
+                        sm.clear()
+                        sm_generation = self._generation
+                    frame_generation = frame.get('generation')
+                    if frame_generation is not None and frame_generation != self._generation:
+                        if frame_generation != last_stale_generation:
+                            await self.ipc.emit({'event': 'status', 'code': 'stale_input_dropped',
+                                'message': f'frame_generation={frame_generation} active_generation={self._generation}'})
+                            last_stale_generation = frame_generation
+                        continue
+                    for attempt in range(2):
+                        attempted_hid = self.hid
+                        try:
+                            if frame.get('kind') == 'cancel_clipboard':
+                                task = automation_tasks.get(frame.get('requestId'))
+                                if task is not None:
+                                    task.cancel()
+                                    await asyncio.gather(task, return_exceptions=True)
+                            elif frame.get('requestId') is not None and frame.get('kind') in {
+                                    PASTE_TEXT_MESSAGE_KIND, READ_CLIPBOARD_MESSAGE_KIND, 'write_clipboard'}:
+                                request_id = frame.get('requestId')
+                                if (not isinstance(request_id, str) or not 1 <= len(request_id) <= 64 or
+                                        not request_id.isascii() or not request_id.isalnum() or
+                                        request_id in automation_tasks or len(automation_tasks) >= 16):
+                                    raise ValueError('invalid automation request')
+                                task = asyncio.create_task(automation_clipboard(frame))
+                                automation_tasks[request_id] = task
+                                paste_tasks.add(task)
+                                if frame.get('kind') != READ_CLIPBOARD_MESSAGE_KIND:
+                                    keyboard_paste_tasks.add(task)
+                                task.add_done_callback(track_paste_task)
+                            elif frame.get('kind') == KEYBOARD_MESSAGE_KIND:
+                                _, ts, usages = decode_keyboard_batch(frame)
+                                if frame.get('releaseAll') is True:
+                                    if usages:
+                                        raise ValueError('keyboard ownership release must be empty')
+                                    # This frame is a handoff barrier, distinct
+                                    # from a physical key-up. Retire Ctrl+V work
+                                    # before any following mapped touch/input.
+                                    await self._cancel_keyboard_pastes(keyboard_paste_tasks)
+                                await self._apply_keyboard(frame, ts, usages)
+                            elif frame.get('kind') == PASTE_TEXT_MESSAGE_KIND:
+                                text = frame.get('text')
+                                if not isinstance(text, str):
+                                    raise ValueError('paste text must be a string')
+                                paste_task = asyncio.create_task(run_paste(text))
+                                paste_tasks.add(paste_task)
+                                keyboard_paste_tasks.add(paste_task)
+                                paste_task.add_done_callback(track_paste_task)
+                            elif frame.get('kind') == READ_CLIPBOARD_MESSAGE_KIND:
+                                read_task = asyncio.create_task(run_clipboard_read())
+                                paste_tasks.add(read_task)
+                                read_task.add_done_callback(track_paste_task)
+                            elif frame.get('kind') == BUTTON_MESSAGE_KIND:
+                                _, page, code, state = decode_button_event(frame)
+                                await self._apply_button(page, code, state)
+                            else:
+                                _, _, points = decode_touch_batch(frame)
+                                await self._apply_frame(sm, frame, points)
+                            keyboard_release = (frame.get('kind') == KEYBOARD_MESSAGE_KIND
+                                                and not usages)
+                            if not self._input_verified or keyboard_release:
+                                async with self._hid_lifecycle_lock:
+                                    await self._ping_hid()
+                                self._input_verified = True
+                                await self.ipc.emit({'event': 'status', 'code': 'input_verified',
+                                    'message': f'kind={frame.get("kind")} seq={frame.get("seq")} generation={self._generation}'})
+                            break
+                        except Exception as error:
+                            if (attempt != 0 or self.transport_mode != 'usb' or
+                                    self.auth_mode != 'direct' or
+                                    frame.get('kind') in {PASTE_TEXT_MESSAGE_KIND,
+                                                          READ_CLIPBOARD_MESSAGE_KIND}):
+                                raise
+                            if not await self._repair_hid(error, attempted_hid):
+                                raise
+                            await self.ipc.emit({
+                                'event': 'warning',
+                                'code': 'direct_hid_recovered',
+                                'message': 'Direct HID service recovered; waiting for input from the new generation.',
+                            })
+                            # Recovery already released all held state. Replaying
+                            # the old press can stick a key whose release was
+                            # gated off while disconnected. Accept fresh input.
+                            sm.clear()
+                            break
+                except Exception as e:
+                    await self._mark_recovering(e)
+                    log.exception('HID command failed kind=%s seq=%s',
+                                  frame.get('kind'), frame.get('seq'))
+                    await self.ipc.emit({'event': 'warning', 'code': 'send_failed',
+                                         'message': f'{type(e).__name__}: {str(e)[:200]}'})
+                    break
+        finally:
+            if pasteboard_task is not None:
+                pasteboard_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await pasteboard_task
+            if rotation_task is not None and rotation_task is not asyncio.current_task():
+                rotation_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await rotation_task
+            for task in paste_tasks:
+                task.cancel()
+            if paste_tasks:
+                await asyncio.gather(*paste_tasks, return_exceptions=True)
+            self._serve_task = None
+
+    async def _repair_hid(self, error: Exception, failed_hid) -> bool:
+        """One transaction owns inline repair, including verification/ready.
+
+        Sender and watchdog errors can refer to the same failed connection.
+        A waiter reuses the completed repair instead of closing the new HID;
+        failed repair leaves transport reconstruction to the supervisor.
+        Enter only after the failed operation releases its lifecycle lock.
+        """
+        async with self._hid_recovery_lock:
+            if failed_hid is not self.hid and self._session_ready.is_set():
+                return True
+            if self._recovering and self._hid_transport_failed:
+                return False
+            await self._mark_recovering(error)
+            reason = self._transport_failure_reason()
+            if reason:
+                await self._recovery_event('hid_repair_skipped_transport_dead', ConnectionError(reason))
+                return False
+            if self.auth_mode != 'direct':
+                return False
+            await self.ipc.emit({'event': 'warning', 'code': 'direct_hid_recovery_begin',
+                'message': 'Repairing and verifying the failed HID service.'})
+            try:
+                await self._refresh_direct_hid()
+                await self._emit_ready()
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as refresh_error:
+                await self._recovery_event('hid_reinit_failed', refresh_error)
+                return False
+
+    async def _request_direct_hid_rotation(self) -> None:
+        """Watch both HID transports; rotate only wired direct HID proactively."""
+        refresh_due = time.monotonic() + DIRECT_HID_ROTATION_SECONDS
+        try:
+            while True:
+                await asyncio.sleep(HID_HEALTH_INTERVAL_SECONDS)
+                attempted_hid = self.hid
+                try:
+                    if (self.transport_mode == 'usb' and self.auth_mode == 'direct' and
+                            time.monotonic() >= refresh_due):
+                        refreshed = await self._refresh_direct_hid(idle_only=True)
+                        if refreshed is not False:
+                            refresh_due = time.monotonic() + DIRECT_HID_ROTATION_SECONDS
+                        else:
+                            # A held key/contact must not be lifted by a healthy
+                            # lease refresh. Still check the old connection;
+                            # actual failure follows the normal repair path.
+                            async with self._hid_lifecycle_lock:
+                                attempted_hid = self.hid
+                                await self._ping_hid()
+                                await self._keep_touch_alive()
+                    else:
+                        # Round-trip on the active HID, also when input is idle.
+                        async with self._hid_lifecycle_lock:
+                            attempted_hid = self.hid
+                            await self._ping_hid()
+                            await self._keep_touch_alive()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    log.warning('direct HID health/refresh failed: %s', error)
+                    await self.ipc.emit({'event': 'warning', 'code': 'hid_health_failed',
+                                         'message': f'{type(error).__name__}: {str(error)[:200]}'})
+                    if self.transport_mode == 'wireless':
+                        await self._mark_recovering(error)
+                    elif await self._repair_hid(error, attempted_hid):
+                        refresh_due = time.monotonic() + DIRECT_HID_ROTATION_SECONDS
+                        continue
+                    serve_task = self._serve_task
+                    if serve_task is not None and serve_task is not asyncio.current_task():
+                        serve_task.cancel()
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    async def _refresh_direct_hid(self, *, idle_only: bool = False) -> bool:
+        """Reopen only Universal HID over the existing CoreDevice tunnel."""
+        if not hasattr(self, '_hid_lifecycle_lock'):
+            self._hid_lifecycle_lock = asyncio.Lock()
+        async with self._hid_lifecycle_lock:
+            # Check after taking the same lock used to submit every HID report,
+            # so a press racing the watchdog cannot be lost on replacement.
+            if idle_only and (self._active_touch_ids or self._held_keyboard_usages or self._held_buttons):
+                return False
+            await self.ipc.emit({'event': 'warning', 'code': 'direct_hid_refresh_begin',
+                                 'message': 'Refreshing the direct Universal HID session.'})
+            old_hid = self.hid
+            hid_type = (LegacyUniversalHIDServiceService
+                        if old_hid is not None and
+                        old_hid.SERVICE_NAME == LEGACY_UNIVERSAL_HID_SERVICE
+                        else UniversalHIDServiceService)
+            if self.indigo is not None:
+                await self._release_button_state()
+                await self._close_remote_service(self.indigo, 'refresh_indigo')
+                self.indigo = None
+            new_hid = hid_type(self.rsd)
+            old_keyboard_service_id = self.keyboard_service_id
+            self.keyboard_service_id = None
+            try:
+                await asyncio.wait_for(new_hid.__aenter__(), 8)
+                await self._verify_touch_surface(new_hid)
+                # Inventory may succeed just before iOS closes the socket.
+                # Fence the candidate on its own connection before adoption.
+                await self._ping_hid(new_hid)
+                if old_hid is not None:
+                    await self._close_remote_service(old_hid, 'replaced_hid')
+                await self._ping_hid(new_hid)
+            except BaseException as error:
+                self.keyboard_service_id = old_keyboard_service_id
+                await self._close_remote_service(new_hid, 'rejected_hid')
+                if isinstance(error, asyncio.CancelledError):
+                    raise
+                await self.ipc.emit({'event': 'warning', 'code': 'direct_hid_refresh_failed',
+                                     'message': f'{type(error).__name__}: {str(error)[:200]}'})
+                raise
+            self.hid = new_hid
+            self._active_touch_ids.clear()
+            self._touch_keepalive_contacts = ()
+            self._held_keyboard_usages = frozenset()
+            # _verify_touch_surface selected this session's device-owned
+            # keyboard. Clearing it registers a duplicate and iOS resets HID.
+            self._owns_hid = True
+            self._input_verified = False
+            await self.ipc.emit({'event': 'warning', 'code': 'direct_hid_refreshed',
+                                 'message': 'Direct Universal HID session refreshed.'})
+            return True
+
+    async def _get_device_pasteboard(self):
+        # Caller owns _pasteboard_lock, shared by reads and Windows -> iOS paste.
+        # CoreDevice's dtpasteboardd permits one reply-bearing request per
+        # RemoteXPC connection.  A service returned here is therefore owned by
+        # exactly one PULL or SET and must be closed by that operation.
+        if self.rsd is None:
+            raise RuntimeError('pasteboard service is unavailable')
+        await self._close_device_pasteboard()
+        if self._pasteboard_refresh_required:
+            await self._refresh_pasteboard_endpoint()
+        self._pasteboard_operation_id += 1
+        operation_id = self._pasteboard_operation_id
+        self._pasteboard_service = PasteboardService(self.rsd)
+        self._pasteboard_rsd = self.rsd
+        try:
+            await self._pasteboard_service.__aenter__()
+        except BaseException as error:
+            # A restarted developer service can leave the original RSD service
+            # catalogue pointing at a retired port. Retrying that same address
+            # cannot recover it. Rediscover only this side channel on the next
+            # operation; never replace the live HID session or repeat its chord.
+            self._pasteboard_refresh_required = True
+            await self._close_device_pasteboard()
+            log.warning('pasteboard_connect_failed op=%s generation=%s error=%s',
+                        operation_id, self._generation, type(error).__name__)
+            raise
+        log.info('pasteboard_connected op=%s generation=%s service=%s',
+                 operation_id, self._generation,
+                 getattr(self._pasteboard_service, 'service_name', 'unknown'))
+        return self._pasteboard_service
+
+    async def _refresh_pasteboard_endpoint(self) -> None:
+        rsd = self.rsd
+        address = getattr(getattr(rsd, 'service', None), 'address', None)
+        if address is None:
+            self._pasteboard_refresh_required = False
+            return  # compatibility with providers without an RSD catalogue
+        discovery = RemoteXPCConnection(address, open_connection=rsd.open_connection)
+        try:
+            async with asyncio.timeout(PASTEBOARD_OPERATION_TIMEOUT_SECONDS):
+                await discovery.connect()
+                await discovery.send_device_handshake()
+                snapshot = await discovery.receive_response()
+            identity = snapshot.get('Properties', {}).get('UniqueDeviceID')
+            if not identity or not _udid_matches(identity, rsd.udid):
+                raise RuntimeError('pasteboard discovery device identity mismatch')
+            name = PasteboardService.SERVICE_NAME
+            endpoint = snapshot.get('Services', {}).get(name)
+            if not isinstance(endpoint, dict) or 'Port' not in endpoint:
+                raise RuntimeError('pasteboard service is not advertised')
+            previous = rsd.peer_info.get('Services', {}).get(name, {})
+            # Keep all other service entries and active RSD/HID connections.
+            rsd.peer_info.setdefault('Services', {})[name] = endpoint
+            self._pasteboard_refresh_required = False
+            log.info('pasteboard_endpoint_refreshed generation=%s changed=%s',
+                     self._generation, previous.get('Port') != endpoint.get('Port'))
+        finally:
+            await self._close_remote_service(discovery, 'pasteboard_discovery')
+
+    async def _close_device_pasteboard(self):
+        service, self._pasteboard_service = self._pasteboard_service, None
+        self._pasteboard_rsd = None
+        if service is not None:
+            await self._close_remote_service(service, 'pasteboard')
+
+    async def _read_device_pasteboard(self):
+        # Foreground pastes own the next available turn. Every read uses a
+        # fresh connection because dtpasteboardd rejects a second reply on one
+        # connection; this also prevents a late reply from poisoning the next
+        # request after cancellation.
+        await self._pasteboard_writes_idle.wait()
+        async with self._pasteboard_lock:
+            async def read():
+                pasteboard = await self._get_device_pasteboard()
+                if hasattr(pasteboard, 'get'):
+                    snapshot = await pasteboard.get(
+                        data_policy=POLICY_PROMISE_SECONDARY)
+                    text, unresolved = _pasteboard_snapshot_text(snapshot)
+                    if unresolved:
+                        # Rich content can promise its plain-text alternative.
+                        # Resolve only when needed, using a new one-request
+                        # connection within the same timeout and read lock.
+                        pasteboard = await self._get_device_pasteboard()
+                        snapshot = await pasteboard.get(data_policy={'allResolved': {}})
+                        text, unresolved = _pasteboard_snapshot_text(snapshot)
+                        if unresolved:
+                            raise RuntimeError('device pasteboard text is unresolved')
+                    return text
+                return await pasteboard.get_text()
+            try:
+                result = await asyncio.wait_for(read(), PASTEBOARD_OPERATION_TIMEOUT_SECONDS)
+                log.info('pasteboard_pull_reply op=%s generation=%s text=%s',
+                         self._pasteboard_operation_id, self._generation,
+                         isinstance(result, str))
+                return result
+            except (Exception, asyncio.CancelledError) as error:
+                log.warning('pasteboard_pull_failed op=%s generation=%s error=%s',
+                            self._pasteboard_operation_id, self._generation,
+                            type(error).__name__)
+                raise
+            finally:
+                # A cancelled RemoteXPC request cannot be reused: its late reply
+                # could otherwise be mistaken for the next read/write response.
+                await self._close_device_pasteboard()
+
+    async def _write_device_pasteboard(self, text: str) -> None:
+        self._pasteboard_writers_waiting += 1
+        # Invalidate reads already in flight as soon as a host paste queues,
+        # not only after SET succeeds. A pre-paste snapshot is already stale.
+        self._pasteboard_write_generation += 1
+        self._pasteboard_writes_idle.clear()
+        acquired = False
+        try:
+            async with asyncio.timeout(PASTEBOARD_WRITE_QUEUE_TIMEOUT_SECONDS):
+                await self._pasteboard_lock.acquire()
+                acquired = True
+            async def write():
+                pasteboard = await self._get_device_pasteboard()
+                # Once SET starts, timeout/cancellation cannot tell whether iOS
+                # applied it. Retain its origin until a stable poll reconciles it.
+                # Connection or queue failures before SET do not add a candidate.
+                self._pasteboard_unconfirmed_writes.add(text)
+                await pasteboard.set_text(text)
+            try:
+                await asyncio.wait_for(write(), PASTEBOARD_OPERATION_TIMEOUT_SECONDS)
+                # A host paste is already present on Windows. Treat it as the
+                # polling baseline so it cannot echo over a newer local copy.
+                self._pasteboard_last_text = text
+                self._pasteboard_unconfirmed_writes.clear()
+                log.info('pasteboard_set_reply op=%s generation=%s length=%s',
+                         self._pasteboard_operation_id, self._generation, len(text))
+            except (Exception, asyncio.CancelledError) as error:
+                log.warning('pasteboard_set_failed op=%s generation=%s length=%s error=%s',
+                            self._pasteboard_operation_id, self._generation, len(text),
+                            type(error).__name__)
+                raise
+            finally:
+                await self._close_device_pasteboard()
+        finally:
+            if acquired:
+                self._pasteboard_lock.release()
+            self._pasteboard_writers_waiting -= 1
+            if self._pasteboard_writers_waiting == 0:
+                self._pasteboard_writes_idle.set()
+
+    async def _publish_device_pasteboard(self, *, force: bool = False) -> None:
+        # Serialize explicit reads and polling through publication, so an older
+        # result cannot arrive after a newer one. SET still has its own priority.
+        async with self._pasteboard_publish_lock:
+            await self._pasteboard_writes_idle.wait()
+            self._pasteboard_read_id += 1
+            read_id = self._pasteboard_read_id
+            write_generation = self._pasteboard_write_generation
+            session_generation = self._generation
+            await self.ipc.emit({'event': 'clipboard_read_started', 'readId': read_id})
+            try:
+                text = await self._read_device_pasteboard()
+                if (write_generation != self._pasteboard_write_generation or
+                        session_generation != self._generation or self._recovering):
+                    return
+                normalized_text = text if isinstance(text, str) else '' if text is None else None
+                if normalized_text is None:
+                    return
+                # A lost SET reply may still have changed the phone. Reconcile
+                # its origin before either polling or an explicit read publishes.
+                unconfirmed_echo = normalized_text in self._pasteboard_unconfirmed_writes
+                if unconfirmed_echo:
+                    self._pasteboard_last_text = normalized_text
+                self._pasteboard_unconfirmed_writes.clear()
+                if not unconfirmed_echo and (force or normalized_text != self._pasteboard_last_text):
+                    await self.ipc.emit({'event': 'clipboard_text', 'readId': read_id,
+                                         'text': normalized_text})
+                    if write_generation == self._pasteboard_write_generation:
+                        self._pasteboard_last_text = normalized_text
+            finally:
+                # Also release the host's request snapshot on unchanged content,
+                # errors and cancellation; only live reads retain version tokens.
+                await self.ipc.emit({'event': 'clipboard_read_finished', 'readId': read_id})
+
+    async def _poll_device_pasteboard(self) -> None:
+        if self.rsd is None:
+            return
+        failures = 0
+        try:
+            while True:
+                try:
+                    if self._recovering:
+                        await self._session_ready.wait()
+                    await self._publish_device_pasteboard()
+                    if failures:
+                        await self.ipc.emit({'event': 'status', 'code': 'clipboard_poll_recovered'})
+                    failures = 0
+                except Exception as error:
+                    failures += 1
+                    if failures == 1:
+                        await self.ipc.emit({'event': 'warning', 'code': 'clipboard_poll_failed',
+                            'message': f'{type(error).__name__}: {str(error)[:200]}'})
+                await asyncio.sleep(min(PASTEBOARD_POLL_MAX_BACKOFF_SECONDS,
+                    PASTEBOARD_POLL_INTERVAL_SECONDS * (2 ** min(failures, 4))))
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log.debug('device pasteboard monitor unavailable: %s', error)
+
+    @staticmethod
+    async def _cancel_keyboard_pastes(tasks: set[asyncio.Task[None]]) -> None:
+        pending = tuple(tasks)
+        for task in pending:
+            task.cancel()
+        # _apply_paste_text's finally releases Command if it was pressed.
+        # The IPC reader cannot execute a new owner's frame until this ends.
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _apply_keyboard(self, frame: dict, timestamp: Optional[int], usages: list[int]) -> None:
+        if timestamp is not None:
+            # Host timestamps are Unix nanoseconds, while the Universal HID
+            # keyboard report reserves six bytes for a Mach-absolute value.
+            timestamp = int(timestamp) & ((1 << 48) - 1)
+        async with self._keyboard_lock:
+            await self._send_keyboard_report(usages, timestamp)
+
+    async def _send_keyboard_report(self, usages: list[int],
+                                    timestamp: Optional[int] = None) -> None:
+        async with self._hid_lifecycle_lock:
+            if self.hid is None:
+                raise RuntimeError('Universal HID service is unavailable')
+            if self.keyboard_service_id is None:
+                # Register the virtual keyboard through the same public API used by
+                # The service ID is device-specific; do not assume that a requested
+                # value was accepted until the device confirms it.
+                self.keyboard_service_id = await asyncio.wait_for(
+                    self.hid.create_keyboard_service(
+                        product='iPhoneMirror virtual keyboard', manufacturer='iPhoneMirror'),
+                    HID_OPERATION_TIMEOUT_SECONDS)
+                await self.ipc.emit({'event': 'status', 'code': 'keyboard_service_ready',
+                                     'message': str(self.keyboard_service_id)})
+            async with self._hid_operation_lock:
+                # A failed drain may still have delivered the bitmap. Keep the
+                # union until a successful report confirms its replacement.
+                self._held_keyboard_usages |= frozenset(usages)
+                await asyncio.wait_for(
+                    self.hid.send_keyboard(self.keyboard_service_id, usages, timestamp),
+                    timeout=HID_OPERATION_TIMEOUT_SECONDS)
+                self._held_keyboard_usages = frozenset(usages)
+
+    async def _send_touch_report(self, report: bytes, *, motion: bool = False,
+                                 active_pointer_ids: Optional[set[int]] = None,
+                                 contacts: Optional[list[tuple[int, int, int, int]]] = None) -> None:
+        # RemoteXPC sends bytes before drain(), then increments its message
+        # ID. Cancelling drain and continuing on that socket reuses the ID.
+        # Give a slow motion write its remaining operation budget without
+        # cancelling it; a real timeout must escape to HID recovery.
+        timeout = (HID_TOUCH_MOTION_TIMEOUT_SECONDS if motion
+                   else HID_OPERATION_TIMEOUT_SECONDS)
+        async with self._hid_lifecycle_lock:
+            if self.hid is None:
+                raise RuntimeError('Universal HID service is unavailable')
+            if active_pointer_ids is not None:
+                self._active_touch_ids.update(active_pointer_ids)
+                # A failed release may have reached the device. Do not let a
+                # watchdog replay its preceding press while repair is pending.
+                self._touch_keepalive_contacts = ()
+            send = asyncio.create_task(self.hid.send_report(
+                DIGITIZER_SURFACE_MAIN_TOUCHSCREEN, report))
+            try:
+                try:
+                    await asyncio.wait_for(asyncio.shield(send), timeout)
+                except asyncio.TimeoutError:
+                    if not motion or send.done():
+                        raise
+                    await self.ipc.emit({'event': 'warning', 'code': 'hid_write_slow',
+                        'message': 'Waiting for the same in-flight motion write; no duplicate XPC request sent.'})
+                    await asyncio.wait_for(asyncio.shield(send),
+                        max(0.001, HID_OPERATION_TIMEOUT_SECONDS - timeout))
+                if active_pointer_ids is not None:
+                    self._active_touch_ids = set(active_pointer_ids)
+                    self._touch_keepalive_contacts = tuple(
+                        contact for contact in (contacts or [])
+                        if contact[1] == TOUCHSCREEN_STATE_CONTACT)
+                    self._touch_report_sent_at = time.monotonic()
+            finally:
+                if not send.done():
+                    send.cancel()
+                await asyncio.gather(send, return_exceptions=True)
+
+    async def _keep_touch_alive(self) -> None:
+        """Caller owns the HID lifecycle lock, including selection and send."""
+        if (not self._touch_keepalive_contacts or self._recovering or
+                not self._session_ready.is_set() or self.hid is None or
+                time.monotonic() - self._touch_report_sent_at < HID_TOUCH_KEEPALIVE_SECONDS):
+            return
+        report = build_touchscreen_frame(list(self._touch_keepalive_contacts))
+        # A fresh device-monotonic timestamp preserves the same slots, IDs and
+        # positions without submitting a new press or repeating a keyboard key.
+        await asyncio.wait_for(self.hid.send_report(
+            DIGITIZER_SURFACE_MAIN_TOUCHSCREEN, report), HID_OPERATION_TIMEOUT_SECONDS)
+        self._touch_report_sent_at = time.monotonic()
+
+    async def _apply_paste_text(self, text: str) -> None:
+        if self.rsd is None:
+            raise RuntimeError('pasteboard service is unavailable')
+        # Retrying SET is idempotent even if its reply was lost. Retrying the
+        # HID chord is not: iOS may already have pasted before a send times out.
+        for attempt in range(2):
+            try:
+                await self._write_device_pasteboard(text)
+                break
+            except (TimeoutError, ConnectionError, OSError):
+                if attempt == 1:
+                    raise
+                await asyncio.sleep(PASTEBOARD_RETRY_DELAY_SECONDS)
+        # The HID service exposes a full pressed-key bitmap. If Command and V
+        # arrive in the same report, iOS may dispatch V before it observes the
+        # Command modifier and inserts a literal "v". Keep the modifier held
+        # across separate reports, matching a physical keyboard chord.
+        async with self._keyboard_lock:
+            command_pressed = False
+            try:
+                await asyncio.sleep(0.15)
+                # A failed send may still have delivered the modifier to iOS.
+                command_pressed = True
+                await self._send_keyboard_report([0xE3])
+                await asyncio.sleep(0.06)
+                await self._send_keyboard_report([0xE3, 0x19])
+                await asyncio.sleep(0.08)
+                await self._send_keyboard_report([0xE3])
+                await asyncio.sleep(0.06)
+            finally:
+                if command_pressed:
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
+                        await self._send_keyboard_report([])
+
+    async def _apply_button(self, usage_page: int, usage_code: int, state: str) -> None:
+        async with self._hid_lifecycle_lock:
+            if self.indigo is None:
+                indigo = IndigoHIDService(self.rsd)
+                try:
+                    await asyncio.wait_for(indigo.__aenter__(), HID_OPERATION_TIMEOUT_SECONDS)
+                except BaseException:
+                    await self._close_remote_service(indigo, 'unavailable_indigo')
+                    raise
+                self.indigo = indigo
+            state_code = {'down': 1, 'up': 2, 'canceled': 3}[state]
+            button = (usage_page, usage_code)
+            if state == 'down':
+                self._held_buttons.add(button)
+            await asyncio.wait_for(
+                self.indigo.send_button(usage_page, usage_code, state_code),
+                timeout=HID_OPERATION_TIMEOUT_SECONDS)
+            if state != 'down':
+                self._held_buttons.discard(button)
+
+
+    async def _apply_frame(self, sm: FiveSlotStateMachine, frame: dict, points: list[dict]) -> None:
+        # Replacing a contact in a full five-point batch needs a release frame
+        # before its slot can represent the new finger. Never omit the old up
+        # or silently drop the new down just because they share one IPC batch.
+        if (any(p['action'] == 'up' and sm.slot_for(p['pointerId']) is not None for p in points)
+                and any(p['action'] == 'down' and sm.slot_for(p['pointerId']) is None for p in points)):
+            await self._apply_frame(sm, frame, [p for p in points if p['action'] == 'up'])
+            await self._apply_frame(sm, frame, [p for p in points if p['action'] != 'up'])
+            return
+        # The HID report field is device-monotonic time, not host wall-clock
+        # time. Generate it at send time so delayed frames cannot move time
+        # backwards after a refresh or clock adjustment.
+        ts = None
+        released: set[int] = set()
+        changed = False
+        for touch_point in points:
+            pointer_id = int(touch_point['pointerId'])
+            action = touch_point['action']
+            x = int(round(float(touch_point['normalizedX']) * 65535))
+            y = int(round(float(touch_point['normalizedY']) * 65535))
+            if action == 'down':
+                slot = sm.assign(pointer_id)
+                if slot is None:
+                    continue
+            elif sm.slot_for(pointer_id) is None:
+                continue
+            sm.update_position(pointer_id, x, y)
+            changed = True
+            if action == 'up':
+                released.add(pointer_id)
+        if changed:
+            # dtuhidd treats missing contacts as lifted. A delta-only report
+            # would release the other four fingers on every movement.
+            contacts = sm.contacts(released)
+            report = build_touchscreen_frame(contacts, ts)
+            active_ids = set(sm._id_to_slot) - released
+            await self._send_touch_report(report, motion=all(p['action'] == 'move' for p in points),
+                                          active_pointer_ids=active_ids, contacts=contacts)
+            for pointer_id in released:
+                sm.release(pointer_id)
+
+    async def _close_remote_service(self, service, stage: str) -> None:
+        # RemoteXPC.close awaits writer.wait_closed. A failed peer must not
+        # leave refresh holding the lifecycle lock or prevent RSD teardown.
+        try:
+            await _bounded_remote_exit(service, HID_CLEANUP_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await self.ipc.emit({'event': 'warning', 'code': 'cleanup_stage_failed',
+                'message': f'stage={stage} error={type(error).__name__}: {str(error)[:160]}'})
+
+    async def _release_button_state(self) -> None:
+        buttons, self._held_buttons = self._held_buttons, set()
+        if self.indigo is not None:
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(HID_CLEANUP_TIMEOUT_SECONDS):
+                    for page, code in buttons:
+                        with contextlib.suppress(Exception):
+                            await self.indigo.send_button(page, code, 2)
+
+    async def _release_hid_state(self) -> None:
+        # 强制释放所有触点（异常清理）。失效 HID 可能不响应；不要让
+        # 逐个释放报告阻塞 usbmux 接口的释放，否则下一次控制重连会在
+        # 旧桥仍持有接口时开始 VERSION 握手。
+        async def release_hid_state() -> None:
+            if self.hid is None:
+                return
+            if self.keyboard_service_id is not None:
+                with contextlib.suppress(Exception):
+                    await self.hid.send_keyboard(self.keyboard_service_id, [])
+            for slot in range(MAX_SLOTS):
+                report = build_touchscreen_report(slot, TOUCHSCREEN_STATE_RELEASE, 0, 0)
+                with contextlib.suppress(Exception):
+                    await self.hid.send_report(
+                        DIGITIZER_SURFACE_MAIN_TOUCHSCREEN, report)
+
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                release_hid_state(), timeout=HID_CLEANUP_TIMEOUT_SECONDS)
+
+    async def _cleanup(self, *, preserve_capture_mux: bool = False) -> None:
+        async def close_pasteboard():
+            try:
+                async with asyncio.timeout(HID_CLEANUP_TIMEOUT_SECONDS):
+                    async with self._pasteboard_lock:
+                        await self._close_device_pasteboard()
+            except Exception as error:
+                log.warning('Pasteboard cleanup wait failed: %s', type(error).__name__)
+            finally:
+                # Producers normally finish before teardown. If an in-flight
+                # owner still holds the lock, detach/close this session's own
+                # channel rather than leaving every later resource blocked.
+                await self._close_device_pasteboard()
+
+        async with _cleanup_cancellation_scope() as finish:
+            await finish(self._release_hid_state())
+            await finish(self._release_button_state())
+            if self.hid is not None and self._owns_hid:
+                await finish(self._close_remote_service(self.hid, 'hid'))
+            if self.indigo is not None:
+                await finish(self._close_remote_service(self.indigo, 'indigo'))
+                self.indigo = None
+            await finish(close_pasteboard())
+            if not preserve_capture_mux:
+                self._close_capture_mux()
+            if self.drain_task is not None:
+                self.drain_task.cancel()
+                await finish(asyncio.gather(self.drain_task, return_exceptions=True))
+            self.keyboard_service_id = None
+            self._active_touch_ids.clear()
+            self._touch_keepalive_contacts = ()
+            self._held_keyboard_usages = frozenset()
+
+            if self.stream_answer is not None and self.display is not None:
+                try:
+                    import uuid as _uuid
+                    csid = self.stream_answer['connection']['options']['avcMediaStreamOptionClientSessionID']['uuid']
+                    if not isinstance(csid, _uuid.UUID):
+                        csid = _uuid.UUID(csid)
+                    with contextlib.suppress(Exception):
+                        await finish(asyncio.wait_for(self.display.stop_media_stream(csid),
+                                                     HID_CLEANUP_TIMEOUT_SECONDS))
+                except Exception:
+                    pass
+            if self.transport is not None:
+                with contextlib.suppress(Exception):
+                    self.transport.close()
+            if self.display is not None:
+                await finish(self._close_remote_service(self.display, 'display'))
+            if self.rsd is not None:
+                await finish(self._close_remote_service(self.rsd, 'rsd'))
+            if self.dial_plane is not None:
+                await finish(self._close_remote_service(self.dial_plane, 'dial_plane'))
+            self.hid = None
+            self._owns_hid = False
+            self.rsd = None
+            self.display = None
+            self.dial_plane = None
+            self.stream_answer = None
+            self.drain_task = None
+            self.transport = None
+            self.gate_open = False
+            self.auth_mode = None
+
+
+async def main_async(rate_hz: int, udid: Optional[str], transport: str,
+                     ddi_dir: Optional[Path] = None) -> None:
+    ipc = BridgeChannel()
+    session = TouchSession(ipc, rate_hz, udid, transport, ddi_dir)
+    connection = asyncio.create_task(session.connect())
+    disconnected = asyncio.create_task(ipc.wait_for_disconnect())
+    try:
+        done, _ = await asyncio.wait((connection, disconnected),
+                                     return_when=asyncio.FIRST_COMPLETED)
+        if connection in done:
+            await connection
+        else:
+            # Host cancellation closes stdin even before the HID input loop
+            # starts. Cancel DDI/tunnel setup now so USB cleanup can run.
+            await disconnected
+    except BridgeUserActionRequired as e:
+        await ipc.emit({'event': 'user_action_required', 'code': e.code,
+                        'message': str(e)[:300]})
+    except Exception as e:
+        await ipc.emit({'event': 'error', 'code': bridge_error_code(e),
+                        'message': str(e)[:300]})
+        await ipc.emit({'event': 'status', 'code': 'terminated'})
+    finally:
+        for task in (connection, disconnected):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(connection, disconnected, return_exceptions=True)
+        await ipc.close()
+        # connect() normally owns tunnel teardown, but failures during
+        # capture-mux setup or lockdown discovery happen before that scope is
+        # entered. Always release those early resources as well.
+        await session._cleanup()
+        if session._mux_checkpoint is not None:
+            # Capture after every tunnel/client finally block: those can still
+            # send a last RST while leaving connect(). Never export mid-cleanup.
+            with contextlib.suppress(Exception):
+                await ipc.emit({'event': 'capture_mux_checkpoint',
+                                'state': session._mux_checkpoint.export_checkpoint()})
+
+
+async def enable_wifi_sync_async(udid: str) -> bool:
+    ipc = BridgeChannel()
+    lockdown = None
+    try:
+        await ipc.emit({'event': 'status', 'code': 'enabling_wifi_sync'})
+        lockdown = await create_lockdown_with_retry(ipc, udid, 'USB')
+        was_enabled = await get_wifi_sync_enabled(lockdown)
+        if not was_enabled:
+            await lockdown.set_enable_wifi_connections(True)
+        enabled = await lockdown.get_enable_wifi_connections()
+        if not enabled:
+            raise RuntimeError('device rejected EnableWifiConnections=true')
+        await ipc.emit({'event': 'wifi_sync_enabled', 'udid': lockdown.udid,
+                        'changed': not was_enabled})
+        return True
+    except Exception as error:
+        await ipc.emit({'event': 'error', 'code': bridge_error_code(error),
+                        'message': str(error)[:300]})
+        return False
+    finally:
+        if lockdown is not None:
+            with contextlib.suppress(Exception):
+                await lockdown.close()
+
+
+async def get_wifi_sync_enabled(lockdown) -> bool:
+    try:
+        return await lockdown.get_enable_wifi_connections()
+    except MissingValueError:
+        # A device that has never enabled Wi-Fi sync has no value yet.
+        # Treat the absent key as false so the caller creates it.
+        return False
+
+
+async def check_setup_async(udid: str, wireless: bool = False) -> dict:
+    """Read existing trust and developer settings without pairing, mounting or input."""
+    lockdown = None
+    try:
+        async with asyncio.timeout(20):
+            lockdown = await create_using_usbmux(serial=udid, connection_type='USB', autopair=False)
+            if lockdown.udid.replace('-', '').lower() != udid.replace('-', '').lower():
+                return {'state': 'Invalid', 'code': 'device_identity_mismatch'}
+            if not await lockdown.get_developer_mode_status():
+                return {'state': 'Incomplete', 'code': 'developer_mode_required'}
+            if wireless and not await get_wifi_sync_enabled(lockdown):
+                return {'state': 'Incomplete', 'code': 'wireless_pairing_required'}
+            return {'state': 'Completed', 'udid': lockdown.udid}
+    except (GetProhibitedError, NotPairedError):
+        return {'state': 'Invalid', 'code': 'apple_device_not_trusted'}
+    except Exception as error:
+        return {'state': 'Unknown', 'code': bridge_error_code(error), 'detail': str(error)[:300]}
+    finally:
+        if lockdown is not None:
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(LOCKDOWN_CLEANUP_TIMEOUT_SECONDS):
+                    await lockdown.close()
+
+
+def main() -> int:
+    # The managed host consumes UTF-8 on both pipes; PyInstaller's isolated
+    # runtime otherwise uses the Windows locale and can fail on Chinese status.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--rate-hz', type=int, default=120)
+    parser.add_argument('--udid', default=None)
+    parser.add_argument('--ddi-dir', type=Path, default=None,
+                        help='仅在未挂载镜像时使用此本地 Personalized DDI 目录')
+    transport = parser.add_mutually_exclusive_group()
+    transport.add_argument('--usb', action='store_const', const='usb',
+                           dest='transport', help='仅连接物理 USB 设备（默认）')
+    transport.add_argument('--wireless', action='store_const', const='wireless',
+                           dest='transport', help='仅连接已通过 usbmux 配对的无线设备')
+    parser.add_argument('--enable-wifi-sync', action='store_true',
+                        help='通过 USB 为指定设备启用 Apple Wi-Fi 同步')
+    parser.add_argument('--check-runtime', action='store_true',
+                        help='验证反控运行时依赖，不连接设备')
+    parser.add_argument('--check-setup', action='store_true',
+                        help='只读检查指定设备的现有信任、开发者模式及无线控制设置')
+    parser.set_defaults(transport='usb')
+    args = parser.parse_args()
+    if args.check_setup:
+        if not args.udid:
+            parser.error('--check-setup requires --udid')
+        print(json.dumps(asyncio.run(check_setup_async(args.udid, args.transport == 'wireless'))))
+        return 0
+    if args.check_runtime:
+        import importlib
+        modules = (
+            'pymobiledevice3.remote.userspace_tunnel',
+            'pymobiledevice3.remote.core_device.screen_stream',
+            'pymobiledevice3.remote.core_device.hid_service',
+            'pymobiledevice3.remote.core_device.pasteboard_service',
+            'pymobiledevice3.services.mobile_image_mounter',
+            'pymobiledevice3.services.cryptexd',
+            'developer_disk_image', 'pyimg4', 'qh3', 'pytun_pmd3.wintun',
+            'usb.backend.libusb0', 'usb.backend.libusb1',
+        )
+        for module in modules:
+            importlib.import_module(module)
+        from bridge_runtime_check import check_runtime_functionality
+        checks = check_runtime_functionality(
+            build_touchscreen_report, TOUCHSCREEN_STATE_CONTACT, TOUCHSCREEN_STATE_RELEASE,
+            build_touchscreen_frame)
+        print(json.dumps({'runtime': 'ready', 'modules': modules, 'functional_checks': checks}))
+        return 0
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+                        stream=sys.stderr)
+    try:
+        if args.enable_wifi_sync:
+            if not args.udid:
+                parser.error('--enable-wifi-sync requires --udid')
+            return 0 if asyncio.run(enable_wifi_sync_async(args.udid)) else 1
+        asyncio.run(main_async(args.rate_hz, args.udid, args.transport, args.ddi_dir))
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

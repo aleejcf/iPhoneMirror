@@ -2,6 +2,8 @@
 param(
     [string]$SourceRoot,
     [string]$PlatformToolset,
+    [string]$OutputDirectory,
+    [string]$FfmpegBuildRecord,
     [switch]$Install
 )
 
@@ -62,8 +64,46 @@ $SourceRoot = (Resolve-Path -LiteralPath $BuildSourceRoot).Path
     -SourceRoot $SourceRoot
 & (Join-Path $ReceiverRoot 'patches\Apply-NetworkRoutePatch.ps1') `
     -SourceRoot $SourceRoot
+& (Join-Path $ReceiverRoot 'patches\Apply-AirPlayCompatibilityPatch.ps1') `
+    -SourceRoot $SourceRoot
+& (Join-Path $ReceiverRoot 'patches\Apply-AirPlayMirrorRecoveryPatch.ps1') `
+    -SourceRoot $SourceRoot
+& (Join-Path $ReceiverRoot 'patches\Apply-AirPlayOrientationAccessUnitPatch.ps1') `
+    -SourceRoot $SourceRoot
 & (Join-Path $ReceiverRoot 'patches\Apply-AudioCodecPatch.ps1') `
     -SourceRoot $SourceRoot
+& (Join-Path $ReceiverRoot 'patches\Apply-AirPlayAudioNegotiationPatch.ps1') `
+    -SourceRoot $SourceRoot
+& (Join-Path $ReceiverRoot 'patches\Apply-AirPlayUpstream125Patch.ps1') `
+    -SourceRoot $SourceRoot
+
+$CompatibilityMarkers = @(
+    @{ Path = 'AirPlayServerLib\lib\http_parser.c';
+       Marker = 'IPHONE_MIRROR_AIRPLAY_PROTOCOL_COMPATIBILITY' },
+    @{ Path = 'AirPlayServerLib\lib\http_request.c';
+       Marker = 'IPHONE_MIRROR_AIRPLAY_HEADER_CASE' },
+    @{ Path = 'AirPlayServerLib\lib\pairing.c';
+       Marker = 'IPHONE_MIRROR_AIRPLAY_PAIR_VERIFY_TWO_STAGE' },
+    @{ Path = 'AirPlayServerLib\lib\raop_rtp_mirror.c';
+       Marker = 'IPHONE_MIRROR_AIRPLAY_MIRROR_RECOVERY' },
+    @{ Path = 'AirPlayServerLib\lib\raop_rtp.c';
+       Marker = 'IPHONE_MIRROR_AUDIO_CODEC_NEGOTIATION' },
+    @{ Path = 'AirPlayServerLib\lib\raop_rtp_mirror.c';
+       Marker = 'IPHONE_MIRROR_MIRROR_NAL_BOUNDS' },
+    @{ Path = 'AirPlayServerLib\lib\raop_rtp_mirror.c';
+       Marker = 'IPHONE_MIRROR_ORIENTATION_ACCESS_UNIT' },
+    @{ Path = 'AirPlayServerLib\lib\raop.c';
+       Marker = 'IPHONE_MIRROR_MIRROR_FLAG_OPTIONAL' },
+    @{ Path = 'AirPlayServerLib\lib\httpd.c';
+       Marker = 'IPHONE_MIRROR_AIRPLAY_RECV_ERROR' },
+    @{ Path = 'airplay2dll\FgAirplayChannel.cpp';
+       Marker = 'IPHONE_MIRROR_H264_DECODER_RECOVERY' })
+foreach ($Entry in $CompatibilityMarkers) {
+    $PatchedPath = Join-Path $SourceRoot $Entry.Path
+    if (-not ([IO.File]::ReadAllText($PatchedPath).Contains($Entry.Marker))) {
+        throw "AirPlay compatibility marker is missing: $($Entry.Marker)"
+    }
+}
 
 $VsWhere = Join-Path ${env:ProgramFiles(x86)} `
     'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -88,8 +128,8 @@ if ([string]::IsNullOrWhiteSpace($PlatformToolset)) {
     throw 'No Visual C++ x64 platform toolset is installed.'
 }
 
-$OutputDirectory = Join-Path $SourceRoot 'x64\Release'
-New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
+$BuildOutputDirectory = Join-Path $SourceRoot 'x64\Release'
+New-Item -ItemType Directory -Force -Path $BuildOutputDirectory | Out-Null
 
 $Properties = @(
     '/m:1',
@@ -100,7 +140,7 @@ $Properties = @(
     '/p:Platform=x64',
     "/p:PlatformToolset=$PlatformToolset",
     "/p:SolutionDir=$SourceRoot\",
-    "/p:OutDir=$OutputDirectory\"
+    "/p:OutDir=$BuildOutputDirectory\"
 )
 $PreviousCl = $env:CL
 try {
@@ -142,10 +182,20 @@ foreach ($Marker in @('IPHONE_MIRROR_AIRPLAY_WIDTH', 'IPHONE_MIRROR_AIRPLAY_HEIG
         'IPHONE_MIRROR_AIRPLAY_PAIRING_SEED',
         'IPHONE_MIRROR_AIRPLAY_PUBLIC_KEY',
         'IPHONE_MIRROR_ALAC_AUDIO_DECODE',
+        'IPHONE_MIRROR_AUDIO_CODEC_NEGOTIATION',
+        'IPHONE_MIRROR_FFMPEG_AAC_ELD',
+        'IPHONE_MIRROR_VIDEO_STATE',
+        'IPHONE_MIRROR_VIDEO_GEOMETRY',
+        'IPHONE_MIRROR_MIRROR_CTR_SKIP',
+        'IPHONE_MIRROR_MIRROR_SETUP_RESTART',
+        'IPHONE_MIRROR_H264_DECODER_RECOVERY',
+        'IPHONE_MIRROR_H264_ROTATION_RECOVERY',
+        'IPHONE_MIRROR_ORIENTATION_ACCESS_UNIT',
         'IPHONE_MIRROR_DLL_ENVIRONMENT_SYNC',
         'IPHONE_MIRROR_RUNTIME_DEVICE_ID',
         'IPHONE_MIRROR_BOUND_MEDIA_SOCKETS',
         'IPHONE_MIRROR_PRESERVE_IPV6_MEDIA',
+        'Mirror TCP read timed out after %d ms',
         'iphonemirror://pause',
         'iphonemirror://resume',
         'iphonemirror://seek',
@@ -164,103 +214,19 @@ if ($BinaryAscii.Contains('0x5A7FFFF7,0x1E') -or
 }
 Write-Host 'Verified combined screen-mirroring and URL-video AirPlay mode.' -ForegroundColor Green
 $Hash = (Get-FileHash -LiteralPath $Binary -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($OutputDirectory) {
+    New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
+    Copy-Item -LiteralPath $Binary -Destination $OutputDirectory
+    Copy-Item -LiteralPath (Join-Path $BuildOutputDirectory 'AirPlayLib.lib') -Destination $OutputDirectory
+    # Preserve patched headers/sources for the library-level regression probe.
+    Copy-Item -LiteralPath (Join-Path $SourceRoot 'AirPlayServerLib') -Destination $OutputDirectory -Recurse
+    Copy-Item -LiteralPath (Join-Path $SourceRoot 'airplay2dll') -Destination $OutputDirectory -Recurse
+    Copy-Item -LiteralPath (Join-Path $SourceRoot 'external') -Destination $OutputDirectory -Recurse
+}
 if ($Install) {
-    $TargetBinary = Join-Path $ReceiverRoot 'bin\x64\airplay2dll.dll'
-    $Manifest = Join-Path $ReceiverRoot 'SHA256SUMS.txt'
-    if (-not (Test-Path -LiteralPath $TargetBinary -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $Manifest -PathType Leaf)) {
-        throw 'Vendored AirPlay receiver or SHA256SUMS.txt is missing.'
-    }
-    foreach ($existing in @($TargetBinary, $Manifest)) {
-        $existingItem = Get-Item -LiteralPath $existing -Force
-        if (($existingItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "Vendored AirPlay asset is a reparse point: $existing"
-        }
-    }
-
-    $ManifestText = [IO.File]::ReadAllText($Manifest)
-    $ManifestPattern = '(?m)^[0-9a-fA-F]{64}  bin/x64/airplay2dll\.dll\r?$'
-    if ([regex]::Matches($ManifestText, $ManifestPattern).Count -ne 1) {
-        throw 'SHA256SUMS.txt must contain exactly one airplay2dll.dll entry.'
-    }
-    $CarriageReturn = if ($ManifestText.Contains("`r`n")) { "`r" } else { '' }
-    $UpdatedManifest = [regex]::Replace($ManifestText, $ManifestPattern,
-        "$Hash  bin/x64/airplay2dll.dll$CarriageReturn")
-
-    $TransactionId = [Guid]::NewGuid().ToString('N')
-    $StagedBinary = "$TargetBinary.$TransactionId.tmp"
-    $StagedManifest = "$Manifest.$TransactionId.tmp"
-    $BackupBinary = "$TargetBinary.$TransactionId.bak"
-    $BackupManifest = "$Manifest.$TransactionId.bak"
-    # File.Replace requires a concrete backup path on the Windows/.NET
-    # runtime used by the build environment. Keep separate rollback copies so
-    # a failure in the second replacement can still restore both targets.
-    $ReplaceBackupBinary = "$TargetBinary.$TransactionId.replace.bak"
-    $ReplaceBackupManifest = "$Manifest.$TransactionId.replace.bak"
-    $TargetsMayBeModified = $false
-    $InstallComplete = $false
-    $RollbackComplete = $false
-    try {
-        Copy-Item -LiteralPath $Binary -Destination $StagedBinary
-        [IO.File]::WriteAllText($StagedManifest, $UpdatedManifest,
-            [Text.UTF8Encoding]::new($false))
-        Copy-Item -LiteralPath $TargetBinary -Destination $BackupBinary
-        Copy-Item -LiteralPath $Manifest -Destination $BackupManifest
-
-        $TargetsMayBeModified = $true
-        [IO.File]::Replace($StagedBinary, $TargetBinary, $ReplaceBackupBinary)
-        [IO.File]::Replace($StagedManifest, $Manifest, $ReplaceBackupManifest)
-        $InstalledHash = (Get-FileHash -LiteralPath $TargetBinary `
-            -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($InstalledHash -ne $Hash -or
-            -not ([IO.File]::ReadAllText($Manifest).Contains(
-                "$Hash  bin/x64/airplay2dll.dll"))) {
-            throw 'Installed AirPlay receiver and hash manifest did not verify.'
-        }
-        $InstallComplete = $true
-    }
-    catch {
-        $installError = $_
-        if (-not $TargetsMayBeModified) {
-            $RollbackComplete = $true
-        }
-        else {
-            $rollbackErrors = @()
-            foreach ($restore in @(
-                    [PSCustomObject]@{ Backup = $BackupBinary; Target = $TargetBinary },
-                    [PSCustomObject]@{ Backup = $BackupManifest; Target = $Manifest })) {
-                try {
-                    if (-not (Test-Path -LiteralPath $restore.Backup -PathType Leaf)) {
-                        throw "Backup is missing: $($restore.Backup)"
-                    }
-                    Copy-Item -LiteralPath $restore.Backup `
-                        -Destination $restore.Target -Force
-                }
-                catch {
-                    $rollbackErrors += $_.Exception.Message
-                }
-            }
-            $RollbackComplete = $rollbackErrors.Count -eq 0
-            if (-not $RollbackComplete) {
-                throw "AirPlay receiver install failed: $($installError.Exception.Message) " +
-                    "Rollback was incomplete: $($rollbackErrors -join '; '). " +
-                    "Recovery backups were retained at $BackupBinary and $BackupManifest."
-            }
-        }
-        throw $installError
-    }
-    finally {
-        foreach ($temporary in @($StagedBinary, $StagedManifest,
-                $ReplaceBackupBinary, $ReplaceBackupManifest)) {
-            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
-        }
-        if ($InstallComplete -or $RollbackComplete) {
-            foreach ($backup in @($BackupBinary, $BackupManifest)) {
-                Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
-            }
-        }
-    }
-    Write-Host 'Updated vendored receiver and SHA256SUMS.txt.' -ForegroundColor Green
+    if (-not $FfmpegBuildRecord) { throw 'Pass -FfmpegBuildRecord from the validated AAC-enabled FFmpeg build.' }
+    & (Join-Path $PSScriptRoot 'install_airplay_runtime.ps1') `
+        -ReceiverBinary $Binary -FfmpegBuildRecord $FfmpegBuildRecord
 }
 Write-Host "AirPlay receiver: $Binary" -ForegroundColor Green
 Write-Host "SHA256: $Hash" -ForegroundColor Green

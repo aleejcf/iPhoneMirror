@@ -3,8 +3,11 @@
 #include "Protocol/Plist.h"
 #include "Transport/Socket.h"
 
+#include <atomic>
 #include <cstdint>
 #include <string>
+#include <span>
+#include <string_view>
 #include <vector>
 
 namespace iPhoneMirror::transport {
@@ -22,13 +25,15 @@ public:
     explicit UsbMuxClient(std::uint16_t port) : port_(port) {}
 
     [[nodiscard]] std::vector<MuxDevice> list_devices();
+    [[nodiscard]] static bool contains_usb_device(
+        std::span<const MuxDevice> devices, std::string_view serial) noexcept;
     [[nodiscard]] bool has_pair_record(const std::string& udid);
     [[nodiscard]] Socket connect_device(std::uint32_t device_id, std::uint16_t device_port);
     [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
 
 private:
     std::uint16_t port_;
-    std::uint32_t next_tag_{1};
+    std::atomic<std::uint32_t> next_tag_{1};
 
     [[nodiscard]] plist::Value request(const plist::Value& body);
     [[nodiscard]] std::pair<Socket, plist::Value> request_with_socket(const plist::Value& body);
@@ -36,4 +41,3 @@ private:
 };
 
 } // namespace iPhoneMirror::transport
-

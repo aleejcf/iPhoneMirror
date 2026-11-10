@@ -6,13 +6,15 @@ using IPhoneMirror.App.Services;
 
 namespace IPhoneMirror.App.Windows;
 
-public partial class StartupErrorWindow : Wpf.Ui.Controls.FluentWindow
+public partial class StartupErrorWindow : IPhoneMirror.UI.Controls.RoundedWindow
 {
     private readonly string _logPath;
+    private readonly Exception _error;
 
     internal StartupErrorWindow(Exception error, string logPath)
     {
         _logPath = logPath;
+        _error = error;
         InitializeComponent();
         try { ThemeService.Attach(this); }
         catch (Exception themeError)
@@ -21,25 +23,23 @@ public partial class StartupErrorWindow : Wpf.Ui.Controls.FluentWindow
                 themeError);
         }
 
-        var language = LocalizationService.StartupCultureName;
-        var hongKong = language.Equals("zh-HK", StringComparison.OrdinalIgnoreCase) ||
-            language.Equals("zh-Hant-HK", StringComparison.OrdinalIgnoreCase) ||
-            language.Equals("zh-MO", StringComparison.OrdinalIgnoreCase);
-        var chinese = language.StartsWith("zh", StringComparison.OrdinalIgnoreCase);
-        HeadingText.Text = hongKong ? "iPhoneMirror 無法啟動" :
-            chinese ? "iPhoneMirror 无法启动" : "iPhoneMirror could not start";
-        SummaryText.Text = StartupDiagnostics.UserMessage(error,
-            hongKong ? "zh-HK" : chinese ? "zh-CN" : "en-US");
-        LogLabelText.Text = hongKong ? "診斷記錄" :
-            chinese ? "诊断日志" : "Diagnostic log";
         LogPathTextBox.Text = logPath;
-        DetailsExpander.Header = hongKong ? "錯誤詳細資料" :
-            chinese ? "错误详情" : "Error details";
         DetailsTextBox.Text = error.ToString();
-        OpenLogButton.Content = hongKong ? "開啟記錄位置" :
-            chinese ? "打开日志位置" : "Open log location";
-        CloseButton.Content = hongKong ? "關閉" :
-            chinese ? "关闭" : "Close";
+        RefreshLanguage();
+        LocalizationService.RefreshWhenLanguageChanges(this, RefreshLanguage);
+    }
+
+    private void RefreshLanguage()
+    {
+        var language = LocalizationService.StartupCultureName;
+        // This window also handles dictionary-load failures. Its captions must
+        // remain readable when none of the localization resources are available.
+        HeadingText.Text = StartupDiagnostics.Label("StartupErrorHeading", language);
+        SummaryText.Text = StartupDiagnostics.UserMessage(_error, language);
+        LogLabelText.Text = StartupDiagnostics.Label("StartupErrorLogLabel", language);
+        DetailsExpander.Header = StartupDiagnostics.Label("StartupErrorDetails", language);
+        OpenLogButton.Content = StartupDiagnostics.Label("StartupErrorOpenLog", language);
+        CloseButton.Content = StartupDiagnostics.Label("StartupErrorClose", language);
     }
 
     private void OnOpenLogClick(object sender, RoutedEventArgs e)
@@ -59,6 +59,8 @@ public partial class StartupErrorWindow : Wpf.Ui.Controls.FluentWindow
         catch (Exception error)
         {
             DiagnosticLogger.Exception("startup", "open_log_location_failed", error);
+            AppPromptWindow.Inform(Localization.LocalizationService.Get("StartupErrorOpenLog"),
+                Localization.LocalizationService.Format("UiLogLocationFailed", _logPath), this);
         }
     }
 

@@ -39,7 +39,8 @@ internal static class SegmentedHttpDownloader
         SegmentedDownloadOptions options,
         Func<Uri, bool> isTrustedFinalUri,
         IProgress<SegmentedDownloadProgress>? progress = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Action<Uri, HttpResponseMessage>? responseReceived = null)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(uri);
@@ -63,6 +64,7 @@ internal static class SegmentedHttpDownloader
         using var probeResponse = await client.SendAsync(probeRequest,
             HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         var resolvedUri = ValidateFinalUri(probeResponse, isTrustedFinalUri);
+        responseReceived?.Invoke(uri, probeResponse);
 
         if (probeResponse.StatusCode == HttpStatusCode.OK)
             return await WriteSingleResponseAsync(probeResponse, destination,
@@ -81,20 +83,20 @@ internal static class SegmentedHttpDownloader
         {
             probeResponse.Dispose();
             return await DownloadSingleAsync(client, resolvedUri, destination, options,
-                isTrustedFinalUri, progress, cancellationToken);
+                isTrustedFinalUri, progress, cancellationToken, responseReceived);
         }
         probeResponse.Dispose();
 
         try
         {
             return await DownloadSegmentsAsync(client, resolvedUri, destination, totalBytes,
-                segmentCount, options, isTrustedFinalUri, progress, cancellationToken);
+                segmentCount, options, isTrustedFinalUri, progress, cancellationToken, responseReceived);
         }
         catch (RangeNotSupportedException)
         {
-            TryDelete(destination);
+            // DownloadSegmentsAsync has already removed its own partial file.
             return await DownloadSingleAsync(client, resolvedUri, destination, options,
-                isTrustedFinalUri, progress, cancellationToken);
+                isTrustedFinalUri, progress, cancellationToken, responseReceived);
         }
     }
 
@@ -113,12 +115,14 @@ internal static class SegmentedHttpDownloader
         SegmentedDownloadOptions options,
         Func<Uri, bool> isTrustedFinalUri,
         IProgress<SegmentedDownloadProgress>? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<Uri, HttpResponseMessage>? responseReceived)
     {
         using var request = CreateRequest(uri);
         using var response = await client.SendAsync(request,
             HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         ValidateFinalUri(response, isTrustedFinalUri);
+        responseReceived?.Invoke(uri, response);
         response.EnsureSuccessStatusCode();
         return await WriteSingleResponseAsync(response, destination, options,
             progress, cancellationToken);
@@ -140,11 +144,13 @@ internal static class SegmentedHttpDownloader
         if (totalBytes is > 0) ValidateTotalBytes(totalBytes.Value, options);
 
         await using var input = await response.Content.ReadAsStreamAsync(cancellationToken);
+        var created = false;
         try
         {
             await using var output = new FileStream(destination, FileMode.CreateNew,
                 FileAccess.Write, FileShare.None, options.BufferSize,
                 FileOptions.Asynchronous | FileOptions.SequentialScan);
+            created = true;
             var buffer = ArrayPool<byte>.Shared.Rent(options.BufferSize);
             try
             {
@@ -174,7 +180,7 @@ internal static class SegmentedHttpDownloader
         }
         catch
         {
-            TryDelete(destination);
+            if (created) TryDelete(destination);
             throw;
         }
     }
@@ -188,13 +194,16 @@ internal static class SegmentedHttpDownloader
         SegmentedDownloadOptions options,
         Func<Uri, bool> isTrustedFinalUri,
         IProgress<SegmentedDownloadProgress>? progress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<Uri, HttpResponseMessage>? responseReceived)
     {
+        var created = false;
         try
         {
             await using var output = new FileStream(destination, FileMode.CreateNew,
                 FileAccess.Write, FileShare.Read, options.BufferSize,
                 FileOptions.Asynchronous | FileOptions.RandomAccess);
+            created = true;
             output.SetLength(totalBytes);
             var handle = output.SafeFileHandle;
             var segmentSize = 1 + ((totalBytes - 1) / segmentCount);
@@ -223,7 +232,7 @@ internal static class SegmentedHttpDownloader
                                     now, previous) == previous)
                                 Report(progress, aggregate, totalBytes, stopwatch,
                                     segmentCount);
-                        }, linked.Token);
+                        }, linked.Token, responseReceived);
                 }
                 catch
                 {
@@ -254,7 +263,7 @@ internal static class SegmentedHttpDownloader
         }
         catch
         {
-            TryDelete(destination);
+            if (created) TryDelete(destination);
             throw;
         }
     }
@@ -269,12 +278,14 @@ internal static class SegmentedHttpDownloader
         SegmentedDownloadOptions options,
         Func<Uri, bool> isTrustedFinalUri,
         Action<int> reportBytes,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<Uri, HttpResponseMessage>? responseReceived)
     {
         using var request = CreateRequest(uri, start, end);
         using var response = await client.SendAsync(request,
             HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         ValidateFinalUri(response, isTrustedFinalUri);
+        responseReceived?.Invoke(uri, response);
         if (response.StatusCode == HttpStatusCode.OK)
             throw new RangeNotSupportedException(
                 "The server ignored a segmented range request.");

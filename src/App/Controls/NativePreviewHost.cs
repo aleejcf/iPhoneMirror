@@ -1,13 +1,17 @@
 using System.Runtime.InteropServices;
+using System.Windows.Input;
 using System.Windows.Interop;
 using IPhoneMirror.App.Localization;
 using IPhoneMirror.App.Interop;
+using IPhoneMirror.App.Models;
 
 namespace IPhoneMirror.App.Controls;
 
 internal sealed class NativePreviewHost : HwndHost
 {
     private const int WmNcHitTest = 0x0084;
+    private const int WmMouseMove = 0x0200;
+    private const uint PmRemove = 0x0001;
     private const int WmEraseBackground = 0x0014;
     private const int HtTransparent = -1;
     private const int WsChild = 0x40000000;
@@ -21,10 +25,27 @@ internal sealed class NativePreviewHost : HwndHost
     private const double MainPreviewInnerCornerRadius = 15.0;
     private nint _window;
     private bool _presentationVisible;
+    private byte _capturedMouseButtons;
     private bool _isFullScreenPresentation;
+    private DeviceCornerProfile _cornerProfile = DeviceCornerProfile.Rectangular;
+    private bool _usesDeviceCornerProfile;
+    private (int Width, int Height, int Radius, double Curve)? _appliedRegion;
 
     internal bool CapturePointerInput { get; set; }
+    internal bool CaptureTouchInput { get; set; }
     internal bool SuppressMouseMove { get; set; }
+    // Raw Input owns button and wheel transitions while Bluetooth control is
+    // active. Suppress legacy messages that leak from the child HWND so a
+    // duplicate up/down cannot overwrite the HID button state.
+    internal bool SuppressLegacyMouseButtons { get; set; }
+
+    internal void ReleasePointerCapture()
+    {
+        _capturedMouseButtons = 0;
+        // WM_CAPTURECHANGED may transfer capture to the title-bar move loop.
+        // Releasing the new owner's capture here would interrupt window dragging.
+        if (_window != 0 && GetCapture() == _window) _ = ReleaseCapture();
+    }
     internal bool IsFullScreenPresentation
     {
         get => _isFullScreenPresentation;
@@ -37,12 +58,41 @@ internal sealed class NativePreviewHost : HwndHost
     }
     internal nint WindowHandle => _window;
 
+    internal void SetDeviceCornerProfile(DeviceCornerProfile profile, bool enabled)
+    {
+        if (_usesDeviceCornerProfile == enabled && _cornerProfile == profile) return;
+        _usesDeviceCornerProfile = enabled;
+        _cornerProfile = profile;
+        UpdateWindowRegion();
+    }
+
     internal event EventHandler<PreviewPointerEventArgs>? PointerInput;
     internal event EventHandler<PreviewKeyboardEventArgs>? KeyboardInput;
 
     public NativePreviewHost()
     {
     }
+
+    protected override void OnGotKeyboardFocus(KeyboardFocusChangedEventArgs e)
+    {
+        base.OnGotKeyboardFocus(e);
+        // Keep WPF's HwndHost automation provider, which owns the interop
+        // child. Forward logical focus (including UIA SetFocus) to the HWND
+        // that actually receives keyboard input and focus-loss releases.
+        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Input,
+            new Action(() =>
+            {
+                // Finish WPF/UIA's focus transaction before handing focus to
+                // the HWND. Synchronous handoff makes UIA report a failure.
+                if (_window != 0 && IsKeyboardFocused) SetFocus(_window);
+            }));
+    }
+
+    [DllImport("user32.dll")]
+    private static extern nint SetFocus(nint window);
+
+    [DllImport("user32.dll")]
+    private static extern nint GetFocus();
 
     protected override HandleRef BuildWindowCore(HandleRef hwndParent)
     {
@@ -51,6 +101,7 @@ internal sealed class NativePreviewHost : HwndHost
             0, 0, 1, 1, hwndParent.Handle, 0, 0, 0);
         if (_window == 0) throw new InvalidOperationException(
             LocalizationService.Get("PreviewChildCreateFailed"));
+        NativeTouchInput.RegisterTouchWindow(_window);
         if (!Activate())
         {
             DestroyWindow(_window);
@@ -93,6 +144,7 @@ internal sealed class NativePreviewHost : HwndHost
 
     internal void SetPresentationVisible(bool visible)
     {
+        if (_presentationVisible == visible) return;
         _presentationVisible = visible;
         if (_window != 0) _ = ShowWindow(_window, visible ? SwShowNoActivate : SwHide);
     }
@@ -113,22 +165,66 @@ internal sealed class NativePreviewHost : HwndHost
     private void ApplyWindowRegion(int width, int height)
     {
         if (_window == 0) return;
-        if (_isFullScreenPresentation)
+        var shortEdge = Math.Min(width, height);
+        var dpi = GetDpiForWindow(_window);
+        var radius = _isFullScreenPresentation ? 0 : _usesDeviceCornerProfile
+            ? _cornerProfile.GetGdiRadius(shortEdge, dpi == 0 ? 1.0 : dpi / 96.0)
+            : Math.Max(2, (int)Math.Round(MainPreviewInnerCornerRadius *
+                (dpi == 0 ? 1.0 : dpi / 96.0)));
+        var shape = (width, height, radius,
+            _usesDeviceCornerProfile ? _cornerProfile.CurveExponent : 0.0);
+        // Position-only updates do not change the child silhouette. Avoid
+        // rebuilding a 260-point HRGN and forcing a repaint on every drag tick.
+        if (_appliedRegion == shape) return;
+        if (radius == 0)
         {
-            // The fullscreen parent is rectangular. Retaining the main
-            // preview's rounded child region exposes a light-theme sliver at
-            // the edge while the D3D surface itself is correctly black.
-            _ = SetWindowRgn(_window, 0, true);
+            if (SetWindowRgn(_window, 0, true) != 0) _appliedRegion = shape;
             return;
         }
-        var dpi = GetDpiForWindow(_window);
-        var radius = Math.Max(2, (int)Math.Round(MainPreviewInnerCornerRadius *
-            (dpi == 0 ? 1.0 : dpi / 96.0)));
-        var region = CreateRoundRectRgn(0, 0, width, height,
-            radius * 2, radius * 2);
+        // The D3D shader uses the device profile's superellipse and smooths
+        // its edge. Keep the HWND's opaque region on that same curve so the
+        // child does not expose a generic circular iPhone corner underneath
+        // the shader when compact mode removes the WPF preview frame.
+        var region = _usesDeviceCornerProfile
+            ? CreateDeviceCornerRegion(width, height, radius,
+                _cornerProfile.CurveExponent)
+            : CreateRoundRectRgn(0, 0, width, height, radius * 2, radius * 2);
         if (region == 0) return;
         // SetWindowRgn owns the region after success.
         if (SetWindowRgn(_window, region, true) == 0) _ = DeleteObject(region);
+        else _appliedRegion = shape;
+    }
+
+    private static nint CreateDeviceCornerRegion(int width, int height, int radius,
+        double exponent)
+    {
+        const int segmentsPerCorner = 64;
+        if (radius <= 0 || width <= radius * 2 || height <= radius * 2)
+            return CreateRoundRectRgn(0, 0, width, height, radius * 2, radius * 2);
+
+        var curve = Math.Clamp(exponent, 1.5, 4.0);
+        var points = new NativePoint[segmentsPerCorner * 4 + 4];
+        var index = 0;
+        AddCorner(width - radius, radius, -Math.PI / 2, 0);
+        AddCorner(width - radius, height - radius, 0, Math.PI / 2);
+        AddCorner(radius, height - radius, Math.PI / 2, Math.PI);
+        AddCorner(radius, radius, Math.PI, Math.PI * 1.5);
+        return CreatePolygonRgn(points, index, Windings);
+
+        void AddCorner(double centerX, double centerY, double from, double to)
+        {
+            for (var segment = 0; segment <= segmentsPerCorner; segment++)
+            {
+                var angle = from + (to - from) * segment / segmentsPerCorner;
+                var x = Math.Pow(Math.Abs(Math.Cos(angle)), 2.0 / curve);
+                var y = Math.Pow(Math.Abs(Math.Sin(angle)), 2.0 / curve);
+                points[index++] = new NativePoint
+                {
+                    X = (int)Math.Round(centerX + radius * Math.Sign(Math.Cos(angle)) * x),
+                    Y = (int)Math.Round(centerY + radius * Math.Sign(Math.Sin(angle)) * y),
+                };
+            }
+        }
     }
 
     protected override void DestroyWindowCore(HandleRef hwnd)
@@ -136,11 +232,28 @@ internal sealed class NativePreviewHost : HwndHost
         PreviewAttachmentCoordinator.Unregister(hwnd.Handle);
         if (hwnd.Handle != 0) DestroyWindow(hwnd.Handle);
         _window = 0;
+        _appliedRegion = null;
     }
 
     protected override nint WndProc(nint hwnd, int message, nint wParam, nint lParam,
         ref bool handled)
     {
+        if (message == NativeTouchInput.WmTouch)
+        {
+            NativeTouchInput.Dispatch(hwnd, wParam, lParam, CapturePointerInput && CaptureTouchInput,
+                GetClientWidth(), GetClientHeight(), 0, 0, 0, input =>
+                {
+                    if (input.Kind == PreviewPointerKind.TouchDown) { Focus(); SetFocus(hwnd); }
+                    PointerInput?.Invoke(this, input);
+                });
+            handled = true;
+            return 0;
+        }
+        if (CapturePointerInput && CaptureTouchInput && NativeTouchInput.IsPromotedMouseMessage(message))
+        {
+            handled = true;
+            return 0;
+        }
         if (message == WmNcHitTest)
         {
             if (CapturePointerInput)
@@ -155,13 +268,25 @@ internal sealed class NativePreviewHost : HwndHost
         }
         if (message == 0x0020 && CapturePointerInput) // WM_SETCURSOR
         {
+            // Consuming this message also owns the cursor shape. Otherwise a
+            // resize/hand cursor from the previous surface remains in use.
+            // Setting the shape leaves Bluetooth's visibility state intact.
+            NativeCursor.SetArrow();
             handled = true;
             return 1;
         }
         if (CapturePointerInput)
         {
+            // Button-up clears our mask before ReleaseCapture synchronously
+            // sends WM_CAPTURECHANGED. That is a completed click, not a reset.
+            if (message == 0x0215 && _capturedMouseButtons == 0)
+            {
+                handled = true;
+                return 0;
+            }
             if (message is 0x0008 or 0x001F or 0x0215) // focus/capture lost
             {
+                ReleasePointerCapture();
                 PointerInput?.Invoke(this, new PreviewPointerEventArgs(
                     PreviewPointerKind.Reset, 0, 0, 0, 0));
                 KeyboardInput?.Invoke(this, new PreviewKeyboardEventArgs(
@@ -169,12 +294,13 @@ internal sealed class NativePreviewHost : HwndHost
             }
             switch (message)
             {
-                case 0x0200: // WM_MOUSEMOVE
+                case WmMouseMove:
                     if (SuppressMouseMove)
                     {
                         handled = true;
                         return 0;
                     }
+                    lParam = DrainQueuedMouseMoves(_window, lParam);
                     PointerInput?.Invoke(this, new PreviewPointerEventArgs(
                         PreviewPointerKind.Move, GetSignedLowWord(lParam),
                         GetSignedHighWord(lParam), 0, 0, GetClientWidth(),
@@ -184,6 +310,23 @@ internal sealed class NativePreviewHost : HwndHost
                 case 0x0201: // WM_LBUTTONDOWN
                 case 0x0204: // WM_RBUTTONDOWN
                 case 0x0207: // WM_MBUTTONDOWN
+                    // STATIC children do not take keyboard focus on click.
+                    // Restore both WPF and native focus after a toolbar/editor
+                    // interaction before dispatching this preview input.
+                    // Re-focusing an already focused HWND through WPF briefly
+                    // blurs it and retires held shortcut modifiers (e.g. Ctrl).
+                    if (GetFocus() != _window)
+                    {
+                        Focus();
+                        SetFocus(_window);
+                    }
+                    if (SuppressLegacyMouseButtons)
+                    {
+                        handled = true;
+                        return 0;
+                    }
+                    _capturedMouseButtons |= MouseButtonFromMessage(message);
+                    _ = SetCapture(_window);
                     PointerInput?.Invoke(this, new PreviewPointerEventArgs(
                         PreviewPointerKind.ButtonDown, GetSignedLowWord(lParam),
                         GetSignedHighWord(lParam), MouseButtonFromMessage(message), 0,
@@ -193,13 +336,25 @@ internal sealed class NativePreviewHost : HwndHost
                 case 0x0202: // WM_LBUTTONUP
                 case 0x0205: // WM_RBUTTONUP
                 case 0x0208: // WM_MBUTTONUP
+                    if (SuppressLegacyMouseButtons)
+                    {
+                        handled = true;
+                        return 0;
+                    }
+                    _capturedMouseButtons = (byte)(_capturedMouseButtons & ~MouseButtonFromMessage(message));
                     PointerInput?.Invoke(this, new PreviewPointerEventArgs(
                         PreviewPointerKind.ButtonUp, GetSignedLowWord(lParam),
                         GetSignedHighWord(lParam), MouseButtonFromMessage(message), 0,
                         GetClientWidth(), GetClientHeight()));
+                    if (_capturedMouseButtons == 0) _ = ReleaseCapture();
                     handled = true;
                     return 0;
                 case 0x020A: // WM_MOUSEWHEEL
+                    if (SuppressLegacyMouseButtons)
+                    {
+                        handled = true;
+                        return 0;
+                    }
                     PointerInput?.Invoke(this, new PreviewPointerEventArgs(
                         PreviewPointerKind.Wheel, GetSignedLowWord(lParam),
                         GetSignedHighWord(lParam), 0, (short)((long)wParam >> 16),
@@ -211,6 +366,11 @@ internal sealed class NativePreviewHost : HwndHost
                     KeyboardInput?.Invoke(this, new PreviewKeyboardEventArgs(
                         PreviewKeyboardKind.Down, (int)wParam,
                         (int)(((long)lParam >> 16) & 0x1FF)));
+                    handled = true;
+                    return 0;
+                case 0x0102 when (((long)lParam >> 16) & 0xFF) == 0: // Posted WM_CHAR (no physical scan code).
+                    KeyboardInput?.Invoke(this, new PreviewKeyboardEventArgs(
+                        PreviewKeyboardKind.Text, 0) { Text = ((char)wParam).ToString() });
                     handled = true;
                     return 0;
                 case 0x0101: // WM_KEYUP
@@ -255,6 +415,16 @@ internal sealed class NativePreviewHost : HwndHost
         return Math.Max(1, rect.Bottom - rect.Top);
     }
 
+    private static nint DrainQueuedMouseMoves(nint hwnd, nint currentLParam)
+    {
+        var latest = currentLParam;
+        var queued = new NativeMessage();
+        var drained = 0;
+        while (drained++ < 64 && PeekMessageW(ref queued, hwnd, WmMouseMove, WmMouseMove, PmRemove))
+            latest = queued.LParam;
+        return latest;
+    }
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern nint CreateWindowExW(int exStyle, string className, string windowName,
         int style, int x, int y, int width, int height, nint parent, nint menu,
@@ -273,9 +443,34 @@ internal sealed class NativePreviewHost : HwndHost
         internal int Bottom;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativePoint
+    {
+        internal int X;
+        internal int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeMessage
+    {
+        internal nint Hwnd;
+        internal uint Message;
+        internal nint WParam;
+        internal nint LParam;
+        internal uint Time;
+        internal int PointX;
+        internal int PointY;
+        internal uint Private;
+    }
+
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetClientRect(nint window, out NativeRect rect);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PeekMessageW(ref NativeMessage message, nint window,
+        uint minMessage, uint maxMessage, uint removeMessage);
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -288,23 +483,48 @@ internal sealed class NativePreviewHost : HwndHost
     private static extern nint CreateRoundRectRgn(int left, int top, int right, int bottom,
         int ellipseWidth, int ellipseHeight);
 
+    private const int Windings = 2;
+
+    [DllImport("gdi32.dll")]
+    private static extern nint CreatePolygonRgn([In] NativePoint[] points, int count,
+        int mode);
+
     [DllImport("user32.dll")]
     private static extern int SetWindowRgn(nint window, nint region, [MarshalAs(UnmanagedType.Bool)] bool redraw);
 
     [DllImport("gdi32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool DeleteObject(nint value);
+
+    [DllImport("user32.dll")]
+    private static extern nint SetCapture(nint window);
+
+    [DllImport("user32.dll")]
+    private static extern nint GetCapture();
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ReleaseCapture();
 }
 
-internal enum PreviewPointerKind { Move, ButtonDown, ButtonUp, Wheel, Reset }
+internal enum PreviewPointerKind { Move, ButtonDown, ButtonUp, Wheel, Reset, TouchDown, TouchMove, TouchUp }
 internal sealed class PreviewPointerEventArgs : EventArgs
 {
     internal PreviewPointerEventArgs(PreviewPointerKind kind, short x, short y,
         byte button, int wheel, int surfaceWidth = 1, int surfaceHeight = 1,
-        uint sourceWidth = 0, uint sourceHeight = 0, int rotation = 0) =>
+        uint sourceWidth = 0, uint sourceHeight = 0, int rotation = 0)
+        : this(kind, (int)x, (int)y, button, wheel, surfaceWidth, surfaceHeight,
+            sourceWidth, sourceHeight, rotation, 0, 0) { }
+
+    internal PreviewPointerEventArgs(PreviewPointerKind kind, int x, int y,
+        byte button, int wheel, int surfaceWidth, int surfaceHeight,
+        uint sourceWidth, uint sourceHeight, int rotation,
+        uint touchId, nint sourceWindow) =>
         (Kind, X, Y, Button, Wheel, SurfaceWidth, SurfaceHeight, SourceWidth,
-            SourceHeight, Rotation) = (kind, x, y, button, wheel, surfaceWidth,
-            surfaceHeight, sourceWidth, sourceHeight, rotation);
+            SourceHeight, Rotation, TouchId, SourceWindow) = (kind, x, y, button, wheel, surfaceWidth,
+            surfaceHeight, sourceWidth, sourceHeight, rotation, touchId, sourceWindow);
+    internal uint TouchId { get; }
+    internal nint SourceWindow { get; }
     internal PreviewPointerKind Kind { get; }
     internal int X { get; }
     internal int Y { get; }
@@ -316,7 +536,7 @@ internal sealed class PreviewPointerEventArgs : EventArgs
     internal uint SourceHeight { get; }
     internal int Rotation { get; }
 }
-internal enum PreviewKeyboardKind { Down, Up, Reset }
+internal enum PreviewKeyboardKind { Down, Up, Reset, Text }
 internal sealed class PreviewKeyboardEventArgs : EventArgs
 {
     internal PreviewKeyboardEventArgs(PreviewKeyboardKind kind, int virtualKey,
@@ -324,4 +544,5 @@ internal sealed class PreviewKeyboardEventArgs : EventArgs
     internal PreviewKeyboardKind Kind { get; }
     internal int VirtualKey { get; }
     internal int ScanCode { get; }
+    internal string? Text { get; init; }
 }

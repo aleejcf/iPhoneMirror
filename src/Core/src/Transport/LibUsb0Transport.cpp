@@ -3,6 +3,7 @@
 #include "Logging.h"
 
 #include <Windows.h>
+#include <shellapi.h>
 #include <lusb0_usb.h>
 
 #include <algorithm>
@@ -25,6 +26,9 @@ constexpr std::uint16_t AppleVendorId = 0x05ac;
 constexpr std::uint8_t QuickTimeSubclass = 0x2a;
 constexpr std::uint8_t QuickTimePlaceholderSubclass = 0xfd;
 constexpr int LibUsb0TransferTimedOut = -116;
+constexpr int LibUsb0DeviceNotFound = -5;
+constexpr int LibUsb0TransientReadRetries = 12;
+constexpr auto LibUsb0TransientReadDelay = std::chrono::milliseconds(50);
 // libusb-win32 returns this value when the handle has no active configuration
 // (its internal pipe table is still at configuration 0).  It is distinct from
 // a genuinely busy interface and is the only claim failure that can be
@@ -172,11 +176,55 @@ DWORD run_configuration_helper(const AppleUsbIdentity& identity,
         throw std::runtime_error(std::format(
             "read USB configuration helper result: win32_error={}", GetLastError()));
     const auto operation_name = operation == L"activate" ? "activate" :
-        operation == L"restore" ? "restore" : "verify";
+        operation == L"restore" ? "restore" :
+        operation == L"reconnect" ? "reconnect" : "verify";
     logging::write(std::format(
         "usb_configuration_helper operation={} exit_code={}",
         operation_name, exit_code));
     return exit_code;
+}
+
+DWORD run_elevated_reconnect_helper(const AppleUsbIdentity& identity) {
+    std::wstring module_path(32768, L'\0');
+    const auto length = GetModuleFileNameW(nullptr, module_path.data(),
+        static_cast<DWORD>(module_path.size()));
+    if (length == 0 || length >= module_path.size())
+        throw std::runtime_error("locate USB reconnect helper failed");
+    module_path.resize(length);
+    const auto helper = std::filesystem::path(module_path).parent_path() /
+        L"iPhoneMirror.UsbConfigurationSwitch.exe";
+    if (!std::filesystem::is_regular_file(helper))
+        throw std::runtime_error("USB reconnect helper is missing");
+    // Consent has a deadline. A late accepted UAC prompt must not restart a
+    // device after the cleanup operation has already expired.
+    const auto parameters = L"reconnect " + quote_process_argument(widen_ascii(identity.serial)) +
+        L" " + std::to_wstring(identity.expected_quicktime_configuration) + L" " +
+        quote_process_argument(widen_ascii(identity.topology_id)) + L" " +
+        std::to_wstring(GetTickCount64() + 60000);
+    SHELLEXECUTEINFOW execute{.cbSize = sizeof(execute)};
+    execute.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+    execute.lpVerb = L"runas";
+    execute.lpFile = helper.c_str();
+    execute.lpParameters = parameters.c_str();
+    execute.nShow = SW_HIDE;
+    logging::write("usb_reconnect action=administrator_consent_required");
+    if (!ShellExecuteExW(&execute)) {
+        const auto error = GetLastError();
+        logging::write(logging::Level::Warning, "usb_reconnect",
+            std::format("usb_reconnect action=elevation_failed win32_error={}", error));
+        return error == ERROR_CANCELLED ? 47 : 44;
+    }
+    if (!execute.hProcess) return 45;
+    const auto wait = WaitForSingleObject(execute.hProcess, 18000);
+    DWORD result = 46;
+    if (wait == WAIT_OBJECT_0 && !GetExitCodeProcess(execute.hProcess, &result))
+        result = 45;
+    // This atomic hub operation never disables a device persistently, opens
+    // a phone filter or has child processes. Do not forcibly kill an elevated
+    // process during a kernel port cycle. A timeout remains a failed restore.
+    CloseHandle(execute.hProcess);
+    logging::write(std::format("usb_reconnect elevated_helper_exit={}", result));
+    return result;
 }
 
 bool run_configuration_switch_helper(const AppleUsbIdentity& identity,
@@ -186,6 +234,9 @@ bool run_configuration_switch_helper(const AppleUsbIdentity& identity,
     const auto exit_code = run_configuration_helper(identity, operation);
     if (exit_code == 0 || exit_code == 20) return true;
     if (exit_code == 10) return false;
+    if (exit_code == 34)
+        throw std::runtime_error(
+            "USB configuration helper could not read the selected phone's serial; no configuration request was sent");
     if (exit_code == 32)
         throw std::runtime_error(std::format(
             "USB configuration helper observed {} removal but the exact interface did not return before timeout",
@@ -927,6 +978,13 @@ bool LibUsb0Connection::disable_quicktime_configuration(
     return run_configuration_switch_helper(identity, false);
 }
 
+bool LibUsb0Connection::reconnect_normal_device(const AppleUsbIdentity& identity) {
+    auto result = run_configuration_helper(identity, L"reconnect");
+    if (result == 44) result = run_elevated_reconnect_helper(identity);
+    logging::write(std::format("usb_reconnect result={} accepted={}", result, result == 0));
+    return result == 0;
+}
+
 LibUsb0Connection LibUsb0Connection::open_quicktime(const std::string& serial) {
     return open_quicktime(AppleUsbIdentity{.serial = serial});
 }
@@ -966,8 +1024,16 @@ LibUsb0Connection LibUsb0Connection::open_quicktime(
     }
 
     connection.endpoints_ = endpoints_for(*device, QuickTimeSubclass);
-    if (!connection.endpoints_.configuration &&
-        options.wait_for_activated_descriptor) {
+    // A visible configuration-5 descriptor is not proof that the device has
+    // left configuration 3. Wait for both pieces of evidence after our own
+    // activation; an existing session remains on the claim-only path.
+    if (options.wait_for_activated_descriptor &&
+        (!connection.endpoints_.configuration ||
+            !is_libusb0_quicktime_configuration_active(selected_info))) {
+        logging::write(std::format(
+            "libusb0_activation_pending active_configuration={} active_known={} descriptor_configuration={}",
+            selected_info.active_configuration, selected_info.active_configuration_known,
+            connection.endpoints_.configuration));
         const auto deadline = std::chrono::steady_clock::now() +
             ActivatedDescriptorTimeout;
         HandleConfigurationObservation observation;
@@ -998,7 +1064,7 @@ LibUsb0Connection LibUsb0Connection::open_quicktime(
             }
             if (std::chrono::steady_clock::now() >= deadline) {
                 fail(std::format(
-                    "activated QuickTime descriptor was not committed within {} ms "
+                    "activated QuickTime descriptor/configuration was not committed within {} ms "
                     "(probes={}, configurations={}, active_configuration={}, active_known={}, last_descriptor_result={})",
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         ActivatedDescriptorTimeout).count(),
@@ -1104,15 +1170,25 @@ std::size_t LibUsb0Connection::read(std::span<std::uint8_t> destination, unsigne
     auto* handle = handle_;
     if (!handle || destination.empty())
         throw std::invalid_argument("invalid QuickTime USB read");
-    const int count = usb_bulk_read(handle, endpoints_.bulk_in,
-        reinterpret_cast<char*>(destination.data()),
-        static_cast<int>(std::min<std::size_t>(destination.size(), INT_MAX)),
-        static_cast<int>(timeout_ms));
-    if (count == LibUsb0TransferTimedOut) return 0;
-    if (count < 0)
-        throw std::runtime_error(std::format(
-            "QuickTime bulk read: libusb0 error {}", count));
-    return static_cast<std::size_t>(count);
+    const auto size = static_cast<int>(std::min<std::size_t>(destination.size(), INT_MAX));
+    for (int attempt = 0; ; ++attempt) {
+        const int count = usb_bulk_read(handle, endpoints_.bulk_in,
+            reinterpret_cast<char*>(destination.data()), size,
+            static_cast<int>(timeout_ms));
+        if (count == LibUsb0TransferTimedOut) return 0;
+        if (count == LibUsb0DeviceNotFound && attempt < LibUsb0TransientReadRetries) {
+            // During the legacy filter's QuickTime re-enumeration, libusb0 can
+            // report a missing pipe for a few polls while the same device node
+            // is being rebuilt. Keep the handle alive and retry briefly before
+            // promoting it to a real capture failure.
+            std::this_thread::sleep_for(LibUsb0TransientReadDelay);
+            continue;
+        }
+        if (count < 0)
+            throw std::runtime_error(std::format(
+                "QuickTime bulk read: libusb0 error {}", count));
+        return static_cast<std::size_t>(count);
+    }
 }
 
 void LibUsb0Connection::write(std::span<const std::uint8_t> source, unsigned timeout_ms) {

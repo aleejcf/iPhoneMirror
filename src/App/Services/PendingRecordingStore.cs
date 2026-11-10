@@ -26,6 +26,21 @@ internal static class PendingRecordingStore
         return Path.Combine(directory, name + PartialSuffix);
     }
 
+    internal static async Task CopyAndDeleteAsync(string pendingPath, string savedPath)
+    {
+        // Windows must be able to delete the source after both streams close.
+        await using (var source = new FileStream(pendingPath, FileMode.Open,
+            FileAccess.Read, FileShare.Read, 1024 * 1024,
+            FileOptions.Asynchronous | FileOptions.SequentialScan))
+        await using (var destination = new FileStream(savedPath, FileMode.Create,
+            FileAccess.Write, FileShare.None, 1024 * 1024, FileOptions.Asynchronous))
+        {
+            await source.CopyToAsync(destination);
+            await destination.FlushAsync();
+        }
+        File.Delete(pendingPath);
+    }
+
     internal static string? FindLatest(string? directory = null)
     {
         directory ??= DefaultDirectory;

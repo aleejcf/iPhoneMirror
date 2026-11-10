@@ -1,3 +1,4 @@
+using IPhoneMirror.UI.Controls;
 using System.ComponentModel;
 using System.IO;
 using System.Windows;
@@ -9,19 +10,36 @@ using Microsoft.Win32;
 
 namespace IPhoneMirror.App.Windows;
 
-public partial class MediaOutputSettingsWindow : Wpf.Ui.Controls.FluentWindow
+public partial class MediaOutputSettingsWindow : IPhoneMirror.UI.Controls.RoundedWindow
 {
     private readonly MainViewModel _viewModel;
     private readonly bool _previewOnly;
     private bool _savePromptOpen;
     private (uint Width, uint Height)? _lastDefaultSize;
+    private readonly CancellationTokenSource _microphoneCancellation = new();
+    private bool _microphoneRefreshRunning;
 
     internal MediaOutputSettingsWindow(MainViewModel viewModel, bool previewOnly = false)
     {
         InitializeComponent();
         _viewModel = viewModel;
         _previewOnly = previewOnly;
+        MicrophoneBox.ItemsSource = new[] { new MicrophoneDevice(LocalizationService.Get("MicrophoneOff"), "") };
+        MicrophoneBox.SelectedIndex = 0;
         DataContext = viewModel;
+        LocalizationService.RefreshWhenLanguageChanges(this, () =>
+        {
+            FeedbackText.Text = LocalizationService.RefreshText(FeedbackText.Text);
+            if (MicrophoneBox.ItemsSource is IEnumerable<MicrophoneDevice> microphones)
+            {
+                var selected = MicrophoneBox.SelectedValue as string;
+                MicrophoneBox.ItemsSource = microphones.Select(device => device.Id.Length == 0
+                    ? device with { Name = LocalizationService.Get("MicrophoneOff") } : device).ToArray();
+                MicrophoneBox.SelectedValue = selected;
+            }
+            if (VirtualCameraCurrentResolutionItem.Content is string caption)
+                VirtualCameraCurrentResolutionItem.Content = LocalizationService.RefreshText(caption);
+        });
         _viewModel.PropertyChanged += OnViewModelPropertyChanged;
         Loaded += OnLoaded;
         Closing += OnClosing;
@@ -35,16 +53,19 @@ public partial class MediaOutputSettingsWindow : Wpf.Ui.Controls.FluentWindow
         VirtualCameraFpsBox.SelectedIndex = 0;
         if (_previewOnly)
         {
-            FeedbackText.Text = LocalizationService.Get("DeveloperReadOnlyPreview");
+            SetFeedback(LocalizationService.Get("DeveloperReadOnlyPreview"));
             UpdateStartButtons();
             return;
         }
         // Re-probe on each opening so a user can install FFmpeg or update PATH
         // without restarting the entire application.
         await RunAsync(() => _viewModel.EnsureMediaOutputCapabilitiesAsync(force: true));
+        if (_microphoneCancellation.IsCancellationRequested) return;
         SelectFirstSupportedProtocol();
         UpdateStartButtons();
-        if (!_viewModel.IsMediaOutputRunning &&
+        await RefreshMicrophonesAsync();
+        if (_microphoneCancellation.IsCancellationRequested) return;
+        if (!_viewModel.IsRecordingMediaOutput &&
             _viewModel.PendingRecordingPath is not null)
             await PromptToSaveRecordingAsync();
     }
@@ -54,12 +75,16 @@ public partial class MediaOutputSettingsWindow : Wpf.Ui.Controls.FluentWindow
         Loaded -= OnLoaded;
         Closing -= OnClosing;
         _viewModel.PropertyChanged -= OnViewModelPropertyChanged;
+        _microphoneCancellation.Cancel();
+        _microphoneCancellation.Dispose();
     }
 
     private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         if (e.PropertyName is nameof(MainViewModel.CanStartMediaOutput) or
             nameof(MainViewModel.CanRecordMediaOutput) or
+            nameof(MainViewModel.CanStartRecording) or
+            nameof(MainViewModel.CanStartStreaming) or
             nameof(MainViewModel.CanStreamRtmp) or
             nameof(MainViewModel.CanStreamSrt) or
             nameof(MainViewModel.CanStreamWhip) or
@@ -71,8 +96,8 @@ public partial class MediaOutputSettingsWindow : Wpf.Ui.Controls.FluentWindow
         if (e.PropertyName == nameof(MainViewModel.SourceVideoHeight) &&
             !_viewModel.IsMediaOutputRunning)
             ApplyPreviewOutputDefaults(force: false);
-        if (e.PropertyName == nameof(MainViewModel.IsMediaOutputRunning) &&
-            !_viewModel.IsMediaOutputRunning &&
+        if (e.PropertyName == nameof(MainViewModel.IsRecordingMediaOutput) &&
+            !_viewModel.IsRecordingMediaOutput &&
             _viewModel.PendingRecordingPath is not null)
             _ = Dispatcher.BeginInvoke(async () =>
                 await PromptToSaveRecordingAsync());
@@ -160,9 +185,9 @@ public partial class MediaOutputSettingsWindow : Wpf.Ui.Controls.FluentWindow
             StartStreamingButton.IsEnabled = false;
             return;
         }
-        StartRecordingButton.IsEnabled = _viewModel.CanStartMediaOutput &&
+        StartRecordingButton.IsEnabled = _viewModel.CanStartRecording &&
             _viewModel.CanRecordMediaOutput;
-        StartStreamingButton.IsEnabled = _viewModel.CanStartMediaOutput &&
+        StartStreamingButton.IsEnabled = _viewModel.CanStartStreaming &&
             SelectedProtocolSupported();
     }
 
@@ -181,7 +206,7 @@ public partial class MediaOutputSettingsWindow : Wpf.Ui.Controls.FluentWindow
             return;
         var result = await _viewModel.StartRecordingAsync(
             width, height, fps, bitrate);
-        FeedbackText.Text = result.Message;
+        SetFeedback(result.Message, result.Success ? StatusTone.Success : StatusTone.Error);
     }
 
     private async void OnStartStreamingClick(object sender, RoutedEventArgs e)
@@ -197,8 +222,39 @@ public partial class MediaOutputSettingsWindow : Wpf.Ui.Controls.FluentWindow
         };
         var result = await _viewModel.StartStreamingAsync(kind,
             StreamDestinationBox.Text.Trim(), StreamAuthorizationBox.Text.Trim(),
-            width, height, fps, bitrate);
-        FeedbackText.Text = result.Message;
+            width, height, fps, bitrate, MicrophoneBox.SelectedValue as string);
+        SetFeedback(result.Message, result.Success ? StatusTone.Success : StatusTone.Error);
+    }
+
+    private async void OnRefreshMicrophonesClick(object sender, RoutedEventArgs e) =>
+        await RefreshMicrophonesAsync();
+
+    private async Task RefreshMicrophonesAsync()
+    {
+        if (_previewOnly || _microphoneRefreshRunning || _microphoneCancellation.IsCancellationRequested) return;
+        _microphoneRefreshRunning = true;
+        RefreshMicrophonesButton.IsEnabled = false;
+        var selected = MicrophoneBox.SelectedValue as string ?? "";
+        try
+        {
+            var devices = await _viewModel.GetMicrophonesAsync(_microphoneCancellation.Token);
+            if (_microphoneCancellation.IsCancellationRequested) return;
+            MicrophoneBox.ItemsSource = new[] { new MicrophoneDevice(LocalizationService.Get("MicrophoneOff"), "") }
+                .Concat(devices).ToArray();
+            MicrophoneBox.SelectedValue = devices.Any(device => device.Id == selected) ? selected : "";
+            if (devices.Count == 0) SetFeedback(LocalizationService.Get("MicrophoneNotFound"), StatusTone.Warning);
+        }
+        catch (OperationCanceledException) when (_microphoneCancellation.IsCancellationRequested) { }
+        catch (Exception error)
+        {
+            SetFeedback(LocalizationService.Format("MicrophoneEnumerationFailed", error.Message), StatusTone.Error);
+        }
+        finally
+        {
+            _microphoneRefreshRunning = false;
+            if (!_microphoneCancellation.IsCancellationRequested)
+                RefreshMicrophonesButton.IsEnabled = true;
+        }
     }
 
     private async void OnStartVirtualCameraClick(object sender, RoutedEventArgs e)
@@ -210,12 +266,12 @@ public partial class MediaOutputSettingsWindow : Wpf.Ui.Controls.FluentWindow
             !TryParseResolution(resolution, out var width, out var height) ||
             !int.TryParse(frameRateText, out var frameRate))
         {
-            FeedbackText.Text = LocalizationService.Get("MediaOutputInvalidSettings");
+            SetFeedback(LocalizationService.Get("MediaOutputInvalidSettings"), StatusTone.Warning);
             return;
         }
         var result = await _viewModel.StartVirtualCameraAsync(
             width, height, frameRate);
-        FeedbackText.Text = result.Message;
+        SetFeedback(result.Message, result.Success ? StatusTone.Success : StatusTone.Error);
     }
 
     private static bool TryParseResolution(string value,
@@ -230,13 +286,13 @@ public partial class MediaOutputSettingsWindow : Wpf.Ui.Controls.FluentWindow
     private async void OnInstallVirtualCameraClick(object sender, RoutedEventArgs e)
     {
         var result = await _viewModel.InstallVirtualCameraAsync();
-        FeedbackText.Text = result.Message;
+        SetFeedback(result.Message, result.Success ? StatusTone.Success : StatusTone.Error);
     }
 
     private async void OnUninstallVirtualCameraClick(object sender, RoutedEventArgs e)
     {
         var result = await _viewModel.UninstallVirtualCameraAsync();
-        FeedbackText.Text = result.Message;
+        SetFeedback(result.Message, result.Success ? StatusTone.Success : StatusTone.Error);
     }
 
     private async void OnStopClick(object sender, RoutedEventArgs e)
@@ -245,11 +301,32 @@ public partial class MediaOutputSettingsWindow : Wpf.Ui.Controls.FluentWindow
         await PromptToSaveRecordingAsync();
     }
 
+    private void OnDiscardClick(object sender, RoutedEventArgs e)
+    {
+        if (_viewModel.PendingRecordingPath is null) return;
+        if (!AppPromptWindow.ConfirmDestructive(LocalizationService.Get("DiscardRecording"),
+                LocalizationService.Get("DiscardRecordingConfirmation"),
+                LocalizationService.Get("DiscardRecording"), this))
+            return;
+        var discarded = _viewModel.DiscardPendingRecording();
+        SetFeedback(LocalizationService.Get(discarded ? "RecordingDiscarded" : "RecordingDiscardFailed"),
+            discarded ? StatusTone.Success : StatusTone.Error);
+    }
+
+    private async void OnStopRecordingClick(object sender, RoutedEventArgs e)
+    {
+        await RunAsync(() => _viewModel.StopRecordingAsync());
+        await PromptToSaveRecordingAsync();
+    }
+
+    private async void OnStopStreamingClick(object sender, RoutedEventArgs e) =>
+        await RunAsync(() => _viewModel.StopStreamingAsync());
+
     private void OnCloseClick(object sender, RoutedEventArgs e) => Close();
 
     private async Task PromptToSaveRecordingAsync()
     {
-        if (_savePromptOpen || _viewModel.IsMediaOutputRunning) return;
+        if (_savePromptOpen || _viewModel.IsRecordingMediaOutput) return;
         var pending = _viewModel.PendingRecordingPath;
         if (pending is null) return;
         _savePromptOpen = true;
@@ -272,7 +349,7 @@ public partial class MediaOutputSettingsWindow : Wpf.Ui.Controls.FluentWindow
             };
             if (dialog.ShowDialog(this) != true)
             {
-                FeedbackText.Text = LocalizationService.Get("RecordingPendingSave");
+                SetFeedback(LocalizationService.Get("RecordingPendingSave"), StatusTone.Warning);
                 return;
             }
 
@@ -281,29 +358,27 @@ public partial class MediaOutputSettingsWindow : Wpf.Ui.Controls.FluentWindow
                 try { File.Move(pending, dialog.FileName, overwrite: true); }
                 catch (IOException)
                 {
-                    await using var source = new FileStream(pending, FileMode.Open,
-                        FileAccess.Read, FileShare.Read, 1024 * 1024,
-                        FileOptions.Asynchronous | FileOptions.SequentialScan);
-                    await using var destination = new FileStream(dialog.FileName,
-                        FileMode.Create, FileAccess.Write, FileShare.None,
-                        1024 * 1024, FileOptions.Asynchronous);
-                    await source.CopyToAsync(destination);
-                    await destination.FlushAsync();
-                    File.Delete(pending);
+                    await PendingRecordingStore.CopyAndDeleteAsync(pending, dialog.FileName);
                 }
                 _viewModel.MarkPendingRecordingSaved(pending);
-                FeedbackText.Text = LocalizationService.Format(
-                    "RecordingSavedFormat", dialog.FileName);
+                SetFeedback(LocalizationService.Format(
+                    "RecordingSavedFormat", dialog.FileName), StatusTone.Success);
             }
             catch (Exception error)
             {
                 DiagnosticLogger.Exception("recording", "save_failed", error,
                     ("file", Path.GetFileName(dialog.FileName)));
-                FeedbackText.Text = LocalizationService.Format(
-                    "RecordingSaveFailedFormat", error.Message);
+                SetFeedback(LocalizationService.Format(
+                    "RecordingSaveFailedFormat", error.Message), StatusTone.Error);
             }
         }
         finally { _savePromptOpen = false; }
+    }
+
+    private void SetFeedback(string message, StatusTone tone = StatusTone.Neutral)
+    {
+        FeedbackText.Text = message;
+        StatusAppearance.SetTone(FeedbackText, tone);
     }
 
     private async Task RunAsync(Func<Task> action)
@@ -312,7 +387,7 @@ public partial class MediaOutputSettingsWindow : Wpf.Ui.Controls.FluentWindow
         catch (Exception error)
         {
             DiagnosticLogger.Exception("media_output", "settings_action_failed", error);
-            FeedbackText.Text = error.Message;
+            SetFeedback(error.Message, StatusTone.Error);
         }
     }
 
@@ -329,7 +404,7 @@ public partial class MediaOutputSettingsWindow : Wpf.Ui.Controls.FluentWindow
             width >= 160 && height >= 160 && fps is >= 10 and <= 60 &&
             bitrate is >= 500 and <= 50000)
             return true;
-        FeedbackText.Text = LocalizationService.Get("MediaOutputInvalidSettings");
+        SetFeedback(LocalizationService.Get("MediaOutputInvalidSettings"), StatusTone.Warning);
         return false;
     }
 }

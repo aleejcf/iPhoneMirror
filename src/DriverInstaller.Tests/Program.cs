@@ -7,14 +7,60 @@ using System.Text;
 
 [assembly: System.Runtime.Versioning.SupportedOSPlatform("windows")]
 
+if (args is ["--operation-path-probe"])
+{
+    var paths = DriverConstants.GetOperationPaths("0123456789abcdef0123456789abcdef");
+    Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new[] { paths.ResultPath, paths.LogPath, DriverConstants.BackupsRoot }));
+    return 0;
+}
+
 var failures = new List<string>();
+Run("isolated driver host keeps result logs and rollback backups in the machine data directory", () =>
+{
+    var paths = DriverConstants.GetOperationPaths("0123456789abcdef0123456789abcdef");
+    var expected = new[] { paths.ResultPath, paths.LogPath, DriverConstants.BackupsRoot };
+    True(expected.All(Path.IsPathFullyQualified));
+    foreach (var environmentMode in new[] { "empty", "spoofed" })
+    {
+        var start = new System.Diagnostics.ProcessStartInfo(Environment.ProcessPath!)
+        {
+            UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            WorkingDirectory = Path.GetTempPath()
+        };
+        // CI starts this test through dotnet, so the child needs the assembly
+        // path before its arguments. An apphost already identifies the assembly.
+        if (string.Equals(Path.GetFileNameWithoutExtension(Environment.ProcessPath),
+                "dotnet", StringComparison.OrdinalIgnoreCase))
+            start.ArgumentList.Add(typeof(DriverConstants).Assembly.Location);
+        start.ArgumentList.Add("--operation-path-probe");
+        start.Environment.Clear();
+        var windows = Directory.GetParent(Environment.SystemDirectory)!.FullName;
+        start.Environment["SystemRoot"] = windows;
+        start.Environment["WINDIR"] = windows;
+        start.Environment["PATH"] = Environment.SystemDirectory;
+        if (environmentMode == "spoofed") start.Environment["ProgramData"] = Path.GetTempPath();
+        using var child = System.Diagnostics.Process.Start(start)!;
+        var output = child.StandardOutput.ReadToEnd();
+        var errors = child.StandardError.ReadToEnd();
+        True(child.WaitForExit(15000));
+        if (child.ExitCode != 0) throw new Exception(errors);
+        var actual = System.Text.Json.JsonSerializer.Deserialize<string[]>(output)!;
+        True(expected.SequenceEqual(actual, StringComparer.OrdinalIgnoreCase));
+    }
+});
+Run("confirmed parent driver changes and recovery", ParentDriverTests.Run);
+Run("driver failure recovery and download deadlines", DriverFailureTests.Run);
+Run("Apple Devices USBMux readiness and port conflicts", AppleMuxSupportTests.Run);
 
 Run("localized culture mapping", () =>
 {
     Equal(DriverLocalization.TraditionalChineseHongKong,
         DriverLocalization.ResolveCultureName("zh-HK"));
-    Equal(DriverLocalization.TraditionalChineseHongKong,
+    Equal(DriverLocalization.TraditionalChineseTaiwan,
         DriverLocalization.ResolveCultureName("zh-Hant-TW"));
+    Equal(DriverLocalization.TraditionalChineseTaiwan,
+        DriverLocalization.ResolveCultureName("zh-TW"));
     Equal(DriverLocalization.TraditionalChineseHongKong,
         DriverLocalization.ResolveCultureName("zh-CHT"));
     Equal(DriverLocalization.Chinese,
@@ -46,8 +92,9 @@ Run("advanced mode exposes forced driver cleanup", () =>
     False(code.Contains("Remove-Selected-iPhone-Drivers.cmd", StringComparison.Ordinal));
     True(code.Contains("ToggleComboBoxDropDown", StringComparison.Ordinal));
     True(cleanupHost.Contains("EnsureElevationBoundary", StringComparison.Ordinal));
-    True(cleanupHost.Contains("Verb = \"runas\"", StringComparison.Ordinal));
-    True(cleanupHost.Contains("start.ArgumentList.Add(Switch)", StringComparison.Ordinal));
+    True(cleanupHost.Contains("DriverOperationClient.BuildElevatedStartInfo(arguments)",
+        StringComparison.Ordinal));
+    True(cleanupHost.Contains("new List<string> { Switch }", StringComparison.Ordinal));
     True(cleanupHost.Contains("ExcludeProcessId", StringComparison.Ordinal));
     True(cleanupHost.Contains("ParentProcessIdSwitch", StringComparison.Ordinal));
     False(cleanupScript.Contains("Verb RunAs", StringComparison.Ordinal));
@@ -93,6 +140,24 @@ Run("Apple parent allowlist", () =>
         @"USB\VID_05AC&PID_110A\0000000000000000"));
     False(DriverConstants.IsAppleMobileCaptureParent(
         @"USB\VID_05AC&PID_200E\0000000000000000"));
+});
+
+Run("legacy 40-character UDID passes enumeration and elevated validation", () =>
+{
+    var serial = "0123456789abcdef0123456789abcdef01234567";
+    Equal(40, serial.Length);
+    var parent = @"USB\VID_05AC&PID_12A8\" + serial;
+    True(DriverConstants.IsValidSerial(serial));
+    True(DriverConstants.IsAllowedAppleParent(parent));
+    True(DriverConstants.IsAppleMobileCaptureParent(parent));
+    True(DriverConstants.IsAppleMobileCaptureParent(parent.ToUpperInvariant()));
+    False(DriverConstants.IsAllowedAppleParent(parent + "0"));
+    False(DriverConstants.IsAllowedAppleParent(parent + "\n"));
+    False(DriverConstants.IsAllowedAppleParent(parent + @"\child"));
+    False(DriverConstants.IsAppleMobileCaptureParent(
+        @"USB\VID_05AC&PID_110A\" + serial));
+    False(DriverConstants.IsAppleMobileCaptureParent(
+        @"USB\VID_05AC&PID_12A8&MI_00\" + serial));
 });
 
 Run("Apple capture PID sources stay aligned", () =>
@@ -178,6 +243,26 @@ Run("Apple signer subject allowlist is exact", () =>
     False(DriverPayload.IsAllowedAppleSignerSubject(
         "CN=Apple Inc., O=Apple Inc., L=Cupertino, S=California, C=US, OU=Injected"));
     False(DriverPayload.IsAllowedAppleSignerSubject(null));
+});
+
+Run("Authenticode revocation fallback only accepts unavailable checks", () =>
+{
+    True(DriverPayload.CanRetryAuthenticodeWithoutRevocation(
+        unchecked((int)0x80092013))); // CRYPT_E_REVOCATION_OFFLINE
+    True(DriverPayload.CanRetryAuthenticodeWithoutRevocation(
+        unchecked((int)0x800B010E))); // CERT_E_REVOCATION_FAILURE
+
+    False(DriverPayload.CanRetryAuthenticodeWithoutRevocation(
+        unchecked((int)0x800B010C))); // CERT_E_REVOKED
+    False(DriverPayload.CanRetryAuthenticodeWithoutRevocation(
+        unchecked((int)0x800B0111))); // TRUST_E_EXPLICIT_DISTRUST
+    False(DriverPayload.CanRetryAuthenticodeWithoutRevocation(
+        unchecked((int)0x800B0004))); // TRUST_E_SUBJECT_NOT_TRUSTED
+    False(DriverPayload.CanRetryAuthenticodeWithoutRevocation(
+        unchecked((int)0x800B0100))); // TRUST_E_NOSIGNATURE
+    False(DriverPayload.CanRetryAuthenticodeWithoutRevocation(
+        unchecked((int)0x80092012))); // CRYPT_E_NO_REVOCATION_CHECK
+    False(DriverPayload.CanRetryAuthenticodeWithoutRevocation(0));
 });
 
 Run("unsigned Apple package is rejected", () =>
@@ -370,6 +455,28 @@ Run("protected operation directory ACL", () =>
         new DirectorySecurity()));
 });
 
+Run("invalid directory ACL preserves recovery backups", () =>
+{
+    var directory = Path.Combine(Path.GetTempPath(), "driver-backup-test-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(directory);
+    var backup = Path.Combine(directory, "snapshot.json");
+    try
+    {
+        File.WriteAllText(backup, "recovery snapshot");
+        var info = new DirectoryInfo(directory);
+        var security = info.GetAccessControl();
+        security.SetAccessRuleProtection(isProtected: false, preserveInheritance: true);
+        info.SetAccessControl(security);
+        Throws<IOException>(() => DriverPayload.CreateProtectedSystemDirectory(directory));
+        True(File.Exists(backup));
+        True(File.ReadAllText(backup) == "recovery snapshot");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+});
+
 Run("elevated result matches process exit code", () =>
 {
     var success = new DriverOperationResult(true, false, "ok", null, null, string.Empty);
@@ -380,12 +487,45 @@ Run("elevated result matches process exit code", () =>
     False(DriverOperationClient.IsResultConsistentWithExitCode(0, failure));
 });
 
-Run("current driver executable is locked before elevation", () =>
+Run("unbundled driver builds cannot cross the elevation boundary", () =>
 {
     var success = DriverOperationClient.EnsureElevationBoundary(out var error);
-    True(success);
-    if (!success) throw error ?? new IOException(
-        "current process elevation boundary was not created");
+    False(success);
+    True(error is InvalidOperationException);
+});
+
+Run("driver bootstrap rejects CLR injection before launching PowerShell", () =>
+{
+    foreach (var name in new[] { "COR_ENABLE_PROFILING", "COMPLUS_InstallRoot",
+                 "DOTNET_STARTUP_HOOKS", "CORECLR_PROFILER", "DEVPATH",
+                 "APPDOMAIN_MANAGER_ASM", "APPDOMAIN_MANAGER_TYPE", "CLRConfigFile" })
+        Throws<InvalidOperationException>(() => DriverElevationBootstrap.ValidateEnvironment(
+            new System.Collections.Hashtable { [name.ToLowerInvariant()] = "untrusted" }));
+    DriverElevationBootstrap.ValidateEnvironment(new System.Collections.Hashtable {
+        ["PATH"] = "user tools", ["PSModulePath"] = "user modules", ["DOTNET_ROOT"] = "" });
+});
+
+Run("driver bootstrap verifies the bundle and isolates all runtime loading", () =>
+{
+    using var stream = typeof(DriverElevationBootstrap).Assembly.GetManifestResourceStream(
+        "DriverElevation.Bootstrap.ps1")!;
+    using var reader = new StreamReader(stream);
+    var script = reader.ReadToEnd();
+    True(script.Contains("$security.SetOwner($administrators)"));
+    True(script.Contains("$directoryInfo.Create($security)"));
+    True(script.Contains("$algorithm.ComputeHash($source)"));
+    True(script.Contains("$start.EnvironmentVariables.Clear()"));
+    True(script.Contains("DOTNET_BUNDLE_EXTRACT_BASE_DIR"));
+    False(script.Contains("ConvertFrom-Json"));
+    True(script.IndexOf("$actualHash.Equals", StringComparison.Ordinal) <
+        script.IndexOf("[Diagnostics.Process]::Start", StringComparison.Ordinal));
+});
+
+Run("driver bootstrap quotes Windows arguments without losing slashes", () =>
+{
+    Equal("\"\"", DriverElevationBootstrap.QuoteWindowsArgument(""));
+    Equal("\"USB\\VID_05AC\"", DriverElevationBootstrap.QuoteWindowsArgument(@"USB\VID_05AC"));
+    Equal("\"a\\\"b\\\\\"", DriverElevationBootstrap.QuoteWindowsArgument("a\"b\\"));
 });
 
 Run("log sanitization", () =>
@@ -476,16 +616,6 @@ Run("operation log rotation is bounded", () =>
     {
         if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
     }
-});
-
-Run("replaceable parent driver allowlist", () =>
-{
-    True(DriverConstants.IsKnownReplaceableParentService("WinUSB"));
-    True(DriverConstants.IsKnownReplaceableParentService("libusb0"));
-    True(DriverConstants.IsKnownReplaceableParentService("libusbK"));
-    False(DriverConstants.IsKnownReplaceableParentService("usbccgp"));
-    False(DriverConstants.IsKnownReplaceableParentService("usbaapl64"));
-    False(DriverConstants.IsKnownReplaceableParentService("unknown"));
 });
 
 Run("friendly product names", () =>
