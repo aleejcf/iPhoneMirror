@@ -276,6 +276,20 @@ if(IPHONEMIRROR_BUILD_TESTS)
         add_test(NAME LinuxEnvironmentProbeTests
             COMMAND iPhoneMirror.LinuxEnvironmentProbe.Tests)
 
+        # Regression coverage for the fixed OBS canvas when a source rotates.
+        # This is platform-neutral NV12 copy code and requires no camera/device.
+        add_executable(iPhoneMirror.VideoFrameCopy.Tests
+            tests/VideoFrameCopyTests.cpp
+            src/Media/VideoFrameCopy.cpp
+            src/Media/CoreMedia.cpp
+            src/Protocol/QuickTimePacket.cpp
+            src/Media/LinuxSharedGpuFrame.cpp)
+        target_include_directories(iPhoneMirror.VideoFrameCopy.Tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(iPhoneMirror.VideoFrameCopy.Tests PRIVATE
+            iPhoneMirror.CompileOptions)
+        add_test(NAME VideoFrameCopyTests COMMAND iPhoneMirror.VideoFrameCopy.Tests)
+
         # WP3 acceptance tool: prints the environment report through the real C
         # ABI. Needs no device and changes no state, so it is always built.
         add_executable(iPhoneMirror.Linux.EnvironmentReport

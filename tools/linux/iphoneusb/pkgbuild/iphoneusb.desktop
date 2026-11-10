@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=iPhoneMirror
+Name[es]=iPhoneMirror
+Comment=Phone screen mirroring for Linux
+Comment[es]=Duplicación de pantalla de iPhone, iPad y Android en Linux
+Exec=iphoneusb
+Icon=iphoneusb
+Terminal=false
+Categories=Utility;Video;
+StartupWMClass=iphoneusb

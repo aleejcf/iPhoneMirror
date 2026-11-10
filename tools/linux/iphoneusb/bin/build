@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+if [ -f "$ROOT/../../../src/Core/CMakeLists.txt" ] &&
+   [ -f "$ROOT/../../../src/LinuxShell/iPhoneMirror.LinuxShell.csproj" ]; then
+  UPSTREAM="$(CDPATH= cd -- "$ROOT/../../.." && pwd)"
+else
+  UPSTREAM="$(CDPATH= cd -- "$ROOT/../iPhoneMirror" && pwd)"
+fi
+mkdir -p "$ROOT/build/qt" "$ROOT/build/native" "$ROOT/build/linux-shell"
+cd "$ROOT/build/qt"
+qmake6 "$ROOT/iphoneusb.pro"
+make -j"$(nproc)"
+cmake -S "$UPSTREAM" -B "$ROOT/build/native" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DIPHONEMIRROR_BUILD_TESTS=OFF
+cmake --build "$ROOT/build/native" --target iPhoneMirror.Core
+# Avalonia's build-only telemetry collector repeatedly SIGABRTs on this host.
+# The app does not use the collector at runtime; disable it for this Linux build.
+(cd "$UPSTREAM/src/LinuxShell" && \
+  AVALONIA_TELEMETRY_OPTOUT=1 dotnet publish "iPhoneMirror.LinuxShell.csproj" \
+    --configuration Release --runtime linux-x64 --self-contained false \
+    --output "$ROOT/build/linux-shell")
+install -Dm755 "$ROOT/build/native/src/Core/libiPhoneMirror.Core.so" \
+  "$ROOT/build/linux-shell/libiPhoneMirror.Core.so"
+echo "Built $ROOT/build/qt/iphoneusb and USB preview runtime"

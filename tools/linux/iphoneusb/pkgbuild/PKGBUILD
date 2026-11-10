@@ -1,0 +1,38 @@
+pkgname=iphoneusb
+pkgver=0.2.0
+pkgrel=119
+pkgdesc='iPhone, iPad and Android screen mirroring for Omarchy'
+arch=('x86_64')
+license=('GPL-3.0-only')
+install=iphoneusb.install
+depends=('qt6-base' 'qt6-declarative' 'qt6-wayland' 'dotnet-runtime' 'libimobiledevice'
+         'android-tools' 'scrcpy'
+         'libusb' 'usbmuxd' 'openssl' 'systemd-libs' 'ffmpeg' 'pipewire' 'libplacebo' 'vulkan-icd-loader')
+optdepends=('uxplay: receptor AirPlay inalámbrico para iPhone/iPad (AUR)'
+            'pipewire-pulse: ruta aislada de audio Android para streaming')
+makedepends=('gcc' 'make' 'qt6-base' 'cmake' 'ninja' 'dotnet-sdk' 'vulkan-headers')
+source=()
+sha256sums=()
+
+build() {
+  cd "$startdir/.."
+  ./bin/build
+}
+
+package() {
+  cd "$startdir/.."
+  if [[ -f "$PWD/../../../src/Core/CMakeLists.txt" ]]; then
+    upstream="$PWD/../../.."
+  else
+    upstream="$PWD/../iPhoneMirror"
+  fi
+  install -Dm755 build/qt/iphoneusb "$pkgdir/usr/bin/iphoneusb"
+  install -d "$pkgdir/usr/lib/iphoneusb"
+  cp -a build/linux-shell/. "$pkgdir/usr/lib/iphoneusb/"
+  install -Dm644 "$upstream/tools/linux/70-iphonemirror.rules" "$pkgdir/usr/lib/udev/rules.d/70-iphonemirror.rules"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/iphoneusb/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/iphoneusb/README.md"
+  install -Dm644 docs/AUTOMATION_API_LINUX.md "$pkgdir/usr/share/doc/iphoneusb/docs/AUTOMATION_API_LINUX.md"
+  install -Dm644 pkgbuild/iphoneusb.desktop "$pkgdir/usr/share/applications/iphoneusb.desktop"
+  install -Dm644 pkgbuild/iphoneusb.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/iphoneusb.svg"
+}

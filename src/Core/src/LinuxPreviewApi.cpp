@@ -8,6 +8,7 @@
 
 #include "LinuxCaptureBridge.h"
 #include "Media/LinuxPlaceboRenderer.h"
+#include "Media/VideoFormats.h"
 #include "Logging.h"
 #include "Text/Utf.h"
 
@@ -145,6 +146,56 @@ std::int32_t IM_CALL im_linux_preview_present_latest() {
         set_error(std::string(renderer->last_error()));
         return static_cast<std::int32_t>(
             iPhoneMirror::Result::CaptureBackendUnavailable);
+    }
+    preview_error.clear();
+    return static_cast<std::int32_t>(iPhoneMirror::Result::Ok);
+}
+
+std::int32_t IM_CALL im_linux_preview_latest_geometry(
+    std::uint32_t* width, std::uint32_t* height) {
+    if (width == nullptr || height == nullptr)
+        return static_cast<std::int32_t>(iPhoneMirror::Result::InvalidArgument);
+    const auto frame = iPhoneMirror::linux_bridge::latest_render_frame();
+    if (!frame)
+        return static_cast<std::int32_t>(iPhoneMirror::Result::DeviceNotFound);
+    *width = frame->width;
+    *height = frame->height;
+    return static_cast<std::int32_t>(iPhoneMirror::Result::Ok);
+}
+
+std::int32_t IM_CALL im_linux_preview_copy_latest_nv12(
+    std::uint32_t output_width, std::uint32_t output_height,
+    iPhoneMirror::VideoFrameInfo* info, std::uint8_t* buffer,
+    std::uint32_t* buffer_size) {
+    if (!info || info->struct_size != sizeof(iPhoneMirror::VideoFrameInfo) ||
+        !buffer_size || output_width < 16 || output_height < 16 ||
+        output_width > 8192 || output_height > 8192 ||
+        (output_width & 1U) != 0 || (output_height & 1U) != 0) {
+        return static_cast<std::int32_t>(iPhoneMirror::Result::InvalidArgument);
+    }
+    const auto frame = iPhoneMirror::linux_bridge::latest_render_frame();
+    if (!frame)
+        return static_cast<std::int32_t>(iPhoneMirror::Result::DeviceNotFound);
+    const auto required = iPhoneMirror::media::detail::checked_nv12_buffer_size(
+        output_width, output_height);
+    if (!required)
+        return static_cast<std::int32_t>(iPhoneMirror::Result::InternalError);
+
+    info->api_version = iPhoneMirror::ApiVersion;
+    info->width = output_width;
+    info->height = output_height;
+    info->stride = output_width;
+    info->pixel_format = 2;
+    info->timestamp_100ns = frame->timestamp_100ns;
+    const auto capacity = *buffer_size;
+    *buffer_size = *required;
+    if (!buffer || capacity < *required)
+        return static_cast<std::int32_t>(iPhoneMirror::Result::BufferTooSmall);
+    if (!iPhoneMirror::media::detail::copy_nv12_frame_letterboxed(*frame,
+            std::span<std::uint8_t>(buffer, *required), output_width,
+            output_height)) {
+        set_error("the decoded frame could not be copied to the NV12 output canvas");
+        return static_cast<std::int32_t>(iPhoneMirror::Result::ProtocolError);
     }
     preview_error.clear();
     return static_cast<std::int32_t>(iPhoneMirror::Result::Ok);

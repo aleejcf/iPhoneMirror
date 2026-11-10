@@ -14,16 +14,22 @@
 // would wait forever for frames.
 
 #include "iPhoneMirror/CoreApi.h"
+#include "iPhoneMirror/LinuxPreviewApi.h"
 
 #include "Capture/CaptureSession.h"
 #include "Device/DeviceManager.h"
 #include "LinuxCaptureBridge.h"
 #include "Logging.h"
+#include "Media/VideoFormats.h"
 #include "Text/Utf.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 
 namespace {
@@ -32,6 +38,7 @@ std::mutex state_mutex;
 bool initialized{};
 std::mutex capture_mutex;
 std::unique_ptr<iPhoneMirror::capture::CaptureSession> capture_session;
+iPhoneMirror::capture::CapturePreferences capture_preferences;
 std::wstring last_error;
 iPhoneMirror::device::DeviceManager device_manager;
 
@@ -47,6 +54,64 @@ std::int32_t not_implemented(std::wstring_view feature, std::wstring_view work_p
         std::wstring(work_package) + L"）";
     return static_cast<std::int32_t>(
         iPhoneMirror::Result::CaptureBackendUnavailable);
+}
+
+double normalized_component(const std::uint8_t* plane, std::size_t index,
+    iPhoneMirror::media::PixelFormat format) {
+    if (format == iPhoneMirror::media::PixelFormat::P010) {
+        std::uint16_t word{};
+        std::memcpy(&word, plane + index * 2U, sizeof(word));
+        return static_cast<double>(word >> 6U) / 1023.0;
+    }
+    return static_cast<double>(plane[index]) / 255.0;
+}
+
+bool decoded_frame_to_bgra(const iPhoneMirror::media::DecodedFrame& source,
+    std::uint8_t* output) {
+    auto frame = source;
+    if (frame.nv12.empty() && frame.gpu_frame &&
+        !iPhoneMirror::media::detail::materialize_gpu_frame(frame)) return false;
+    if (!output || frame.width == 0 || frame.height == 0 || frame.nv12.empty())
+        return false;
+
+    const auto stride = static_cast<std::size_t>(std::abs(frame.stride));
+    const bool ten_bit = frame.pixel_format == iPhoneMirror::media::PixelFormat::P010;
+    const auto component_bytes = ten_bit ? 2U : 1U;
+    const auto luma_row_bytes = static_cast<std::size_t>(frame.width) * component_bytes;
+    const auto chroma_row_bytes =
+        static_cast<std::size_t>((frame.width + 1U) / 2U) * 2U * component_bytes;
+    const auto luma_bytes = stride * frame.height;
+    const auto chroma_rows = (static_cast<std::size_t>(frame.height) + 1U) / 2U;
+    const auto required = luma_bytes + stride * chroma_rows;
+    if (stride < std::max(luma_row_bytes, chroma_row_bytes) ||
+        frame.nv12.size() < required) return false;
+
+    const auto* luma = frame.nv12.data();
+    const auto* chroma = luma + luma_bytes;
+    const auto conversion = iPhoneMirror::media::detail::yuv_conversion_parameters(
+        frame.pixel_format, frame.color.range, frame.color.matrix);
+    for (std::uint32_t y = 0; y < frame.height; ++y) {
+        const auto* y_row = luma + static_cast<std::size_t>(y) * stride;
+        const auto* uv_row = chroma + static_cast<std::size_t>(y / 2U) * stride;
+        auto* out = output + static_cast<std::size_t>(y) * frame.width * 4U;
+        for (std::uint32_t x = 0; x < frame.width; ++x) {
+            const auto uv = static_cast<std::size_t>(x / 2U) * 2U;
+            const auto rgb = iPhoneMirror::media::detail::convert_yuv_to_sdr(
+                normalized_component(y_row, x, frame.pixel_format),
+                normalized_component(uv_row, uv, frame.pixel_format),
+                normalized_component(uv_row, uv + 1U, frame.pixel_format),
+                frame.color, conversion);
+            const auto red = static_cast<std::uint8_t>(std::lround(rgb.red * 255.0));
+            const auto green = static_cast<std::uint8_t>(std::lround(rgb.green * 255.0));
+            const auto blue = static_cast<std::uint8_t>(std::lround(rgb.blue * 255.0));
+            const auto offset = static_cast<std::size_t>(x) * 4U;
+            out[offset] = blue;
+            out[offset + 1U] = green;
+            out[offset + 2U] = red;
+            out[offset + 3U] = 255;
+        }
+    }
+    return true;
 }
 
 template <std::size_t Capacity>
@@ -194,17 +259,17 @@ const wchar_t* IM_CALL im_last_error() { return last_error.c_str(); }
 // AV interface takes no contention; with usbmuxd 1.1.1 the daemon clamps its
 // configuration choice to 4, abandons the device, and iOS never opens a session.
 // See docs/LINUX_PORT.md.
-std::int32_t IM_CALL start_capture_locked(const wchar_t* serial, bool play_audio) {
+std::int32_t IM_CALL start_capture_locked(const wchar_t* serial,
+    const iPhoneMirror::capture::CapturePreferences& preferences) {
     if (serial == nullptr || *serial == L'\0')
         return fail(iPhoneMirror::Result::InvalidArgument, L"serial 不能为空");
-    std::scoped_lock lock(capture_mutex);
     if (capture_session) {
         return fail(iPhoneMirror::Result::SessionAlreadyExists,
             L"已有采集会话在运行");
     }
     try {
         auto session = std::make_unique<iPhoneMirror::capture::CaptureSession>(
-            iPhoneMirror::text::wide_to_utf8(serial), play_audio);
+            iPhoneMirror::text::wide_to_utf8(serial), preferences);
         session->start(false);
         capture_session = std::move(session);
         last_error.clear();
@@ -218,20 +283,56 @@ std::int32_t IM_CALL start_capture_locked(const wchar_t* serial, bool play_audio
 }
 
 std::int32_t IM_CALL im_start_capture(const wchar_t* serial) {
-    return start_capture_locked(serial, true);
+    std::scoped_lock lock(capture_mutex);
+    return start_capture_locked(serial, capture_preferences);
 }
 
 std::int32_t IM_CALL im_start_capture_ex(const wchar_t* serial,
     std::int32_t play_audio) {
-    return start_capture_locked(serial, play_audio != 0);
+    std::scoped_lock lock(capture_mutex);
+    auto preferences = capture_preferences;
+    preferences.play_audio = play_audio != 0;
+    return start_capture_locked(serial, preferences);
 }
 
-// Only the options are unimplemented, not capture: mapping CaptureOptions field
-// by field is separate work, and starting while silently dropping half of them
-// would be exactly the kind of false success this file refuses to report.
-std::int32_t IM_CALL im_start_capture_with_options(const wchar_t*,
-    const iPhoneMirror::CaptureOptions*) {
-    return not_implemented(L"带选项的采集启动", L"P5b");
+std::int32_t IM_CALL im_start_capture_with_options(const wchar_t* serial,
+    const iPhoneMirror::CaptureOptions* options) {
+    if (!serial || !*serial || !options ||
+        options->struct_size != sizeof(iPhoneMirror::CaptureOptions) ||
+        (options->requested_width == 0) != (options->requested_height == 0) ||
+        (options->requested_width != 0 &&
+            (options->requested_width < 16 || options->requested_height < 16 ||
+             options->requested_width > 8192 || options->requested_height > 8192)) ||
+        options->target_fps > 120 || !std::isfinite(options->audio_volume) ||
+        options->audio_volume < 0.0F || options->audio_volume > 1.0F ||
+        (options->reserved[0] == 0) != (options->reserved[1] == 0) ||
+        (options->reserved[0] != 0 &&
+            (options->reserved[0] < 16 || options->reserved[1] < 16 ||
+             options->reserved[0] > 8192 || options->reserved[1] > 8192)) ||
+        options->reserved[2] > 2 || options->reserved[3] > 2 ||
+        options->reserved[4] > 2) {
+        return fail(iPhoneMirror::Result::InvalidArgument,
+            L"Los parámetros de CaptureOptions no son válidos");
+    }
+
+    const iPhoneMirror::capture::CapturePreferences preferences{
+        .render_max_width = options->requested_width,
+        .render_max_height = options->requested_height,
+        .target_fps = options->target_fps,
+        .play_audio = options->play_audio != 0,
+        .audio_volume = options->audio_volume,
+        .usb_requested_width = options->reserved[0],
+        .usb_requested_height = options->reserved[1],
+        .usb_projection_mode = static_cast<iPhoneMirror::capture::UsbProjectionMode>(
+            options->reserved[2]),
+        .decoder_preference = static_cast<iPhoneMirror::media::DecoderPreference>(
+            options->reserved[3]),
+        .color_output_preference = static_cast<iPhoneMirror::media::ColorOutputPreference>(
+            options->reserved[4]),
+    };
+    std::scoped_lock lock(capture_mutex);
+    capture_preferences = preferences;
+    return start_capture_locked(serial, preferences);
 }
 
 std::int32_t IM_CALL im_stop_capture() {
@@ -304,9 +405,82 @@ std::int32_t IM_CALL im_get_latest_video_timestamp(std::int64_t* timestamp_100ns
     return static_cast<std::int32_t>(iPhoneMirror::Result::Ok);
 }
 
-std::int32_t IM_CALL im_copy_latest_video_frame(iPhoneMirror::VideoFrameInfo*,
-    std::uint8_t*, std::uint32_t*) {
-    return not_implemented(L"视频帧拷贝", L"WP5");
+std::int32_t IM_CALL im_copy_latest_video_frame(iPhoneMirror::VideoFrameInfo* info,
+    std::uint8_t* buffer, std::uint32_t* buffer_size) {
+    if (!info || info->struct_size != sizeof(iPhoneMirror::VideoFrameInfo) ||
+        !buffer_size) {
+        return fail(iPhoneMirror::Result::InvalidArgument,
+            L"VideoFrameInfo 结构版本不匹配");
+    }
+    std::shared_ptr<const iPhoneMirror::media::DecodedFrame> frame;
+    {
+        std::scoped_lock lock(capture_mutex);
+        if (!capture_session)
+            return fail(iPhoneMirror::Result::CaptureBackendUnavailable,
+                L"当前没有投屏会话");
+        frame = capture_session->latest_frame();
+    }
+    if (!frame) return fail(iPhoneMirror::Result::DeviceNotFound,
+        L"正在等待首个解码视频帧");
+    const auto required64 = static_cast<std::uint64_t>(frame->width) *
+        frame->height * 4U;
+    if (required64 == 0 || required64 > std::numeric_limits<std::uint32_t>::max())
+        return fail(iPhoneMirror::Result::InternalError, L"视频帧尺寸过大");
+    const auto required = static_cast<std::uint32_t>(required64);
+    info->api_version = iPhoneMirror::ApiVersion;
+    info->width = frame->width;
+    info->height = frame->height;
+    info->stride = frame->width * 4U;
+    info->pixel_format = 1;
+    info->timestamp_100ns = frame->timestamp_100ns;
+    const auto capacity = *buffer_size;
+    *buffer_size = required;
+    if (!buffer || capacity < required)
+        return static_cast<std::int32_t>(iPhoneMirror::Result::BufferTooSmall);
+    if (!decoded_frame_to_bgra(*frame, buffer))
+        return fail(iPhoneMirror::Result::ProtocolError,
+            L"El formato del cuadro decodificado no se pudo convertir a BGRA");
+    last_error.clear();
+    return static_cast<std::int32_t>(iPhoneMirror::Result::Ok);
+}
+
+std::int32_t IM_CALL im_linux_capture_copy_next_audio_packet(
+    std::uint64_t after_sequence, iPhoneMirror::AudioPacketInfo* info,
+    std::uint8_t* buffer, std::uint32_t* buffer_size) {
+    if (!info || info->struct_size != sizeof(iPhoneMirror::AudioPacketInfo) ||
+        !buffer_size) {
+        return fail(iPhoneMirror::Result::InvalidArgument,
+            L"AudioPacketInfo 结构版本不匹配");
+    }
+    std::shared_ptr<const iPhoneMirror::capture::AudioPacket> packet;
+    {
+        std::scoped_lock lock(capture_mutex);
+        if (!capture_session)
+            return fail(iPhoneMirror::Result::CaptureBackendUnavailable,
+                L"当前没有投屏会话");
+        packet = capture_session->next_audio_packet(after_sequence);
+    }
+    if (!packet) {
+        last_error.clear();
+        return static_cast<std::int32_t>(
+            iPhoneMirror::Result::CaptureBackendUnavailable);
+    }
+    if (packet->pcm.size() > std::numeric_limits<std::uint32_t>::max())
+        return fail(iPhoneMirror::Result::InternalError, L"音频数据包过大");
+
+    info->api_version = iPhoneMirror::ApiVersion;
+    info->sequence = packet->sequence;
+    info->sample_rate = packet->sample_rate;
+    info->channels = packet->channels;
+    info->bits_per_sample = packet->bits_per_sample;
+    const auto required = static_cast<std::uint32_t>(packet->pcm.size());
+    const auto capacity = *buffer_size;
+    *buffer_size = required;
+    if (!buffer || capacity < required)
+        return static_cast<std::int32_t>(iPhoneMirror::Result::BufferTooSmall);
+    std::copy(packet->pcm.begin(), packet->pcm.end(), buffer);
+    last_error.clear();
+    return static_cast<std::int32_t>(iPhoneMirror::Result::Ok);
 }
 
 std::int32_t IM_CALL im_copy_latest_video_frame_scaled(
@@ -332,21 +506,43 @@ std::int32_t IM_CALL im_set_preview_corner_profile(float, float) {
     return not_implemented(L"预览圆角裁剪", L"WP6");
 }
 
-std::int32_t IM_CALL im_set_video_preferences(std::uint32_t, std::uint32_t,
-    std::uint32_t) {
-    return not_implemented(L"视频渲染偏好", L"WP5");
+std::int32_t IM_CALL im_set_video_preferences(std::uint32_t width,
+    std::uint32_t height, std::uint32_t fps) {
+    if ((width == 0) != (height == 0) || fps > 120 ||
+        (width != 0 && (width < 16 || height < 16 || width > 8192 || height > 8192)))
+        return fail(iPhoneMirror::Result::InvalidArgument, L"视频尺寸或帧率无效");
+    std::scoped_lock lock(capture_mutex);
+    if (capture_session && width != 0)
+        return not_implemented(L"运行中调整视频尺寸", L"P5b");
+    capture_preferences.render_max_width = width;
+    capture_preferences.render_max_height = height;
+    capture_preferences.target_fps = fps;
+    if (capture_session) capture_session->set_target_fps(fps);
+    last_error.clear();
+    return static_cast<std::int32_t>(iPhoneMirror::Result::Ok);
 }
 
 std::int32_t IM_CALL im_set_image_adjustments(float, float, float, float) {
     return not_implemented(L"图像调节", L"WP5");
 }
 
-std::int32_t IM_CALL im_set_audio_enabled(std::int32_t) {
-    return not_implemented(L"音频开关", L"WP5");
+std::int32_t IM_CALL im_set_audio_enabled(std::int32_t enabled) {
+    std::scoped_lock lock(capture_mutex);
+    capture_preferences.play_audio = enabled != 0;
+    if (capture_session) capture_session->set_audio_enabled(enabled != 0);
+    last_error.clear();
+    return static_cast<std::int32_t>(iPhoneMirror::Result::Ok);
 }
 
-std::int32_t IM_CALL im_set_audio_volume(float) {
-    return not_implemented(L"音量设置", L"WP5");
+std::int32_t IM_CALL im_set_audio_volume(float volume) {
+    if (!std::isfinite(volume) || volume < 0.0F || volume > 1.0F)
+        return fail(iPhoneMirror::Result::InvalidArgument,
+            L"El volumen debe estar entre 0.0 y 1.0");
+    std::scoped_lock lock(capture_mutex);
+    capture_preferences.audio_volume = volume;
+    if (capture_session) capture_session->set_audio_volume(volume);
+    last_error.clear();
+    return static_cast<std::int32_t>(iPhoneMirror::Result::Ok);
 }
 
 std::int32_t IM_CALL im_is_libusb0_device_available(const wchar_t*,

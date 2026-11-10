@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //
-// P5a shell entry point. Opens a window with the preview control and drives it
-// from a raw NV12 file, which is the same input LinuxDecodeProbe writes.
-//
-// Playing a file rather than a device is deliberate for this step: it proves the
-// window binds and shows what Core rendered, without needing an iPhone attached.
-// Wiring the capture session's decoder output to the same renderer is the next
-// increment and changes nothing on this side.
+// Linux shell entry point for file playback, Apple USB capture, HID diagnostics,
+// and the Android V4L2 preview window.
 
 using Avalonia;
 using Avalonia.Controls;
@@ -21,6 +16,21 @@ internal static class Program
     private static int _exitCode = 70;
 
     private static int Main(string[] arguments)
+    {
+        try
+        {
+            return Run(arguments);
+        }
+        catch (Exception exception)
+        {
+            // Keep launch failures in the captured stderr/journal instead of
+            // allowing the desktop crash reporter to interrupt the user.
+            Console.Error.WriteLine($"iPhoneMirror Linux: {exception}");
+            return 70;
+        }
+    }
+
+    private static int Run(string[] arguments)
     {
         if (arguments.Length >= 1 && arguments[0] == "--hid-probe")
             return RunHidProbe(arguments.Length >= 2 ? arguments[1] : "iPhoneMirror", 8);
@@ -38,9 +48,11 @@ internal static class Program
         }
         if (arguments.Length >= 2 && arguments[0] == "--device")
         {
-            return RunDevice(arguments[1],
-                arguments.Length >= 4 ? arguments[2..4] : null);
+            return RunDevice(arguments[1], arguments[2..]);
         }
+        if (arguments.Length is 3 or 4 && arguments[0] == "--v4l2-preview")
+            return RunV4l2Preview(arguments[1], arguments[2],
+                arguments.Length == 4 ? arguments[3] : null);
         if (arguments.Length < 3)
         {
             Console.Error.WriteLine(
@@ -48,6 +60,8 @@ internal static class Program
                 + "[--frames N]\n"
                 + "       iPhoneMirror.LinuxShell --device <udid> "
                 + "[<width> <height>]\n"
+                + "       iPhoneMirror.LinuxShell --v4l2-preview </dev/videoN> "
+                + "<vertical|horizontal> [android-serial]\n"
                 + "       iPhoneMirror.LinuxShell --hid-probe [<name>]");
             return 64;
         }
@@ -72,6 +86,10 @@ internal static class Program
             .UsePlatformDetect()
             .With(new X11PlatformOptions
             {
+                // These windows are video-only. X11's optional D-Bus IME
+                // registration can fail in restricted user sessions and is
+                // not needed for preview input.
+                EnableIme = false,
                 RenderingMode = new[] { X11RenderingMode.Vulkan },
             })
             .AfterSetup(_ => ShellApp.Configure(path, width, height, budget, null,
@@ -83,11 +101,42 @@ internal static class Program
     // The preview target defaults to the highest encoder tier verified on both
     // test devices; the device decides the source geometry and Core letterboxes
     // into whatever target it is given.
-    private static int RunDevice(string serial, string[]? geometry)
+    private static int RunDevice(string serial, string[] options)
     {
         uint width = 1206;
         uint height = 2622;
-        if (geometry is { Length: 2 })
+        var playAudio = !options.Contains("--no-audio", StringComparer.Ordinal);
+        var videoSink = options.FirstOrDefault(option =>
+            option.StartsWith("--v4l2-sink=", StringComparison.Ordinal))?
+            ["--v4l2-sink=".Length..];
+        var outputProfile = options.FirstOrDefault(option =>
+            option.StartsWith("--output-profile=", StringComparison.Ordinal))?
+            ["--output-profile=".Length..] ?? "vertical";
+        if (outputProfile is not ("vertical" or "horizontal"))
+        {
+            Console.Error.WriteLine("invalid OBS output profile");
+            return 64;
+        }
+        var projectionModeText = options.FirstOrDefault(option =>
+            option.StartsWith("--projection-mode=", StringComparison.Ordinal))?
+            ["--projection-mode=".Length..] ?? "0";
+        if (!uint.TryParse(projectionModeText, out var projectionMode) ||
+            projectionMode > 2)
+        {
+            Console.Error.WriteLine("invalid USB projection mode");
+            return 64;
+        }
+        var recordingPath = options.FirstOrDefault(option =>
+            option.StartsWith("--record=", StringComparison.Ordinal))?
+            ["--record=".Length..];
+        var microphoneEnabled = options.Contains("--microphone", StringComparer.Ordinal);
+        var geometry = options.Where(option => option != "--no-audio" &&
+            !option.StartsWith("--v4l2-sink=", StringComparison.Ordinal) &&
+            !option.StartsWith("--output-profile=", StringComparison.Ordinal) &&
+            !option.StartsWith("--projection-mode=", StringComparison.Ordinal) &&
+            !option.StartsWith("--record=", StringComparison.Ordinal) &&
+            option != "--microphone").ToArray();
+        if (geometry.Length >= 2)
         {
             _ = uint.TryParse(geometry[0], out width);
             _ = uint.TryParse(geometry[1], out height);
@@ -96,9 +145,37 @@ internal static class Program
             .UsePlatformDetect()
             .With(new X11PlatformOptions
             {
+                EnableIme = false,
                 RenderingMode = new[] { X11RenderingMode.Vulkan },
             })
             .AfterSetup(_ => ShellApp.Configure(string.Empty, width, height, 0,
+                serial, code => _exitCode = code, playAudio, videoSink,
+                outputProfile, projectionMode, recordingPath, microphoneEnabled))
+            .StartWithClassicDesktopLifetime(Array.Empty<string>());
+        return _exitCode;
+    }
+
+    private static int RunV4l2Preview(string device, string profile,
+        string? serial)
+    {
+        if (!device.StartsWith("/dev/video", StringComparison.Ordinal) ||
+            profile is not ("vertical" or "horizontal") ||
+            serial is { Length: 0 } ||
+            serial?.Any(char.IsWhiteSpace) == true)
+        {
+            Console.Error.WriteLine("invalid V4L2 preview source or profile");
+            return 64;
+        }
+        var (width, height) = profile == "horizontal"
+            ? (1920U, 1080U) : (1080U, 1920U);
+        AppBuilder.Configure<ShellApp>()
+            .UsePlatformDetect()
+            .With(new X11PlatformOptions
+            {
+                EnableIme = false,
+                RenderingMode = new[] { X11RenderingMode.Vulkan },
+            })
+            .AfterSetup(_ => ShellApp.ConfigureV4l2Preview(device, width, height,
                 serial, code => _exitCode = code))
             .StartWithClassicDesktopLifetime(Array.Empty<string>());
         return _exitCode;

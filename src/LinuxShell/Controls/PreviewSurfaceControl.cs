@@ -8,9 +8,11 @@
 // samples a half-drawn one.
 
 using System.Globalization;
+using System.Diagnostics;
 using System.Text;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Input;
 using Avalonia.Platform;
 using Avalonia.Rendering.Composition;
 using IPhoneMirror.LinuxShell.Interop;
@@ -27,10 +29,19 @@ internal sealed class PreviewSurfaceControl : Control
     private ICompositionImportedGpuSemaphore? _renderCompleted;
     private ICompositionImportedGpuSemaphore? _available;
     private PreviewSurface _described;
+    private byte[]? _deviceUuid;
     private bool _ready;
+    private bool _tornDown;
+    private IPointer? _gesturePointer;
+    private Point _gestureStart;
+    private long _gestureStartedAt;
 
     internal string Diagnostic { get; private set; } = "not attached yet";
+    internal bool IsReady => _ready;
     internal event EventHandler? Ready;
+    internal event Action<string>? InitializationFailed;
+    internal event Action<Point, Point, TimeSpan>? PointerGestureCompleted;
+    internal bool ForwardPointerGestures { get; set; }
 
     protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
     {
@@ -46,6 +57,7 @@ internal sealed class PreviewSurfaceControl : Control
 
     private async Task InitializeAsync()
     {
+        _tornDown = false;
         var report = new StringBuilder();
         try
         {
@@ -56,6 +68,7 @@ internal sealed class PreviewSurfaceControl : Control
             if (selfVisual is null)
             {
                 Fail(report, "the control has no composition visual");
+                InitializationFailed?.Invoke(Diagnostic);
                 return;
             }
             _compositor = selfVisual.Compositor;
@@ -63,6 +76,7 @@ internal sealed class PreviewSurfaceControl : Control
             if (_interop is null)
             {
                 Fail(report, "this backend exposes no GPU interop");
+                InitializationFailed?.Invoke(Diagnostic);
                 return;
             }
 
@@ -73,6 +87,7 @@ internal sealed class PreviewSurfaceControl : Control
             {
                 Fail(report, "the compositor will not accept an opaque POSIX "
                     + "file descriptor, so an exported Vulkan image cannot be bound");
+                InitializationFailed?.Invoke(Diagnostic);
                 return;
             }
             var synchronization = _interop.GetSynchronizationCapabilities(ImageType);
@@ -81,10 +96,16 @@ internal sealed class PreviewSurfaceControl : Control
             {
                 Fail(report, "the compositor cannot synchronise an imported image "
                     + "with binary semaphores, which is the only mode Core drives");
+                InitializationFailed?.Invoke(Diagnostic);
                 return;
             }
 
-            if (!OpenPreview(report, _interop.DeviceUuid)) return;
+            _deviceUuid = _interop.DeviceUuid;
+            if (!OpenPreview(report, _deviceUuid))
+            {
+                InitializationFailed?.Invoke(Diagnostic);
+                return;
+            }
 
             _surface = _compositor.CreateDrawingSurface();
             _visual = _compositor.CreateSurfaceVisual();
@@ -92,25 +113,11 @@ internal sealed class PreviewSurfaceControl : Control
             FitVisual();
             ElementComposition.SetElementChildVisual(this, _visual);
 
-            var properties = new PlatformGraphicsExternalImageProperties
+            if (!ImportSurface(report))
             {
-                Format = PlatformGraphicsExternalImageFormat.R8G8B8A8UNorm,
-                Width = (int)_described.Width,
-                Height = (int)_described.Height,
-                MemorySize = _described.AllocationSize,
-                MemoryOffset = _described.AllocationOffset,
-            };
-            _importedImage = _interop.ImportImage(
-                new PlatformHandle(_described.MemoryFd, ImageType), properties);
-            _renderCompleted = _interop.ImportSemaphore(new PlatformHandle(
-                _described.RenderCompletedFd,
-                KnownPlatformGraphicsExternalSemaphoreHandleTypes
-                    .VulkanOpaquePosixFileDescriptor));
-            _available = _interop.ImportSemaphore(new PlatformHandle(
-                _described.AvailableFd,
-                KnownPlatformGraphicsExternalSemaphoreHandleTypes
-                    .VulkanOpaquePosixFileDescriptor));
-            report.Append("import image and semaphores: ok").AppendLine();
+                InitializationFailed?.Invoke(Diagnostic);
+                return;
+            }
 
             _ready = true;
             Diagnostic = report.ToString();
@@ -119,7 +126,84 @@ internal sealed class PreviewSurfaceControl : Control
         catch (Exception exception)
         {
             Fail(report, $"{exception.GetType().Name}: {exception.Message}");
+            InitializationFailed?.Invoke(Diagnostic);
         }
+    }
+
+    private bool ImportSurface(StringBuilder report)
+    {
+        if (_interop is null) return false;
+        const string ImageType = KnownPlatformGraphicsExternalImageHandleTypes
+            .VulkanOpaquePosixFileDescriptor;
+        var properties = new PlatformGraphicsExternalImageProperties
+        {
+            Format = PlatformGraphicsExternalImageFormat.R8G8B8A8UNorm,
+            Width = (int)_described.Width,
+            Height = (int)_described.Height,
+            MemorySize = _described.AllocationSize,
+            MemoryOffset = _described.AllocationOffset,
+        };
+        _importedImage = _interop.ImportImage(
+            new PlatformHandle(_described.MemoryFd, ImageType), properties);
+        _renderCompleted = _interop.ImportSemaphore(new PlatformHandle(
+            _described.RenderCompletedFd,
+            KnownPlatformGraphicsExternalSemaphoreHandleTypes
+                .VulkanOpaquePosixFileDescriptor));
+        _available = _interop.ImportSemaphore(new PlatformHandle(
+            _described.AvailableFd,
+            KnownPlatformGraphicsExternalSemaphoreHandleTypes
+                .VulkanOpaquePosixFileDescriptor));
+        report.Append("import image and semaphores: ok").AppendLine();
+        _ready = true;
+        FitVisual();
+        return true;
+    }
+
+    // Recreate the exported image at the settled decoder geometry after a
+    // rotation, so OBS receives the screen without padding from the old aspect.
+    internal async Task<bool> SetFrameGeometryAsync(uint width, uint height)
+    {
+        // A previous surface recreation can fail transiently. Equal dimensions
+        // do not mean that the compositor import is ready; allow the next stable
+        // geometry tick to retry opening Core and importing the image/semaphores.
+        if (_ready && width == TargetWidth && height == TargetHeight) return true;
+
+        _ready = false;
+        // First return the shared target to Core, then detach the old importer.
+        // Destroying these resources in the opposite order can leave the GPU
+        // waiting on a semaphore whose compositor has already been disposed.
+        CorePreview.Close();
+        var oldImage = _importedImage;
+        var oldRenderCompleted = _renderCompleted;
+        var oldAvailable = _available;
+        _importedImage = null;
+        _renderCompleted = null;
+        _available = null;
+
+        if (_compositor is not null)
+        {
+            _surface = _compositor.CreateDrawingSurface();
+            _visual = _compositor.CreateSurfaceVisual();
+            _visual.Surface = _surface;
+            ElementComposition.SetElementChildVisual(this, _visual);
+        }
+        if (oldImage is not null) await oldImage.DisposeAsync();
+        if (oldRenderCompleted is not null)
+            await oldRenderCompleted.DisposeAsync();
+        if (oldAvailable is not null) await oldAvailable.DisposeAsync();
+
+        TargetWidth = width;
+        TargetHeight = height;
+
+        var report = new StringBuilder();
+        if (!OpenPreview(report, _deviceUuid) || !ImportSurface(report))
+        {
+            Diagnostic = report.ToString();
+            Console.Error.WriteLine(Diagnostic);
+            return false;
+        }
+        Diagnostic = report.ToString();
+        return true;
     }
 
     private unsafe bool OpenPreview(StringBuilder report, byte[]? deviceUuid)
@@ -188,6 +272,59 @@ internal sealed class PreviewSurfaceControl : Control
         return result;
     }
 
+    protected override void OnPointerPressed(PointerPressedEventArgs e)
+    {
+        base.OnPointerPressed(e);
+        Focus();
+        if (!ForwardPointerGestures ||
+            (!e.GetCurrentPoint(this).Properties.IsLeftButtonPressed &&
+                e.Pointer.Type != PointerType.Touch) ||
+            !TryMapToCanvas(e.GetPosition(this), clamp: false, out var canvasPoint))
+            return;
+        _gesturePointer = e.Pointer;
+        _gestureStart = canvasPoint;
+        _gestureStartedAt = Stopwatch.GetTimestamp();
+        e.Pointer.Capture(this);
+        e.Handled = true;
+    }
+
+    protected override void OnPointerReleased(PointerReleasedEventArgs e)
+    {
+        base.OnPointerReleased(e);
+        if (!ForwardPointerGestures || _gesturePointer != e.Pointer) return;
+        var start = _gestureStart;
+        var hasEnd = TryMapToCanvas(e.GetPosition(this), clamp: true, out var end);
+        var duration = Stopwatch.GetElapsedTime(_gestureStartedAt);
+        _gesturePointer = null;
+        e.Pointer.Capture(null);
+        if (!hasEnd) return;
+        PointerGestureCompleted?.Invoke(start, end, duration);
+        e.Handled = true;
+    }
+
+    private bool TryMapToCanvas(Point position, bool clamp, out Point canvasPoint)
+    {
+        canvasPoint = default;
+        if (TargetWidth == 0 || TargetHeight == 0 ||
+            Bounds.Width <= 0 || Bounds.Height <= 0) return false;
+        var scale = Math.Min(Bounds.Width / TargetWidth,
+            Bounds.Height / TargetHeight);
+        if (scale <= 0 || double.IsNaN(scale) || double.IsInfinity(scale))
+            return false;
+        var drawnWidth = TargetWidth * scale;
+        var drawnHeight = TargetHeight * scale;
+        var left = (Bounds.Width - drawnWidth) / 2;
+        var top = (Bounds.Height - drawnHeight) / 2;
+        var x = position.X - left;
+        var y = position.Y - top;
+        if (!clamp && (x < 0 || y < 0 || x >= drawnWidth || y >= drawnHeight))
+            return false;
+        canvasPoint = new Point(
+            Math.Clamp(x / scale, 0, TargetWidth - 1),
+            Math.Clamp(y / scale, 0, TargetHeight - 1));
+        return true;
+    }
+
     // Renders one NV12 frame through Core and hands the result to the compositor.
     internal async Task<bool> PresentAsync(byte[] frame, uint width, uint height)
     {
@@ -253,14 +390,45 @@ internal sealed class PreviewSurfaceControl : Control
 
     private void Teardown()
     {
+        if (_tornDown) return;
+        _tornDown = true;
         _ready = false;
-        _importedImage?.DisposeAsync();
-        _renderCompleted?.DisposeAsync();
-        _available?.DisposeAsync();
+        try
+        {
+            CorePreview.Close();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"preview cleanup: {exception.Message}");
+        }
+        var image = _importedImage;
+        var renderCompleted = _renderCompleted;
+        var available = _available;
         _importedImage = null;
         _renderCompleted = null;
         _available = null;
-        CorePreview.Close();
+        if (image is not null)
+            _ = DisposeQuietlyAsync(image.DisposeAsync, "imported image");
+        if (renderCompleted is not null)
+            _ = DisposeQuietlyAsync(renderCompleted.DisposeAsync,
+                "render-completed semaphore");
+        if (available is not null)
+            _ = DisposeQuietlyAsync(available.DisposeAsync,
+                "available semaphore");
+    }
+
+    private static async Task DisposeQuietlyAsync(Func<ValueTask> dispose,
+        string resource)
+    {
+        try
+        {
+            await dispose();
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"preview cleanup ({resource}): "
+                + exception.Message);
+        }
     }
 
     // Defaults to the highest encoder tier verified on both test devices; the

@@ -1,7 +1,9 @@
 #include "Capture/CaptureSession.h"
+#include "Capture/UsbDisplaySize.h"
 #include "Device/AppleUsbDiscovery.h"
 #include "Capture/UsbConfigurationRestorePolicy.h"
 
+#include "Protocol/Plist.h"
 #include "Transport/UsbMuxClient.h"
 
 #include "Audio/IAudioRenderer.h"
@@ -54,6 +56,92 @@ std::counting_semaphore<1> libusb0_restore_gate{1};
 #endif
 std::mutex active_usb_backend_mutex;
 std::array<std::uint32_t, 3> active_usb_backend_counts{};
+
+#ifndef _WIN32
+void append_u32be(std::vector<std::uint8_t>& bytes, std::uint32_t value) {
+    bytes.push_back(static_cast<std::uint8_t>(value >> 24U));
+    bytes.push_back(static_cast<std::uint8_t>(value >> 16U));
+    bytes.push_back(static_cast<std::uint8_t>(value >> 8U));
+    bytes.push_back(static_cast<std::uint8_t>(value));
+}
+
+std::uint32_t read_u32be(const std::uint8_t* bytes) noexcept {
+    return (static_cast<std::uint32_t>(bytes[0]) << 24U) |
+        (static_cast<std::uint32_t>(bytes[1]) << 16U) |
+        (static_cast<std::uint32_t>(bytes[2]) << 8U) |
+        static_cast<std::uint32_t>(bytes[3]);
+}
+
+void lockdown_get_value(transport::Socket& socket) {
+    const auto request = plist::Value::Dict({
+        {"Label", plist::Value::String("iPhoneMirror")},
+        {"Request", plist::Value::String("GetValue")},
+    });
+    const auto xml = plist::to_xml(request);
+    std::vector<std::uint8_t> frame;
+    frame.reserve(4 + xml.size());
+    append_u32be(frame, static_cast<std::uint32_t>(xml.size()));
+    frame.insert(frame.end(), xml.begin(), xml.end());
+    socket.send_all(frame);
+
+    const auto header = socket.receive_exact(4);
+    const auto length = read_u32be(header.data());
+    if (length == 0 || length > 8U * 1024U * 1024U)
+        throw std::runtime_error("invalid Lockdown keepalive response length");
+    const auto payload = socket.receive_exact(length);
+    const auto response = plist::parse_xml(std::string_view(
+        reinterpret_cast<const char*>(payload.data()), payload.size()));
+    if (const auto* error = response.find("Error"))
+        throw std::runtime_error(std::format("Lockdown keepalive refused: {}",
+            error->string_or()));
+}
+
+class LinuxLockdownKeepalive final {
+public:
+    ~LinuxLockdownKeepalive() { stop(); }
+
+    void start(std::string_view serial) {
+        transport::UsbMuxClient mux{
+            std::string(transport::UsbMuxUnixSocketPath)};
+        const auto devices = mux.list_devices();
+        const auto device = std::find_if(devices.begin(), devices.end(),
+            [&](const auto& item) {
+                return transport::apple_usb_serial_equal(item.serial, serial);
+            });
+        if (device == devices.end())
+            throw std::runtime_error("usbmuxd cannot open the iPhone Lockdown channel");
+
+        auto socket = mux.connect_device(device->device_id, 62078);
+        lockdown_get_value(socket);
+        worker_ = std::jthread([socket = std::move(socket)](std::stop_token stop) mutable {
+            while (!stop.stop_requested()) {
+                for (int second = 0; second < 15 && !stop.stop_requested(); ++second)
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (stop.stop_requested()) break;
+                try {
+                    lockdown_get_value(socket);
+                } catch (const std::exception& error) {
+                    logging::write(logging::Level::Warning, "lockdown",
+                        std::format("lockdown keepalive stopped error={}", error.what()));
+                    break;
+                }
+            }
+        });
+        logging::write(std::format("lockdown keepalive started device_fp={}",
+            logging::fingerprint(serial)));
+    }
+
+    void stop() noexcept {
+        if (!worker_.joinable()) return;
+        worker_.request_stop();
+        worker_.join();
+        logging::write("lockdown keepalive stopped");
+    }
+
+private:
+    std::jthread worker_;
+};
+#endif
 
 std::optional<std::size_t> preferred_active_usb_backend() noexcept {
     try {
@@ -166,27 +254,6 @@ private:
     std::string_view device_fp_;
 };
 #endif
-
-struct NativeDisplaySize { std::uint32_t width; std::uint32_t height; };
-
-NativeDisplaySize native_display_size(std::wstring_view product_type) noexcept {
-    // ProductType-to-panel-pixel mapping. Identifiers sharing a panel are
-    // grouped deliberately; HPD1 is sensitive to the exact portrait aspect.
-    // Keep unknown/new hardware on the highest empirically safe tier.
-    static constexpr std::pair<std::wstring_view, NativeDisplaySize> sizes[] = {
-        {L"iPhone13,1", {1080, 2340}}, // iPhone 12 mini
-        {L"iPhone14,4", {1080, 2340}}, // iPhone 13 mini
-        {L"iPhone18,3", {1206, 2622}}, // iPhone 17 test hardware
-        {L"iPad13,16", {1640, 2360}},  // iPad Air (5th generation)
-    };
-    for (const auto& [identifier, size] : sizes)
-        if (identifier == product_type) return size;
-    // A phone-shaped fallback makes unknown iPads negotiate an extreme aspect
-    // ratio. 1640x2360 is the conservative 4:3-class iPad capability used by
-    // current base/Air models; the stream's vdim remains authoritative.
-    if (product_type.starts_with(L"iPad")) return {1640, 2360};
-    return {1206, 2622};
-}
 
 bool same_video_decoder_configuration(const coremedia::FormatDescription& left,
     const coremedia::FormatDescription& right) noexcept {
@@ -1117,7 +1184,7 @@ void CaptureSession::set_stopped_warning(FailureKind kind, FailureStage stage,
 }
 
 void CaptureSession::run(std::stop_token stop_token) noexcept {
-    const auto native = native_display_size(product_type_);
+    const auto native = capture::native_display_size(product_type_);
     native_portrait_size_.store(
         detail::pack_video_dimensions(native.width, native.height),
         std::memory_order_release);
@@ -1127,11 +1194,11 @@ void CaptureSession::run(std::stop_token stop_token) noexcept {
         product_type_ascii.push_back(ch <= 0x7f ? static_cast<char>(ch) : '?');
     const auto device_fp = logging::fingerprint(serial_);
     logging::write(std::format(
-        "capture_run begin device_fp={} backend={} product_type={} usb_display_size={}x{} render_fps_limit={} audio={} volume={:.3f} decoder_policy={} color_policy={}", device_fp,
+        "capture_run begin device_fp={} backend={} product_type={} usb_display_size={}x{} model_known={} render_fps_limit={} audio={} volume={:.3f} decoder_policy={} color_policy={}", device_fp,
         usb_backend_ == UsbBackend::LibUsb0 ? "libusb0" :
         usb_backend_ == UsbBackend::UsbDk ? "usbdk" : "libusb1",
         product_type_ascii,
-        native.width, native.height,
+        native.width, native.height, native.model_known,
         target_fps(),
         play_audio_.load(std::memory_order_relaxed),
         audio_volume_.load(std::memory_order_relaxed),
@@ -1151,6 +1218,9 @@ void CaptureSession::run(std::stop_token stop_token) noexcept {
     DeferredCleanup configuration_restore;
     DeferredCleanup active_backend_release;
     auto preflight_device = std::move(preflight_device_);
+#ifndef _WIN32
+    LinuxLockdownKeepalive lockdown_keepalive;
+#endif
     // Keep the transport context alive until after the connection has been
     // closed on every exception path. Destruction is reverse declaration
     // order, so the handle must be declared after its owning context.
@@ -1345,6 +1415,14 @@ void CaptureSession::run(std::stop_token stop_token) noexcept {
     };
 
     try {
+#ifndef _WIN32
+        // iOS will acknowledge QuickTime's initial PING but will not keep the
+        // video channel flowing unless the host also keeps its Lockdown mux
+        // session alive. Keep a paired Lockdown tunnel for the complete USB
+        // capture lifetime; device discovery's short metadata query is not
+        // sufficient because it closes that tunnel immediately.
+        lockdown_keepalive.start(serial_);
+#endif
         bool quicktime_open_recovered{};
         bool newly_activated_libusb0{};
 #ifdef _WIN32
@@ -1611,6 +1689,9 @@ void CaptureSession::run(std::stop_token stop_token) noexcept {
                 native_portrait_size_.load(std::memory_order_acquire));
         };
         std::atomic<std::int64_t> last_audio_activity_ns{};
+        std::atomic<std::int64_t> last_video_output_ns{};
+        std::atomic<std::uint32_t> last_video_output_width{};
+        std::atomic<std::uint32_t> last_video_output_height{};
         std::atomic_bool fast_stream_reconnect_requested{};
         std::atomic_uint32_t decoder_reconnect_generation{};
         // The queue preserves normal H.264 reference order. Sustained decoder
@@ -1631,6 +1712,8 @@ void CaptureSession::run(std::stop_token stop_token) noexcept {
             std::uint64_t preference_switch_wait_samples{};
             std::uint64_t video_decode_count{};
             std::uint64_t video_output_count{};
+            auto last_video_output_at = std::chrono::steady_clock::time_point{};
+            bool decoder_waiting_for_keyframe{};
             detail::ProtectedVideoDetector protected_video_detector;
             bool native_probe_published{};
             bool reordered_timing_reported{};
@@ -1861,9 +1944,68 @@ void CaptureSession::run(std::stop_token stop_token) noexcept {
                         }
                     }
 
+                    if (!decoded_by_replacement && decoder_waiting_for_keyframe) {
+                        if (!media::detail::is_random_access_sample(format, encoded_sample))
+                            continue;
+                        decoder_waiting_for_keyframe = false;
+                        logging::write("video_worker decoder_recovery keyframe_received=true");
+                    }
+
                     if (!decoded_by_replacement) {
-                        decoded_frames = video_decoder->decode(
-                            encoded_sample, timestamp_100ns, duration_100ns);
+                        try {
+                            decoded_frames = video_decoder->decode(
+                                encoded_sample, timestamp_100ns, duration_100ns);
+                        } catch (const std::exception& error) {
+#ifndef _WIN32
+                            if (!video_decoder->selected_decoder_is_hardware()) throw;
+                            active_decoder_preference =
+                                media::DecoderPreference::SoftwareCompatible;
+                            try {
+                                auto software_decoder = media::make_platform_video_decoder(
+                                    media::DecoderPreference::SoftwareCompatible);
+                                software_decoder->configure(format, 60, 1);
+                                video_decoder = std::move(software_decoder);
+                                active_decoder_runtime_mode = DecoderRuntimeMode::Software;
+                                decoder_switch_.set_applied_runtime_mode(
+                                    {active_decoder_preference, applied_decoder_generation},
+                                    active_decoder_runtime_mode);
+                                input_times.clear();
+                                {
+                                    std::scoped_lock lock(mutex_);
+                                    latest_frame_.reset();
+                                }
+                                decoder_waiting_for_keyframe =
+                                    !media::detail::is_random_access_sample(format, encoded_sample);
+                                logging::write(logging::Level::Warning, "video",
+                                    std::format(
+                                        "video_worker decoder_recovery from=hardware to=software waiting_for_keyframe={} reason={}",
+                                        decoder_waiting_for_keyframe, error.what()));
+                                if (decoder_waiting_for_keyframe) continue;
+                                decoded_frames = video_decoder->decode(
+                                    encoded_sample, timestamp_100ns, duration_100ns);
+                            } catch (const std::exception& recovery_error) {
+                                video_decoder.reset();
+                                configured_format.reset();
+                                active_decoder_runtime_mode = DecoderRuntimeMode::Unknown;
+                                decoder_switch_.set_applied_runtime_mode(
+                                    {active_decoder_preference, applied_decoder_generation},
+                                    active_decoder_runtime_mode);
+                                decoder_waiting_for_keyframe = true;
+                                input_times.clear();
+                                {
+                                    std::scoped_lock lock(mutex_);
+                                    latest_frame_.reset();
+                                }
+                                logging::write(logging::Level::Warning, "video",
+                                    std::format(
+                                        "video_worker decoder_recovery_failed waiting_for_keyframe=true hardware_error={} software_error={}",
+                                        error.what(), recovery_error.what()));
+                                break;
+                            }
+#else
+                            throw;
+#endif
+                        }
                     }
                     const auto observed_runtime_mode = decoder_runtime_mode(
                         video_decoder->decoder_acceleration());
@@ -1911,6 +2053,35 @@ void CaptureSession::run(std::stop_token stop_token) noexcept {
                         ++video_output_count;
                         std::scoped_lock lock(mutex_);
                         latest_frame_ = published;
+                    }
+                    if (published) {
+                        const auto output_at = std::chrono::steady_clock::now();
+                        if (last_video_output_at !=
+                                std::chrono::steady_clock::time_point{}) {
+                            const auto pause_ms = std::chrono::duration_cast<
+                                std::chrono::milliseconds>(output_at -
+                                    last_video_output_at).count();
+                            if (pause_ms >= 500) {
+                                logging::write(logging::Level::Warning, "video",
+                                    std::format(
+                                        "video_output_pause elapsed_ms={} resolution={}x{} decoder={} mode={}",
+                                        pause_ms, published->width, published->height,
+                                        video_decoder->selected_decoder_name(),
+                                        active_decoder_runtime_mode == DecoderRuntimeMode::Hardware
+                                            ? "hardware"
+                                            : active_decoder_runtime_mode == DecoderRuntimeMode::Software
+                                                ? "software" : "unknown"));
+                            }
+                        }
+                        last_video_output_at = output_at;
+                        last_video_output_width.store(published->width,
+                            std::memory_order_relaxed);
+                        last_video_output_height.store(published->height,
+                            std::memory_order_relaxed);
+                        last_video_output_ns.store(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                output_at.time_since_epoch()).count(),
+                            std::memory_order_release);
                     }
                     {
                         std::scoped_lock lock(mutex_);
@@ -1980,6 +2151,27 @@ void CaptureSession::run(std::stop_token stop_token) noexcept {
         detail::FastStreamReconnectGate fast_stream_reconnect_gate;
         detail::StreamingSilenceWatchdog media_silence_watchdog;
         detail::StreamingSilenceWatchdog video_silence_watchdog;
+        std::int64_t last_reported_video_output_ns{};
+        const auto report_video_output_stall = [&] {
+            const auto output_ns = last_video_output_ns.load(
+                std::memory_order_acquire);
+            if (output_ns == 0 || output_ns == last_reported_video_output_ns)
+                return;
+            const auto now = std::chrono::steady_clock::now();
+            const auto output_at = std::chrono::steady_clock::time_point(
+                std::chrono::nanoseconds(output_ns));
+            const auto pause = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - output_at);
+            if (pause < std::chrono::milliseconds(500)) return;
+            last_reported_video_output_ns = output_ns;
+            const auto width = last_video_output_width.load(std::memory_order_relaxed);
+            const auto height = last_video_output_height.load(std::memory_order_relaxed);
+            logging::write(logging::Level::Warning, "video",
+                std::format(
+                    "video_output_stalled elapsed_ms={} last_resolution={}x{} video_input_silence_ms={}",
+                    pause.count(), width, height,
+                    video_silence_watchdog.silence_duration(now).count()));
+        };
         const auto request_fast_reconnect_for_missing_frame_rate = [&] {
             const auto now = std::chrono::steady_clock::now();
             if (video_silence_watchdog.silence_duration(now) <
@@ -2066,6 +2258,7 @@ void CaptureSession::run(std::stop_token stop_token) noexcept {
             }
             const auto count = usb->read(read_buffer, 250);
             video_worker_failure.rethrow_if_set();
+            report_video_output_stall();
             if (protocol.state() != quicktime::SessionState::WaitingForPing &&
                 protocol.video_frames() == 0) {
                 const auto now = std::chrono::steady_clock::now();

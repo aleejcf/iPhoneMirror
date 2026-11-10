@@ -39,11 +39,18 @@ internal sealed class BluezHidService : IObjectManager, IAsyncDisposable
     private static readonly ObjectPath Root = new("/com/iphonemirror/hid");
 
     private readonly Connection _connection = new(Address.System);
+    private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private readonly List<GattNode> _objects = [];
     private readonly Dictionary<byte, GattCharacteristicNode> _reports = [];
     private readonly Advertisement _advertisement = new();
     private ObjectPath _adapter = new("/org/bluez/hci0");
-    private bool _registered;
+    private volatile bool _registered;
+    private bool _startAttempted;
+    private bool _applicationRegistrationAttempted;
+    private bool _advertisementRegistrationAttempted;
+    private bool _adapterSettingsCaptured;
+    private bool _disposed;
+    private bool _restorePowered;
     private bool _restoreDiscoverable;
     private bool _restorePairable;
 
@@ -60,8 +67,11 @@ internal sealed class BluezHidService : IObjectManager, IAsyncDisposable
 
     internal async Task<bool> StartAsync(string localName = "iPhoneMirror")
     {
+        await _lifecycleGate.WaitAsync();
         try
         {
+            if (_disposed || _startAttempted) return _registered;
+            _startAttempted = true;
             await _connection.ConnectAsync();
             BuildObjects();
 
@@ -73,13 +83,16 @@ internal sealed class BluezHidService : IObjectManager, IAsyncDisposable
             // is the same state any Bluetooth settings panel puts it in, and it is
             // restored on dispose.
             var adapter = _connection.CreateProxy<IAdapter1>(Bluez, _adapter);
+            _restorePowered = (bool)await adapter.GetAsync("Powered");
             _restoreDiscoverable = (bool)await adapter.GetAsync("Discoverable");
             _restorePairable = (bool)await adapter.GetAsync("Pairable");
+            _adapterSettingsCaptured = true;
             await adapter.SetAsync("Powered", true);
             await adapter.SetAsync("Pairable", true);
             await adapter.SetAsync("Discoverable", true);
 
             var manager = _connection.CreateProxy<IGattManager1>(Bluez, _adapter);
+            _applicationRegistrationAttempted = true;
             await manager.RegisterApplicationAsync(Root,
                 new Dictionary<string, object>());
 
@@ -87,6 +100,7 @@ internal sealed class BluezHidService : IObjectManager, IAsyncDisposable
             await _connection.RegisterObjectAsync(_advertisement);
             var advertising =
                 _connection.CreateProxy<ILEAdvertisingManager1>(Bluez, _adapter);
+            _advertisementRegistrationAttempted = true;
             await advertising.RegisterAdvertisementAsync(_advertisement.ObjectPath,
                 new Dictionary<string, object>());
 
@@ -96,9 +110,13 @@ internal sealed class BluezHidService : IObjectManager, IAsyncDisposable
         }
         catch (Exception error)
         {
-            Diagnostic = $"{error.GetType().Name}: {error.Message}";
+            var startupError = $"{error.GetType().Name}: {error.Message}";
+            var cleanupErrors = await CleanupRegistrationsAsync();
+            Diagnostic = cleanupErrors.Count == 0 ? startupError
+                : startupError + "; rollback: " + string.Join("; ", cleanupErrors);
             return false;
         }
+        finally { _lifecycleGate.Release(); }
     }
 
     // Sends one input report. Returns false when the peer has not subscribed,
@@ -134,7 +152,23 @@ internal sealed class BluezHidService : IObjectManager, IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        if (_registered)
+        await _lifecycleGate.WaitAsync();
+        try
+        {
+            if (_disposed) return;
+            _disposed = true;
+            var failures = await CleanupRegistrationsAsync();
+            if (failures.Count > 0)
+                Diagnostic = "teardown: " + string.Join("; ", failures);
+            _connection.Dispose();
+        }
+        finally { _lifecycleGate.Release(); }
+    }
+
+    private async Task<List<string>> CleanupRegistrationsAsync()
+    {
+        var failures = new List<string>();
+        if (_advertisementRegistrationAttempted)
         {
             try
             {
@@ -142,29 +176,56 @@ internal sealed class BluezHidService : IObjectManager, IAsyncDisposable
                     Bluez, _adapter);
                 await advertising.UnregisterAdvertisementAsync(
                     _advertisement.ObjectPath);
+            }
+            catch (Exception error)
+            {
+                // Register can time out after BlueZ has accepted the request.
+                // Try the matching unregister during rollback regardless.
+                failures.Add($"advertisement: {error.Message}");
+            }
+            if (!failures.Any(failure => failure.StartsWith("advertisement:",
+                    StringComparison.Ordinal)))
+                _advertisementRegistrationAttempted = false;
+        }
+        if (_applicationRegistrationAttempted)
+        {
+            try
+            {
                 var manager = _connection.CreateProxy<IGattManager1>(Bluez,
                     _adapter);
                 await manager.UnregisterApplicationAsync(Root);
             }
             catch (Exception error)
             {
-                // Teardown failures are reported, not thrown: the process is
-                // exiting and BlueZ drops the registration when the name goes.
-                Diagnostic = $"teardown: {error.Message}";
+                failures.Add($"GATT application: {error.Message}");
             }
-            try
-            {
-                var adapter = _connection.CreateProxy<IAdapter1>(Bluez, _adapter);
-                await adapter.SetAsync("Discoverable", _restoreDiscoverable);
-                await adapter.SetAsync("Pairable", _restorePairable);
-            }
-            catch (Exception error)
-            {
-                Diagnostic = $"adapter restore: {error.Message}";
-            }
-            _registered = false;
+            if (!failures.Any(failure => failure.StartsWith("GATT application:",
+                    StringComparison.Ordinal)))
+                _applicationRegistrationAttempted = false;
         }
-        _connection.Dispose();
+        if (_adapterSettingsCaptured)
+        {
+            var adapter = _connection.CreateProxy<IAdapter1>(Bluez, _adapter);
+            var restored = true;
+            foreach (var (property, value) in new (string Name, bool Value)[]
+                {
+                    ("Discoverable", _restoreDiscoverable),
+                    ("Pairable", _restorePairable),
+                    ("Powered", _restorePowered),
+                })
+            {
+                try { await adapter.SetAsync(property, value); }
+                catch (Exception error)
+                {
+                    restored = false;
+                    failures.Add($"adapter {property}: {error.Message}");
+                }
+            }
+            if (restored)
+                _adapterSettingsCaptured = false;
+        }
+        _registered = false;
+        return failures;
     }
 
     private void BuildObjects()

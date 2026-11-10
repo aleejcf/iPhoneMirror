@@ -1,0 +1,9 @@
+post_install() {
+  udevadm control --reload-rules
+  echo 'Unplug and reconnect the iPhone to apply its USB access rule.'
+}
+
+post_upgrade() {
+  udevadm control --reload-rules
+  echo 'Unplug and reconnect the iPhone to apply its USB access rule.'
+}

@@ -9,8 +9,8 @@
 // window handle to draw into. And the port's rule is that Linux backends are new
 // files, so the shared header keeps its ApiVersion and its surface untouched.
 //
-// The managed side P/Invokes these three functions and imports the descriptors
-// through Avalonia's ICompositionGpuInterop.
+// The managed side P/Invokes these Linux-only entry points and imports the
+// exported descriptors through Avalonia's ICompositionGpuInterop.
 
 #pragma once
 
@@ -73,3 +73,23 @@ IM_API std::int32_t IM_CALL im_linux_preview_present_nv12(
 // report), and CaptureBackendUnavailable when there is no preview or the render
 // failed.
 IM_API std::int32_t IM_CALL im_linux_preview_present_latest();
+
+// Reads the geometry of the newest decoded device frame without consuming it.
+IM_API std::int32_t IM_CALL im_linux_preview_latest_geometry(
+    std::uint32_t* width, std::uint32_t* height);
+
+// Copies the newest decoded frame to a tightly packed NV12 canvas. The source
+// aspect ratio is preserved and unused pixels are filled with black, allowing
+// a virtual camera to keep a fixed V4L2 format through device rotation.
+IM_API std::int32_t IM_CALL im_linux_preview_copy_latest_nv12(
+    std::uint32_t output_width, std::uint32_t output_height,
+    iPhoneMirror::VideoFrameInfo* info, std::uint8_t* buffer,
+    std::uint32_t* buffer_size);
+
+// Copies the first queued PCM packet whose sequence is greater than
+// after_sequence. Pass a null buffer to query its size, then retry. The capture
+// backend can report CaptureBackendUnavailable while no new packet is queued;
+// that is a normal polling result. Existing Win32 exports remain unchanged.
+IM_API std::int32_t IM_CALL im_linux_capture_copy_next_audio_packet(
+    std::uint64_t after_sequence, iPhoneMirror::AudioPacketInfo* info,
+    std::uint8_t* buffer, std::uint32_t* buffer_size);
